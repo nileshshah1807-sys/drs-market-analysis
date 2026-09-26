@@ -2761,7 +2761,10 @@ class App:
             config = EmailConfig()
             
             if config.is_configured and config.sender_password:
-                status = f"✅ Email configured: {config.sender_email} → {', '.join(config.receiver_emails)}"
+                import daily_report
+                where = "Windows Credential Manager" if daily_report.KEYRING_OK else "email_config.json (install 'keyring' for safer storage)"
+                status = (f"✅ Email configured: {config.sender_email} → {', '.join(config.receiver_emails)}"
+                          f"   |   password stored in {where}")
                 color = THEME['success']
             elif config.is_configured:
                 status = "⚠ Email configured but password is empty - please re-save"
@@ -2784,6 +2787,8 @@ class App:
             return
         
         try:
+            if REPORT_OK:
+                EmailConfig().delete_stored_password()   # also remove it from Windows Credential Manager
             config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "email_config.json")
             if os.path.exists(config_file):
                 os.remove(config_file)

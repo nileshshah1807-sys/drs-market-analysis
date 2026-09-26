@@ -149,6 +149,7 @@ class EmailConfig:
         self.receiver_emails = []
         self.is_configured = False
         self.last_error = ""
+        self._loaded_email = ""
         self.load_config()
     
     def configure(self, smtp_server, smtp_port, sender_email, sender_password, receiver_emails):
@@ -290,60 +291,117 @@ class EmailConfig:
             return False
     
     def save_config(self):
-        """Save email configuration INCLUDING password."""
+        """Save email settings. The password goes to Windows Credential Manager when available
+        (email_config.json then holds no password); otherwise it falls back to the file."""
         try:
-            import base64
-            # Encode password with base64 for basic obfuscation (not secure encryption)
-            encoded_password = base64.b64encode(self.sender_password.encode('utf-8')).decode('utf-8') if self.sender_password else ""
-            
+            stored_securely = _store_password(self.sender_email, self.sender_password)
+            if stored_securely and self._loaded_email and self._loaded_email != self.sender_email:
+                _delete_password(self._loaded_email)   # sender changed - don't leave the old one behind
+
             data = {
                 'smtp_server': self.smtp_server,
                 'smtp_port': self.smtp_port,
                 'sender_email': self.sender_email,
-                'sender_password_encoded': encoded_password,
                 'receiver_emails': self.receiver_emails,
                 'is_configured': self.is_configured,
+                'password_storage': 'windows_credential_manager' if stored_securely else 'file',
                 'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             }
+            if not stored_securely and self.sender_password:
+                import base64
+                # Fallback only (keyring unavailable): base64 is obfuscation, NOT encryption
+                data['sender_password_encoded'] = base64.b64encode(self.sender_password.encode('utf-8')).decode('utf-8')
             with open(self.config_file, 'w') as f:
                 json.dump(data, f, indent=2)
-            print(f"[EmailConfig] Config saved to {self.config_file}")
+            self._loaded_email = self.sender_email
+            print(f"[EmailConfig] Config saved (password in "
+                  f"{'Windows Credential Manager' if stored_securely else 'email_config.json'})")
         except Exception as e:
             print(f"[EmailConfig] Save error: {e}")
-    
+
     def load_config(self):
-        """Load email configuration INCLUDING password."""
+        """Load email settings. A password still stored in email_config.json (older versions)
+        is moved into Windows Credential Manager and removed from the file."""
         try:
             if self.config_file.exists():
                 with open(self.config_file, 'r') as f:
                     data = json.load(f)
-                    self.smtp_server = data.get('smtp_server', 'smtp.gmail.com')
-                    self.smtp_port = int(data.get('smtp_port', 587))
-                    self.sender_email = data.get('sender_email', '')
-                    self.receiver_emails = data.get('receiver_emails', [])
-                    self.is_configured = data.get('is_configured', False)
-                    
-                    # Load password - try encoded first, then plain text for backward compatibility
-                    encoded_pw = data.get('sender_password_encoded', '')
-                    plain_pw = data.get('sender_password', '')
-                    
-                    if encoded_pw:
-                        try:
-                            import base64
-                            self.sender_password = base64.b64decode(encoded_pw.encode('utf-8')).decode('utf-8')
-                        except Exception:
-                            self.sender_password = plain_pw
-                    else:
-                        self.sender_password = plain_pw
-                    
-                    # Validate: if configured but password is empty, mark as not configured
-                    if self.is_configured and not self.sender_password:
-                        print("[EmailConfig] WARNING: Config says configured but password is empty!")
-                        self.is_configured = False
-                    
-                    print(f"[EmailConfig] Config loaded: {self.sender_email}, configured={self.is_configured}, pw_len={len(self.sender_password)}")
+                self.smtp_server = data.get('smtp_server', 'smtp.gmail.com')
+                self.smtp_port = int(data.get('smtp_port', 587))
+                self.sender_email = data.get('sender_email', '')
+                self.receiver_emails = data.get('receiver_emails', [])
+                self.is_configured = data.get('is_configured', False)
+                self._loaded_email = self.sender_email
+
+                # Password left in the file by older versions (base64 or plain text)
+                file_pw = data.get('sender_password', '')
+                if data.get('sender_password_encoded'):
+                    try:
+                        import base64
+                        file_pw = base64.b64decode(data['sender_password_encoded'].encode('utf-8')).decode('utf-8')
+                    except Exception:
+                        pass
+
+                if file_pw:
+                    self.sender_password = file_pw
+                    if KEYRING_OK:
+                        self.save_config()   # migrate: stores in Credential Manager, rewrites file without it
+                else:
+                    self.sender_password = _read_password(self.sender_email)
+
+                # Validate: if configured but password is empty, mark as not configured
+                if self.is_configured and not self.sender_password:
+                    print("[EmailConfig] WARNING: Config says configured but password is empty!")
+                    self.is_configured = False
+
+                print(f"[EmailConfig] Config loaded: {self.sender_email}, configured={self.is_configured}")
         except Exception as e:
             print(f"[EmailConfig] Load error: {e}")
+
+    def delete_stored_password(self):
+        """Remove the saved password from Windows Credential Manager (used by 'Clear Config')."""
+        if self.sender_email:
+            _delete_password(self.sender_email)
+
+
+# Windows Credential Manager (via the keyring package) for the email app password
+KEYRING_SERVICE = "DR Nilesh Shah Market Analysis - Email"
+try:
+    import keyring
+    KEYRING_OK = type(keyring.get_keyring()).__name__ not in ('Keyring', 'FailKeyring', 'NullKeyring')
+except Exception:
+    KEYRING_OK = False
+
+
+def _store_password(email: str, password: str) -> bool:
+    """Save the password in Credential Manager and read it back to confirm. False if unavailable."""
+    if not KEYRING_OK or not email or not password:
+        return False
+    try:
+        keyring.set_password(KEYRING_SERVICE, email, password)
+        return keyring.get_password(KEYRING_SERVICE, email) == password
+    except Exception as e:
+        print(f"[EmailConfig] Credential Manager save failed: {e}")
+        return False
+
+
+def _read_password(email: str) -> str:
+    if not KEYRING_OK or not email:
+        return ""
+    try:
+        return keyring.get_password(KEYRING_SERVICE, email) or ""
+    except Exception as e:
+        print(f"[EmailConfig] Credential Manager read failed: {e}")
+        return ""
+
+
+def _delete_password(email: str):
+    if not KEYRING_OK or not email:
+        return
+    try:
+        keyring.delete_password(KEYRING_SERVICE, email)
+    except Exception:
+        pass   # nothing stored
 
 
 # ============================================================

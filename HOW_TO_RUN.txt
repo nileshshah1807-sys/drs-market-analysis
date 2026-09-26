@@ -10,7 +10,7 @@ Option A: Double-click "install_dependencies.bat" (Windows)
    This will automatically install all required packages.
 
 Option B: Open Command Prompt and run:
-   pip install yfinance pandas numpy ta scikit-learn openpyxl reportlab pdfplumber schedule Pillow pytz
+   python -m pip install -r requirements.txt
 
 
 STEP 2: VERIFY INSTALLATION
@@ -62,21 +62,28 @@ NEW FEATURES
    - Dividends shown as "Expected ... (ESTIMATED - not announced)" are
      projections from past years, not announcements.
 
+6. EMAIL PASSWORD STORED SAFELY
+   The Gmail App Password is kept in Windows Credential Manager
+   (Control Panel > Credential Manager > Windows Credentials >
+   "DR Nilesh Shah Market Analysis - Email"), not in email_config.json.
+   To change it, enter the new one in Settings and click "Save Email Config".
+   "Clear Config" removes it from Credential Manager too.
+
 
 TROUBLESHOOTING
 -----------------
 
 Problem: "No module named 'ta'"
-Fix: pip install ta
+Fix: python -m pip install ta
 
 Problem: "No module named 'yfinance'"  
-Fix: pip install yfinance
+Fix: python -m pip install yfinance
 
 Problem: "Daily report module not found"
 Fix: Make sure daily_report.py is in the same folder as dr_shah_analysis.py
 
 Problem: "No module named 'reportlab'"
-Fix: pip install reportlab
+Fix: python -m pip install reportlab
 
 Problem: App doesn't start
 Fix: Run install_dependencies.bat first
@@ -109,7 +116,7 @@ QUICK COMMANDS:
 ----------------
 
 Install everything:
-   pip install yfinance pandas numpy ta scikit-learn openpyxl reportlab pdfplumber schedule Pillow pytz
+   python -m pip install -r requirements.txt
 
 Run app:
    python dr_shah_analysis.py

@@ -12,25 +12,25 @@ echo [1/8] Upgrading pip...
 python -m pip install --upgrade pip --quiet
 
 echo [2/8] Installing yfinance...
-pip install yfinance --quiet
+python -m pip install yfinance --quiet
 
 echo [3/8] Installing pandas and numpy...
-pip install pandas numpy --quiet
+python -m pip install pandas numpy --quiet
 
 echo [4/8] Installing ta (Technical Analysis)...
-pip install ta --quiet
+python -m pip install ta --quiet
 
 echo [5/8] Installing scikit-learn (AI/ML)...
-pip install scikit-learn --quiet
+python -m pip install scikit-learn --quiet
 
 echo [6/8] Installing openpyxl, reportlab, pdfplumber...
-pip install openpyxl reportlab pdfplumber --quiet
+python -m pip install openpyxl reportlab pdfplumber --quiet
 
-echo [7/8] Installing schedule and Pillow...
-pip install schedule Pillow --quiet
+echo [7/8] Installing schedule, Pillow, matplotlib, requests, keyring...
+python -m pip install schedule Pillow matplotlib requests keyring --quiet
 
 echo [8/8] Installing pytz (timezone support)...
-pip install pytz --quiet
+python -m pip install pytz --quiet
 
 echo.
 echo ============================================================
@@ -55,6 +55,9 @@ modules = [
     ('schedule', 'Auto scheduling'),
     ('PIL', 'Image support'),
     ('pytz', 'Timezone support'),
+    ('matplotlib', 'Charts'),
+    ('requests', 'NSE/BSE data'),
+    ('keyring', 'Secure password storage'),
 ]
 
 all_ok = True

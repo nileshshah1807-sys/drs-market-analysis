@@ -17,7 +17,7 @@ if errorlevel 1 (
 echo [1/4] Installing required packages...
 echo.
 
-pip install yfinance pandas numpy ta scikit-learn openpyxl pdfplumber reportlab schedule Pillow --quiet
+python -m pip install yfinance pandas numpy ta scikit-learn openpyxl pdfplumber reportlab schedule Pillow matplotlib requests keyring --quiet
 
 echo.
 echo [2/4] Verifying installation...

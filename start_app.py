@@ -38,6 +38,9 @@ def check_and_install():
         'schedule': 'schedule',
         'PIL': 'Pillow',
         'pytz': 'pytz',
+        'matplotlib': 'matplotlib',
+        'requests': 'requests',
+        'keyring': 'keyring',
     }
     
     missing = []
