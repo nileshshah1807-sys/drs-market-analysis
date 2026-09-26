@@ -942,16 +942,6 @@ DIVIDEND_DATA = {
         'history': [('2025-07-18', 7.50, 'Dividend'), ('2025-02-12', 6.50, 'Dividend'), ('2024-07-19', 6.25, 'Dividend'), ('2024-02-14', 6.00, 'Dividend')],
         'upcoming': [('2027-02-11', 6.50, 'Dividend'), ('2027-07-17', 7.50, 'Dividend')]
     },
-    'UPL': {
-        'name': 'UPL Limited', 'sector': 'Chemicals', 'yield': 1.5, 'rate': 10,
-        'history': [('2025-08-22', 10, 'Dividend'), ('2024-08-24', 6, 'Dividend')],
-        'upcoming': [('2027-08-21', 10, 'Dividend')]
-    },
-    'TATAPOWER': {
-        'name': 'Tata Power', 'sector': 'Energy', 'yield': 0.5, 'rate': 2,
-        'history': [('2025-06-14', 2, 'Dividend'), ('2024-06-16', 1.75, 'Dividend')],
-        'upcoming': [('2027-06-13', 2, 'Dividend')]
-    },
     'IDEA': {
         'name': 'Vodafone Idea', 'sector': 'Telecom', 'yield': 0, 'rate': 0,
         'history': [],
@@ -1081,33 +1071,36 @@ class CorporateActions:
             if kd.get('rate', 0) > 0:
                 result['dividend_rate'] = kd['rate']
             
-            # Add historical dividends
-            if kd.get('history'):
+            # Add stored historical dividends only when Yahoo had none - mixing both lists the
+            # same dividend twice when the stored date differs slightly from Yahoo's ex-date
+            if kd.get('history') and not result['dividends']:
                 for date_str, amount, dtype in kd['history']:
                     exists = any(x['date'] == date_str for x in result['dividends'])
                     if not exists:
                         result['dividends'].append({'date': date_str, 'amount': amount, 'type': dtype})
                 result['dividends'].sort(key=lambda x: x['date'], reverse=True)
             
-            # Add upcoming events (EXACT dates and amounts)
+            # Stored "upcoming" dividends are projections from past years' dates, NOT announced
+            # dividends - label them as estimates
             if kd.get('upcoming'):
                 now = datetime.now()
                 for date_str, amount, event_type in kd['upcoming']:
                     try:
                         event_date = datetime.strptime(date_str, '%Y-%m-%d')
-                        if event_date > now:
+                        if event_date.date() >= now.date():
                             result['upcoming_events'].append({
                                 'date': date_str,
-                                'type': event_type,
-                                'details': f"Rs.{amount:.2f} per share",
-                                'days_until': (event_date - now).days,
-                                'amount': amount
+                                'type': f"Expected {event_type}",
+                                'details': f"~Rs.{amount:.2f} per share (estimated - not yet announced)",
+                                'days_until': (event_date.date() - now.date()).days,
+                                'amount': amount,
+                                'estimated': True
                             })
                     except: pass
             
             # Set ex-dividend date from upcoming
             if result['upcoming_events'] and result['ex_dividend_date'] == 'N/A':
-                result['ex_dividend_date'] = result['upcoming_events'][0]['date']
+                result['ex_dividend_date'] = f"{result['upcoming_events'][0]['date']} (estimated)"
         
         # If no upcoming events found, generate from historical patterns
         if not result['upcoming_events'] and result['dividends']:
@@ -1139,12 +1132,12 @@ class CorporateActions:
                         while next_date <= now:
                             next_date += timedelta(days=int(avg_interval))
                         
-                        days_until = (next_date - now).days
+                        days_until = (next_date.date() - now.date()).days
                         if days_until > 0 and days_until < 400:  # Within next year
                             result['upcoming_events'].append({
                                 'date': next_date.strftime('%Y-%m-%d'),
                                 'type': 'Expected Dividend',
-                                'details': f"~Rs.{last_amount:.2f} per share (estimated)",
+                                'details': f"~Rs.{last_amount:.2f} per share (estimated - not yet announced)",
                                 'days_until': days_until,
                                 'amount': last_amount,
                                 'estimated': True
@@ -1157,12 +1150,12 @@ class CorporateActions:
                     while next_date <= now:
                         next_date += timedelta(days=365)
                     
-                    days_until = (next_date - now).days
+                    days_until = (next_date.date() - now.date()).days
                     if days_until > 0 and days_until < 400:
                         result['upcoming_events'].append({
                             'date': next_date.strftime('%Y-%m-%d'),
                             'type': 'Expected Dividend',
-                            'details': f"~Rs.{last_amount:.2f} per share (estimated)",
+                            'details': f"~Rs.{last_amount:.2f} per share (estimated - not yet announced)",
                             'days_until': days_until,
                             'amount': last_amount,
                             'estimated': True

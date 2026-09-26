@@ -46,6 +46,13 @@ try:
 except ImportError:
     PDF_OK = False
 
+# Fast batch downloads + disk cache
+try:
+    import market_data
+    MARKET_DATA_OK = True
+except ImportError:
+    MARKET_DATA_OK = False
+
 # News import
 try:
     from newsapi import NewsApiClient
@@ -63,7 +70,7 @@ NIFTY50_STOCKS = [
     'ITC', 'SBIN', 'BHARTIARTL', 'KOTAKBANK', 'LT', 'AXISBANK',
     'BAJFINANCE', 'ASIANPAINT', 'MARUTI', 'SUNPHARMA', 'TITAN',
     'BAJAJFINSV', 'WIPRO', 'HCLTECH', 'ULTRACEMCO', 'NTPC',
-    'NESTLEIND', 'POWERGRID', 'TATAMOTORS', 'M&M', 'JSWSTEEL',
+    'NESTLEIND', 'POWERGRID', 'TMPV', 'M&M', 'JSWSTEEL',
     'TATASTEEL', 'TECHM', 'ADANIENT', 'ONGC', 'HINDALCO',
     'INDUSINDBK', 'DIVISLAB', 'DRREDDY', 'CIPLA', 'GRASIM',
     'BPCL', 'COALINDIA', 'HEROMOTOCO', 'EICHERMOT', 'UPL',
@@ -81,7 +88,7 @@ SENSEX30_STOCKS = [
     'ITC', 'SBIN', 'BHARTIARTL', 'KOTAKBANK', 'LT', 'AXISBANK',
     'BAJFINANCE', 'ASIANPAINT', 'MARUTI', 'SUNPHARMA', 'TITAN',
     'BAJAJFINSV', 'WIPRO', 'HCLTECH', 'ULTRACEMCO', 'NTPC',
-    'NESTLEIND', 'POWERGRID', 'TATAMOTORS', 'M&M', 'JSWSTEEL',
+    'NESTLEIND', 'POWERGRID', 'TMPV', 'M&M', 'JSWSTEEL',
     'TATASTEEL', 'TECHM', 'INDUSINDBK'
 ]
 
@@ -113,6 +120,17 @@ NYSE_TOP25 = [
     'XOM', 'LLY', 'JPM', 'V', 'PG', 'MA', 'JNJ', 'HD', 'CVX', 'MRK',
     'ABBV', 'PEP', 'KO', 'COST', 'WMT', 'MCD', 'BA'
 ]
+
+
+def _load_min_liquidity():
+    """Liquidity threshold (Rs crore/day) set in the app's Settings tab."""
+    try:
+        return float(json.loads((Path(__file__).parent / "app_settings.json").read_text()).get('min_liquidity_cr', 1.0))
+    except Exception:
+        return 1.0
+
+
+MIN_LIQUIDITY_CR = _load_min_liquidity()
 
 
 # ============================================================
@@ -338,18 +356,20 @@ class StockAnalyzer:
     def __init__(self):
         self.cache = {}
     
-    def analyze(self, symbol, exchange='NSE'):
-        """Fetch and analyze a single stock."""
+    def analyze(self, symbol, exchange='NSE', df=None):
+        """Analyze a single stock. Fetches its history unless df is given."""
         if not DATA_OK:
             return None
-        
+
         try:
-            suffixes = {'NSE': '.NS', 'BSE': '.BO', 'NYSE': '', 'NASDAQ': ''}
-            suffix = suffixes.get(exchange, '')
-            
-            ticker = yf.Ticker(f"{symbol}{suffix}")
-            df = ticker.history(period='1y')
-            
+            if df is None:
+                # NSE symbols fall back to BSE (.BO) for BSE-only listings
+                suffixes = {'NSE': ['.NS', '.BO'], 'BSE': ['.BO'], 'NYSE': [''], 'NASDAQ': ['']}
+                for suffix in suffixes.get(exchange, ['']):
+                    df = yf.Ticker(f"{symbol}{suffix}").history(period='1y')
+                    if df is not None and len(df) >= 20:
+                        break
+
             if df is None or df.empty or len(df) < 20:
                 return None
             
@@ -391,10 +411,11 @@ class StockAnalyzer:
             # Moving Averages
             try:
                 sma20 = float(ta.trend.SMAIndicator(df['Close'], 20).sma_indicator().iloc[-1])
-                sma50 = float(ta.trend.SMAIndicator(df['Close'], 50).sma_indicator().iloc[-1]) if len(df) >= 50 else current_price
-                sma200 = float(ta.trend.SMAIndicator(df['Close'], 200).sma_indicator().iloc[-1]) if len(df) >= 200 else current_price
+                # None = stock too new for that average; it's skipped in scoring instead of counting as bearish
+                sma50 = float(ta.trend.SMAIndicator(df['Close'], 50).sma_indicator().iloc[-1]) if len(df) >= 50 else None
+                sma200 = float(ta.trend.SMAIndicator(df['Close'], 200).sma_indicator().iloc[-1]) if len(df) >= 200 else None
             except:
-                sma20 = sma50 = sma200 = current_price
+                sma20, sma50, sma200 = current_price, None, None
             
             # SuperTrend
             try:
@@ -430,10 +451,10 @@ class StockAnalyzer:
             # MA scoring
             if current_price > sma20: score += 10
             else: score -= 10
-            if current_price > sma50: score += 5
-            else: score -= 5
-            if current_price > sma200: score += 5
-            else: score -= 5
+            if sma50 is not None:
+                score += 5 if current_price > sma50 else -5
+            if sma200 is not None:
+                score += 5 if current_price > sma200 else -5
             
             # Volume scoring
             if volume_ratio > 1.5: score += 5
@@ -488,8 +509,9 @@ class StockAnalyzer:
                 'macd_hist': round(macd_hist, 4),
                 'macd_signal': macd_signal,
                 'sma20': round(sma20, 2),
-                'sma50': round(sma50, 2),
-                'sma200': round(sma200, 2),
+                'sma50': round(sma50, 2) if sma50 is not None else None,
+                'sma200': round(sma200, 2) if sma200 is not None else None,
+                'avg_value_cr': round(float((df['Close'] * df['Volume']).tail(20).mean()) / 1e7, 2),
                 'supertrend': st_signal,
                 'supertrend_dir': st_direction,
                 'vwap': round(vwap, 2),
@@ -506,9 +528,21 @@ class StockAnalyzer:
             return None
     
     def analyze_batch(self, symbols, exchange='NSE', max_stocks=50):
-        """Analyze multiple stocks."""
+        """Analyze multiple stocks (one batch download via market_data when available)."""
+        symbols = list(symbols)[:max_stocks]
+        if MARKET_DATA_OK:
+            data = market_data.load_history(symbols, years=5, exchange=exchange)
+            results = []
+            for symbol in symbols:
+                df = data.get(symbol.upper())
+                if df is not None:
+                    result = self.analyze(symbol, exchange, market_data.slice_period(df, '1y'))
+                    if result:
+                        results.append(result)
+            return results
+
         results = []
-        for symbol in symbols[:max_stocks]:
+        for symbol in symbols:
             result = self.analyze(symbol, exchange)
             if result:
                 results.append(result)
@@ -540,13 +574,7 @@ class NewsFetcher:
                     news = ticker.news
                     if news:
                         for item in news[:3]:
-                            news_items.append({
-                                'title': item.get('title', 'N/A'),
-                                'publisher': item.get('publisher', 'Unknown'),
-                                'link': item.get('link', ''),
-                                'published': datetime.fromtimestamp(item.get('providerPublishTime', 0)).strftime('%Y-%m-%d %H:%M') if item.get('providerPublishTime') else 'N/A',
-                                'source': 'Yahoo Finance'
-                            })
+                            news_items.append(self._parse_yf_news(item))
                 except:
                     pass
         except:
@@ -570,6 +598,34 @@ class NewsFetcher:
                 unique_news.append(item)
         
         return unique_news[:max_articles]
+
+    @staticmethod
+    def _parse_yf_news(item):
+        """Handle both yfinance news formats (flat pre-0.2.50, nested under 'content' in newer versions)."""
+        content = item.get('content')
+        if isinstance(content, dict):
+            provider = content.get('provider') or {}
+            url = (content.get('canonicalUrl') or content.get('clickThroughUrl') or {}).get('url', '')
+            published = content.get('pubDate') or content.get('displayTime') or ''
+            try:
+                published = datetime.strptime(published[:16], '%Y-%m-%dT%H:%M').strftime('%Y-%m-%d %H:%M')
+            except ValueError:
+                published = published or 'N/A'
+            return {
+                'title': content.get('title') or 'N/A',
+                'publisher': provider.get('displayName', 'Unknown'),
+                'link': url,
+                'published': published,
+                'source': 'Yahoo Finance'
+            }
+        ts = item.get('providerPublishTime')
+        return {
+            'title': item.get('title', 'N/A'),
+            'publisher': item.get('publisher', 'Unknown'),
+            'link': item.get('link', ''),
+            'published': datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else 'N/A',
+            'source': 'Yahoo Finance'
+        }
 
 
 # ============================================================
@@ -602,7 +658,26 @@ class DailyReportGenerator:
             'summary': {},
             'news': [],
         }
-        
+
+        # 0. User's watchlist (e.g. {'NSE': ['RELIANCE', 'TCS']})
+        if watchlist:
+            print("\n[0/5] Analyzing your watchlist...")
+            wl_results = []
+            for exchange, symbols in watchlist.items():
+                wl_results.extend(self.analyzer.analyze_batch(list(symbols), exchange, len(symbols)))
+            report['sections']['watchlist'] = {
+                'title': 'Your Watchlist',
+                'stocks': sorted(wl_results, key=lambda x: x['score'], reverse=True),
+                'total': len(wl_results),
+                'strong_buy': sum(1 for r in wl_results if r['recommendation'] == 'STRONG BUY'),
+                'buy': sum(1 for r in wl_results if r['recommendation'] == 'BUY'),
+                'hold': sum(1 for r in wl_results if r['recommendation'] == 'HOLD'),
+                'sell': sum(1 for r in wl_results if r['recommendation'] == 'SELL'),
+                'strong_sell': sum(1 for r in wl_results if r['recommendation'] == 'STRONG SELL'),
+                'avg_score': round(sum(r['score'] for r in wl_results) / len(wl_results), 1) if wl_results else 0,
+            }
+            print(f"   Analyzed {len(wl_results)} watchlist stocks")
+
         # 1. Nifty 50 Analysis
         if include_india:
             print("\n[1/5] Analyzing Nifty 50 stocks...")
@@ -662,8 +737,9 @@ class DailyReportGenerator:
         # 5. Summary
         print("\n[5/5] Creating Summary...")
         all_stocks = []
-        for section in report['sections'].values():
-            all_stocks.extend(section.get('stocks', []))
+        for key, section in report['sections'].items():
+            if key != 'watchlist':  # summary/top picks are market-wide; watchlist has its own section
+                all_stocks.extend(section.get('stocks', []))
         
         total_stocks = len(all_stocks)
         total_sb = sum(1 for s in all_stocks if s['recommendation'] == 'STRONG BUY')
@@ -792,7 +868,36 @@ class DailyReportGenerator:
             ]))
             elements.append(t)
             elements.append(Spacer(1, 15))
-            
+
+            # Watchlist Section
+            wl = report.get('sections', {}).get('watchlist', {})
+            if wl:
+                elements.append(Paragraph(f"YOUR WATCHLIST ({wl.get('total', 0)} Stocks)", section_style))
+                elements.append(Paragraph(f"Avg Score: {wl.get('avg_score', 0)} | Buy: {wl.get('strong_buy', 0) + wl.get('buy', 0)} | Hold: {wl.get('hold', 0)} | Sell: {wl.get('sell', 0) + wl.get('strong_sell', 0)}", subtitle_style))
+
+                data = [['Symbol', 'Price', 'Chg%', 'RSI', 'ST', 'Score', 'Signal', 'SL', 'T1', 'Rs Cr/day']]
+                for s in wl.get('stocks', []):
+                    liq = s.get('avg_value_cr', 0)
+                    data.append([
+                        s['symbol'], f"{s['price']:.2f}", f"{s['change_pct']:+.1f}%",
+                        f"{s['rsi']:.0f}", s['supertrend'], f"{s['score']:.0f}",
+                        s['recommendation'], f"{s['stop_loss']:.2f}", f"{s['target1']:.2f}",
+                        f"{liq:.2f}" + (" LOW" if liq < MIN_LIQUIDITY_CR else "")
+                    ])
+
+                t = Table(data, colWidths=[65, 55, 40, 35, 35, 35, 70, 50, 50, 55], repeatRows=1)
+                t.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#7c3aed')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 7),
+                    ('FONTSIZE', (0, 1), (-1, -1), 6),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#d1d5db')),
+                ]))
+                elements.append(t)
+                elements.append(Spacer(1, 10))
+
             # Top Picks
             top_picks = report.get('top_picks', [])
             if top_picks:
@@ -932,6 +1037,11 @@ class DailyReportGenerator:
             traceback.print_exc()
             return None
     
+    @staticmethod
+    def _rec_class(rec):
+        """CSS class for a recommendation (the stylesheet only defines buy/hold/sell)."""
+        return 'buy' if 'BUY' in rec else 'sell' if 'SELL' in rec else 'hold'
+
     def generate_email_body(self, report=None):
         """Generate HTML email body."""
         if report is None:
@@ -976,12 +1086,22 @@ class DailyReportGenerator:
                 </div>
         """
         
+        # Watchlist
+        wl = report.get('sections', {}).get('watchlist', {})
+        if wl.get('stocks'):
+            html += f'<div class="section"><h2>Your Watchlist ({wl["total"]} stocks)</h2><table><tr><th>#</th><th>Symbol</th><th>Price</th><th>Chg%</th><th>RSI</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>Rs Cr/day</th></tr>'
+            for i, s in enumerate(wl['stocks'], 1):
+                rec_class = self._rec_class(s['recommendation'])
+                html += f'<tr><td>{i}</td><td><b>{s["symbol"]}</b></td><td>{s["price"]:.2f}</td><td>{s["change_pct"]:+.2f}%</td><td>{s["rsi"]:.0f}</td><td>{s["score"]:.0f}</td><td class="{rec_class}">{s["recommendation"]}</td><td>{s["stop_loss"]:.2f}</td><td>{s["target1"]:.2f}</td><td>{s.get("avg_value_cr", 0):.2f}{" LOW" if s.get("avg_value_cr", 0) < MIN_LIQUIDITY_CR else ""}</td></tr>'
+            html += (f'</table><p style="font-size:11px;color:#666">LOW = average traded value below Rs {MIN_LIQUIDITY_CR:g} crore/day: '
+                     'stop-loss and targets are less reliable for these stocks.</p></div>')
+
         # Top Picks
         top_picks = report.get('top_picks', [])
         if top_picks:
             html += '<div class="section"><h2>Top 15 Picks</h2><table><tr><th>#</th><th>Symbol</th><th>Exchange</th><th>Price</th><th>Chg%</th><th>Score</th><th>Signal</th></tr>'
             for i, s in enumerate(top_picks[:15], 1):
-                rec_class = s['recommendation'].lower().replace(' ', '-')
+                rec_class = self._rec_class(s['recommendation'])
                 currency = '$' if s.get('exchange') in ['NYSE', 'NASDAQ'] else ''
                 html += f'<tr><td>{i}</td><td><b>{s["symbol"]}</b></td><td>{s.get("exchange","")}</td><td>{currency}{s["price"]:.2f}</td><td>{s["change_pct"]:+.2f}%</td><td>{s["score"]:.0f}</td><td class="{rec_class}">{s["recommendation"]}</td></tr>'
             html += '</table></div>'

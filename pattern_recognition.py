@@ -10,27 +10,55 @@ import pandas as pd
 from typing import List, Dict, Tuple, Optional
 
 
+MAX_PATTERN_AGE = 60     # a peak/trough pattern must complete within the last ~3 months of trading days
+MIN_SWING = 0.03         # tops/bottoms must be separated by at least a 3% dip/rally to count
+MIN_SEPARATION = 10      # ...and at least 10 trading days apart
+
+
 class PatternDetector:
     """Advanced pattern detection for technical analysis."""
-    
+
     def __init__(self):
         self.patterns_found = []
-    
+
     def detect_all_patterns(self, df: pd.DataFrame) -> Dict:
         """Detect all patterns in the given dataframe."""
         if df is None or len(df) < 5:
             return {'chart': [], 'candlestick': [], 'harmonic': [], 'summary': {}}
-        
+
+        chart, ignored = self.resolve_conflicts(self.detect_chart_patterns(df))
         results = {
-            'chart': self.detect_chart_patterns(df),
+            'chart': chart,
             'candlestick': self.detect_candlestick_patterns(df),
             'harmonic': self.detect_harmonic_patterns(df),
         }
-        
+
         # Create summary
         results['summary'] = self.create_pattern_summary(results)
-        
+        results['summary']['ignored_conflicts'] = ignored
+
         return results
+
+    @staticmethod
+    def resolve_conflicts(patterns: List[Dict]) -> Tuple[List[Dict], List[str]]:
+        """A chart can't be forming a bullish AND a bearish reversal at once.
+
+        When chart patterns disagree, keep the side of the most convincing pattern:
+        a confirmed breakout (STRONG) first, then the most recently completed one,
+        then the more reliable one. Returns (kept patterns, names of ignored ones).
+        """
+        directional = [p for p in patterns if p.get('signal') in ('BULLISH', 'BEARISH')]
+        if len({p['signal'] for p in directional}) < 2:
+            return patterns, []
+        best = max(directional, key=lambda p: (p.get('strength') == 'STRONG',
+                                               -p.get('bars_ago', 0), p.get('reliability', 0)))
+        kept = [p for p in patterns if p.get('signal') not in ('BULLISH', 'BEARISH') or p['signal'] == best['signal']]
+        ignored = [p['name'] for p in directional if p['signal'] != best['signal']]
+        return kept, ignored
+
+    @staticmethod
+    def _age_text(bars_ago: int) -> str:
+        return " (completed today)" if bars_ago == 0 else f" (completed {bars_ago} trading days ago)"
     
     def create_pattern_summary(self, results: Dict) -> Dict:
         """Create a summary of detected patterns."""
@@ -166,194 +194,205 @@ class PatternDetector:
         return troughs
     
     def detect_head_shoulders(self, close, high, low, peaks, troughs) -> Optional[Dict]:
-        """Detect Head and Shoulders pattern."""
+        """Detect Head and Shoulders pattern (most recent one only, right shoulder within MAX_PATTERN_AGE)."""
         if len(peaks) < 3 or len(troughs) < 2:
             return None
-        
-        # Look at last 3 peaks
-        for i in range(len(peaks) - 2):
+
+        n = len(close)
+        # Newest candidate first; stop once the right shoulder is too old to matter
+        for i in range(len(peaks) - 3, -1, -1):
             p1, p2, p3 = peaks[i], peaks[i+1], peaks[i+2]
-            
+            if n - 1 - p3 > MAX_PATTERN_AGE:
+                break
+
             # Left shoulder, Head, Right shoulder
             ls = high[p1]
             head = high[p2]
             rs = high[p3]
-            
-            # Head should be highest
-            if head > ls and head > rs:
-                # Shoulders should be approximately equal
-                if abs(ls - rs) / ls < 0.05:
-                    # Find neckline (troughs between peaks)
-                    neckline_troughs = [t for t in troughs if p1 < t < p3]
-                    if neckline_troughs:
-                        neckline = min(low[t] for t in neckline_troughs)
-                        current_price = close[-1]
-                        
-                        if current_price < neckline:
-                            signal = 'BEARISH'
-                            strength = 'STRONG'
-                        else:
-                            signal = 'BEARISH'
-                            strength = 'FORMING'
-                        
-                        return {
-                            'name': 'Head & Shoulders',
-                            'signal': signal,
-                            'strength': strength,
-                            'category': 'CHART',
-                            'description': f'Bearish reversal pattern. Head at {head:.2f}, Neckline at {neckline:.2f}',
-                            'target': neckline - (head - neckline),
-                            'stop_loss': head,
-                            'reliability': 85
-                        }
+
+            # Head should be highest; shoulders approximately equal
+            if head > ls and head > rs and abs(ls - rs) / ls < 0.05:
+                # Neckline: lows between the shoulders
+                neckline_troughs = [t for t in troughs if p1 < t < p3]
+                if not neckline_troughs:
+                    continue
+                neckline = min(low[t] for t in neckline_troughs)
+                if (min(ls, rs) - neckline) / neckline < MIN_SWING:
+                    continue
+                confirmed = close[-1] < neckline
+                bars_ago = n - 1 - p3
+                return {
+                    'name': 'Head & Shoulders',
+                    'signal': 'BEARISH',
+                    'strength': 'STRONG' if confirmed else 'FORMING',
+                    'category': 'CHART',
+                    'description': f'Bearish reversal pattern. Head at {head:.2f}, Neckline at {neckline:.2f}'
+                                   + (' - neckline broken' if confirmed else '') + self._age_text(bars_ago),
+                    'target': neckline - (head - neckline),
+                    'stop_loss': head,
+                    'reliability': 85,
+                    'bars_ago': bars_ago,
+                }
         return None
-    
+
     def detect_inverse_head_shoulders(self, close, high, low, peaks, troughs) -> Optional[Dict]:
-        """Detect Inverse Head and Shoulders pattern."""
+        """Detect Inverse Head and Shoulders pattern (most recent one only)."""
         if len(troughs) < 3 or len(peaks) < 2:
             return None
-        
-        for i in range(len(troughs) - 2):
+
+        n = len(close)
+        for i in range(len(troughs) - 3, -1, -1):
             t1, t2, t3 = troughs[i], troughs[i+1], troughs[i+2]
-            
+            if n - 1 - t3 > MAX_PATTERN_AGE:
+                break
+
             ls = low[t1]
             head = low[t2]
             rs = low[t3]
-            
-            if head < ls and head < rs:
-                if abs(ls - rs) / ls < 0.05:
-                    neckline_peaks = [p for p in peaks if t1 < p < t3]
-                    if neckline_peaks:
-                        neckline = max(high[p] for p in neckline_peaks)
-                        current_price = close[-1]
-                        
-                        if current_price > neckline:
-                            signal = 'BULLISH'
-                            strength = 'STRONG'
-                        else:
-                            signal = 'BULLISH'
-                            strength = 'FORMING'
-                        
-                        return {
-                            'name': 'Inverse Head & Shoulders',
-                            'signal': signal,
-                            'strength': strength,
-                            'category': 'CHART',
-                            'description': f'Bullish reversal pattern. Head at {head:.2f}, Neckline at {neckline:.2f}',
-                            'target': neckline + (neckline - head),
-                            'stop_loss': head,
-                            'reliability': 85
-                        }
+
+            if head < ls and head < rs and abs(ls - rs) / ls < 0.05:
+                neckline_peaks = [p for p in peaks if t1 < p < t3]
+                if not neckline_peaks:
+                    continue
+                neckline = max(high[p] for p in neckline_peaks)
+                if (neckline - max(ls, rs)) / max(ls, rs) < MIN_SWING:
+                    continue
+                confirmed = close[-1] > neckline
+                bars_ago = n - 1 - t3
+                return {
+                    'name': 'Inverse Head & Shoulders',
+                    'signal': 'BULLISH',
+                    'strength': 'STRONG' if confirmed else 'FORMING',
+                    'category': 'CHART',
+                    'description': f'Bullish reversal pattern. Head at {head:.2f}, Neckline at {neckline:.2f}'
+                                   + (' - neckline broken' if confirmed else '') + self._age_text(bars_ago),
+                    'target': neckline + (neckline - head),
+                    'stop_loss': head,
+                    'reliability': 85,
+                    'bars_ago': bars_ago,
+                }
         return None
-    
+
     def detect_double_top(self, close, high, peaks) -> Optional[Dict]:
-        """Detect Double Top pattern."""
+        """Detect Double Top pattern (last two peaks, recent, with a real dip between them)."""
         if len(peaks) < 2:
             return None
-        
+
+        n = len(close)
         p1, p2 = peaks[-2], peaks[-1]
         top1 = high[p1]
         top2 = high[p2]
-        
-        if abs(top1 - top2) / top1 < 0.03:  # Within 3%
-            support = min(close[p1:p2])
-            current_price = close[-1]
-            
-            if current_price < support:
-                signal = 'BEARISH'
-                strength = 'STRONG'
-            else:
-                signal = 'BEARISH'
-                strength = 'FORMING'
-            
+        if n - 1 - p2 > MAX_PATTERN_AGE or p2 - p1 < MIN_SEPARATION:
+            return None
+
+        support = min(close[p1:p2])
+        if abs(top1 - top2) / top1 < 0.03 and (min(top1, top2) - support) / support >= MIN_SWING:
+            confirmed = close[-1] < support
+            bars_ago = n - 1 - p2
             return {
                 'name': 'Double Top',
-                'signal': signal,
-                'strength': strength,
+                'signal': 'BEARISH',
+                'strength': 'STRONG' if confirmed else 'FORMING',
                 'category': 'CHART',
-                'description': f'Bearish reversal. Two tops at {top1:.2f} and {top2:.2f}',
+                'description': f'Bearish reversal. Two tops at {top1:.2f} and {top2:.2f}, support {support:.2f}'
+                               + (' - support broken' if confirmed else '') + self._age_text(bars_ago),
                 'target': support - (top1 - support),
                 'stop_loss': max(top1, top2),
-                'reliability': 75
+                'reliability': 75,
+                'bars_ago': bars_ago,
             }
         return None
-    
+
     def detect_double_bottom(self, close, low, troughs) -> Optional[Dict]:
-        """Detect Double Bottom pattern."""
+        """Detect Double Bottom pattern (last two troughs, recent, with a real rally between them)."""
         if len(troughs) < 2:
             return None
-        
+
+        n = len(close)
         t1, t2 = troughs[-2], troughs[-1]
         bottom1 = low[t1]
         bottom2 = low[t2]
-        
-        if abs(bottom1 - bottom2) / bottom1 < 0.03:
-            resistance = max(close[t1:t2])
-            current_price = close[-1]
-            
-            if current_price > resistance:
-                signal = 'BULLISH'
-                strength = 'STRONG'
-            else:
-                signal = 'BULLISH'
-                strength = 'FORMING'
-            
+        if n - 1 - t2 > MAX_PATTERN_AGE or t2 - t1 < MIN_SEPARATION:
+            return None
+
+        resistance = max(close[t1:t2])
+        if abs(bottom1 - bottom2) / bottom1 < 0.03 and (resistance - max(bottom1, bottom2)) / max(bottom1, bottom2) >= MIN_SWING:
+            confirmed = close[-1] > resistance
+            bars_ago = n - 1 - t2
             return {
                 'name': 'Double Bottom',
-                'signal': signal,
-                'strength': strength,
+                'signal': 'BULLISH',
+                'strength': 'STRONG' if confirmed else 'FORMING',
                 'category': 'CHART',
-                'description': f'Bullish reversal. Two bottoms at {bottom1:.2f} and {bottom2:.2f}',
+                'description': f'Bullish reversal. Two bottoms at {bottom1:.2f} and {bottom2:.2f}, resistance {resistance:.2f}'
+                               + (' - resistance broken' if confirmed else '') + self._age_text(bars_ago),
                 'target': resistance + (resistance - bottom1),
                 'stop_loss': min(bottom1, bottom2),
-                'reliability': 75
+                'reliability': 75,
+                'bars_ago': bars_ago,
             }
         return None
-    
+
     def detect_triple_top(self, close, high, peaks) -> Optional[Dict]:
         """Detect Triple Top pattern."""
         if len(peaks) < 3:
             return None
-        
+
+        n = len(close)
         p1, p2, p3 = peaks[-3], peaks[-2], peaks[-1]
         t1, t2, t3 = high[p1], high[p2], high[p3]
-        
-        if abs(t1 - t2) / t1 < 0.03 and abs(t2 - t3) / t2 < 0.03:
-            support = min(close[p1:p3])
+        if n - 1 - p3 > MAX_PATTERN_AGE or min(p2 - p1, p3 - p2) < MIN_SEPARATION:
+            return None
+
+        support = min(close[p1:p3])
+        if (abs(t1 - t2) / t1 < 0.03 and abs(t2 - t3) / t2 < 0.03
+                and (min(t1, t2, t3) - support) / support >= MIN_SWING):
+            confirmed = close[-1] < support
+            bars_ago = n - 1 - p3
             return {
                 'name': 'Triple Top',
                 'signal': 'BEARISH',
-                'strength': 'STRONG',
+                'strength': 'STRONG' if confirmed else 'FORMING',
                 'category': 'CHART',
-                'description': f'Strong bearish reversal. Three tops near {t1:.2f}',
+                'description': f'Bearish reversal. Three tops near {t1:.2f}, support {support:.2f}'
+                               + (' - support broken' if confirmed else '') + self._age_text(bars_ago),
                 'target': support - (t1 - support),
                 'stop_loss': max(t1, t2, t3),
-                'reliability': 80
+                'reliability': 80,
+                'bars_ago': bars_ago,
             }
         return None
-    
+
     def detect_triple_bottom(self, close, low, troughs) -> Optional[Dict]:
         """Detect Triple Bottom pattern."""
         if len(troughs) < 3:
             return None
-        
+
+        n = len(close)
         t1, t2, t3 = troughs[-3], troughs[-2], troughs[-1]
         b1, b2, b3 = low[t1], low[t2], low[t3]
-        
-        if abs(b1 - b2) / b1 < 0.03 and abs(b2 - b3) / b2 < 0.03:
-            resistance = max(close[t1:t3])
+        if n - 1 - t3 > MAX_PATTERN_AGE or min(t2 - t1, t3 - t2) < MIN_SEPARATION:
+            return None
+
+        resistance = max(close[t1:t3])
+        if (abs(b1 - b2) / b1 < 0.03 and abs(b2 - b3) / b2 < 0.03
+                and (resistance - max(b1, b2, b3)) / max(b1, b2, b3) >= MIN_SWING):
+            confirmed = close[-1] > resistance
+            bars_ago = n - 1 - t3
             return {
                 'name': 'Triple Bottom',
                 'signal': 'BULLISH',
-                'strength': 'STRONG',
+                'strength': 'STRONG' if confirmed else 'FORMING',
                 'category': 'CHART',
-                'description': f'Strong bullish reversal. Three bottoms near {b1:.2f}',
+                'description': f'Bullish reversal. Three bottoms near {b1:.2f}, resistance {resistance:.2f}'
+                               + (' - resistance broken' if confirmed else '') + self._age_text(bars_ago),
                 'target': resistance + (resistance - b1),
                 'stop_loss': min(b1, b2, b3),
-                'reliability': 80
+                'reliability': 80,
+                'bars_ago': bars_ago,
             }
         return None
-    
+
     def detect_ascending_triangle(self, close, high, low) -> Optional[Dict]:
         """Detect Ascending Triangle pattern."""
         if len(close) < 30:

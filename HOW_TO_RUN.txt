@@ -27,6 +27,42 @@ Option A: Double-click "run_app.bat"
 Option B: Run: python dr_shah_analysis.py
 
 
+NEW FEATURES
+--------------
+
+1. BACKTEST tab
+   Click "Run Backtest" to see whether the score actually predicted returns
+   for your watchlist over the past 2-5 years, which indicators help or hurt,
+   and suggested weights (learned on older data, checked on newer data).
+   "Apply Suggested Weights" saves them; Settings > "Reset Defaults" undoes it.
+
+2. FAST SCANS
+   All stocks download in one batch and prices are cached in the
+   "data_cache" folder, so re-scans only fetch the latest days.
+   (Safe to delete data_cache - it is rebuilt automatically.)
+
+3. EMAIL REPORT WITHOUT THE APP OPEN
+   Settings > Auto Report Scheduling > set the time > "Install Windows Task".
+   The report is emailed on NSE trading days (weekends and NSE holidays are
+   skipped, never sent twice a day). The PC must be on and you must be
+   logged in. "Remove Windows Task" turns it off.
+   Test it manually:  python scheduled_report.py --force
+
+4. LIQUIDITY FLAG
+   Scan Results has a "Traded/day (Cr)" column. Stocks below the threshold
+   (Settings > Liquidity Filter, default Rs 1 crore/day) are marked LOW,
+   get a warning on the Stop-Loss & Targets tab, and can be hidden with
+   "Hide illiquid". The Backtest tab can test liquid stocks only.
+
+5. MORE ACCURATE SIGNALS
+   - Newly listed stocks are no longer scored as bearish just because they
+     don't have 200 days of history yet (missing averages are skipped).
+   - Chart patterns must be recent (last ~3 months) and can no longer show
+     bullish and bearish reversals at the same time.
+   - Dividends shown as "Expected ... (ESTIMATED - not announced)" are
+     projections from past years, not announcements.
+
+
 TROUBLESHOOTING
 -----------------
 

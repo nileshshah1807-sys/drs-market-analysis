@@ -96,6 +96,30 @@ try:
 except ImportError:
     pass
 
+# Fast batch price download + disk cache
+MARKET_DATA_OK = False
+try:
+    import market_data
+    MARKET_DATA_OK = True
+except ImportError:
+    pass
+
+# Strategy backtester
+BACKTEST_OK = False
+try:
+    import backtest
+    BACKTEST_OK = True
+except ImportError:
+    pass
+
+# Scheduled (Windows Task Scheduler) email report
+SCHEDULER_OK = False
+try:
+    import scheduled_report
+    SCHEDULER_OK = True
+except ImportError:
+    pass
+
 # Try PIL
 try:
     from PIL import Image, ImageTk
@@ -118,6 +142,8 @@ except ImportError:
 log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dr_shah_analysis.log')
 logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s', filemode='a')
 logger = logging.getLogger(__name__)
+# yfinance logs every .NS miss (BSE-only stocks fall back to .BO) - keep the app log readable
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 # ============================================================
 # CONFIGURATION
@@ -126,17 +152,22 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent
 LOGO_PATH = BASE_DIR / "logo_new.png"
 WATCHLIST_FILE = BASE_DIR / "watchlist.json"
+SCHEDULE_FILE = BASE_DIR / "schedule_config.json"
+WEIGHTS_FILE = BASE_DIR / "weights_config.json"
+APP_SETTINGS_FILE = BASE_DIR / "app_settings.json"
+DEFAULT_MIN_LIQUIDITY_CR = 1.0   # stocks trading less than this (Rs crore/day) are flagged as illiquid
+HISTORY_YEARS = 5   # years of price history kept in the disk cache (scans use the last 2y; backtests use all)
 LOG_FILE = BASE_DIR / "dr_shah_analysis.log"
 
 SECTOR_MAP = {
     'Banking': ['HDFCBANK', 'ICICIBANK', 'SBIN', 'KOTAKBANK', 'AXISBANK', 'INDUSINDBK', 'FEDERALBNK', 'BANDHANBNK', 'IDFCFIRSTB', 'PNB', 'BANKBARODA', 'CANBK', 'UNIONBANK'],
     'IT': ['TCS', 'INFY', 'WIPRO', 'HCLTECH', 'TECHM', 'LTIM', 'MPHASIS', 'COFORGE', 'PERSISTENT', 'LTTS'],
-    'Auto': ['MARUTI', 'TATAMOTORS', 'BAJAJ-AUTO', 'HEROMOTOCO', 'EICHERMOT', 'M&M', 'TVSMOTOR', 'BAJFINANCE', 'BAJAJFINSV', 'ESCORTS'],
+    'Auto': ['MARUTI', 'TATAMOTORS', 'TMPV', 'TMCV', 'BAJAJ-AUTO', 'HEROMOTOCO', 'EICHERMOT', 'M&M', 'TVSMOTOR', 'BAJFINANCE', 'BAJAJFINSV', 'ESCORTS'],
     'Pharma': ['SUNPHARMA', 'DRREDDY', 'CIPLA', 'DIVISLAB', 'LUPIN', 'BIOCON', 'TORNTPHARM', 'ALKEM', 'GLENMARK'],
     'FMCG': ['HINDUNILVR', 'ITC', 'NESTLEIND', 'BRITANNIA', 'DABUR', 'MARICO', 'GODREJCP', 'TATACONSUM', 'COLPAL'],
     'Energy': ['RELIANCE', 'ONGC', 'BPCL', 'POWERGRID', 'NTPC', 'GAIL', 'IOC', 'HINDPETRO', 'TATAPOWER'],
     'Metals': ['TATASTEEL', 'JSWSTEEL', 'HINDALCO', 'VEDL', 'NATIONALUM', 'JINDALSTEL', 'SAIL', 'NMDC'],
-    'Infra': ['LT', 'ADANIENT', 'ADANIPORTS', 'ADANITRANS', 'GMRINFRA', 'IRCON', 'RVNL', 'NBCC'],
+    'Infra': ['LT', 'ADANIENT', 'ADANIPORTS', 'ADANIENSOL', 'GMRINFRA', 'IRCON', 'RVNL', 'NBCC'],
     'Telecom': ['BHARTIARTL', 'IDEA', 'INDUSTOWER', 'HFCL'],
     'Chemicals': ['PIDILITIND', 'ASIANPAINT', 'BERGEPAINT', 'SRF', 'DEEPAKNTR', 'ATUL', 'NAVINFLUOR'],
 }
@@ -206,7 +237,11 @@ class ThreadSafeGUI:
         try:
             while True:
                 func, args, kwargs = self.queue.get_nowait()
-                func(*args, **kwargs)
+                try:
+                    func(*args, **kwargs)
+                except Exception as e:
+                    # One failing update must not stop the queue from being processed
+                    logger.error(f"GUI update error in {getattr(func, '__name__', func)}: {e}")
         except queue.Empty:
             pass
         self.root.after(40, self._process)
@@ -230,7 +265,15 @@ class Analyzer:
         cached = self.cache.get(key)
         if cached is not None:
             return cached
-        
+
+        if MARKET_DATA_OK:
+            df = market_data.load_history([symbol], years=HISTORY_YEARS).get(symbol.upper())
+            df = market_data.slice_period(df, period) if df is not None else None
+            if df is not None and len(df) >= 20:
+                self.cache.set(key, df)
+                return df
+            return pd.DataFrame()
+
         for suffix in ['.NS', '.BO']:
             try:
                 ticker = yf.Ticker(f"{symbol}{suffix}")
@@ -241,35 +284,60 @@ class Analyzer:
             except:
                 continue
         return pd.DataFrame()
-    
-    def analyze(self, df):
+
+    def fetch_many(self, symbols, period="2y", progress=None):
+        """Fetch many symbols at once (one batch download + disk cache). Returns {symbol: df}."""
+        if not MARKET_DATA_OK:
+            out = {}
+            for s in symbols:
+                df = self.fetch(s, period)
+                if df is not None and not df.empty:
+                    out[s] = df
+            return out
+        data = market_data.load_history(symbols, years=HISTORY_YEARS, progress=progress)
+        out = {}
+        for s in symbols:
+            df = data.get(s.upper())
+            if df is not None:
+                df = market_data.slice_period(df, period)
+                if len(df) >= 20:
+                    out[s] = df
+                    self.cache.set(f"{s}_{period}", df)
+        return out
+
+    def analyze(self, df, with_ai=False):
         if df is None or df.empty:
             raise ValueError("No data")
         
         price = safe_float(df['Close'].iloc[-1])
         prev = safe_float(df['Close'].iloc[-2]) if len(df) > 1 else price
-        
+
+        # Liquidity: average daily traded value over the last 20 sessions, in Rs crore
+        try: liquidity_cr = safe_float((df['Close'] * df['Volume']).tail(20).mean() / 1e7)
+        except: liquidity_cr = 0.0
+
         # RSI
         try: rsi = safe_float(ta.momentum.RSIIndicator(df['Close'], 14).rsi().iloc[-1], 50)
         except: rsi = 50.0
         
-        # MACD
+        # MACD (None when there isn't enough history - ~35 days - so it scores neutral instead of bearish)
         try:
             m = ta.trend.MACD(df['Close'])
-            macd = {'macd': safe_float(m.macd().iloc[-1]), 'signal': safe_float(m.macd_signal().iloc[-1]),
-                    'hist': safe_float(m.macd_diff().iloc[-1])}
-        except: macd = {'macd': 0, 'signal': 0, 'hist': 0}
-        
-        # Moving Averages
+            macd = {'macd': safe_float(m.macd().iloc[-1], None), 'signal': safe_float(m.macd_signal().iloc[-1], None),
+                    'hist': safe_float(m.macd_diff().iloc[-1], None)}
+        except: macd = {'macd': None, 'signal': None, 'hist': None}
+
+        # Moving Averages - None when the stock is too new for that average (it's then skipped
+        # by the scorer; treating it as equal to the price used to count as a bearish signal)
         try:
             ma = {
-                'sma20': safe_float(ta.trend.SMAIndicator(df['Close'], 20).sma_indicator().iloc[-1], price),
-                'sma50': safe_float(ta.trend.SMAIndicator(df['Close'], 50).sma_indicator().iloc[-1], price) if len(df) >= 50 else price,
-                'sma200': safe_float(ta.trend.SMAIndicator(df['Close'], 200).sma_indicator().iloc[-1], price) if len(df) >= 200 else price,
-                'ema12': safe_float(ta.trend.EMAIndicator(df['Close'], 12).ema_indicator().iloc[-1], price),
-                'ema26': safe_float(ta.trend.EMAIndicator(df['Close'], 26).ema_indicator().iloc[-1], price)
+                'sma20': safe_float(ta.trend.SMAIndicator(df['Close'], 20).sma_indicator().iloc[-1], None),
+                'sma50': safe_float(ta.trend.SMAIndicator(df['Close'], 50).sma_indicator().iloc[-1], None) if len(df) >= 50 else None,
+                'sma200': safe_float(ta.trend.SMAIndicator(df['Close'], 200).sma_indicator().iloc[-1], None) if len(df) >= 200 else None,
+                'ema12': safe_float(ta.trend.EMAIndicator(df['Close'], 12).ema_indicator().iloc[-1], None),
+                'ema26': safe_float(ta.trend.EMAIndicator(df['Close'], 26).ema_indicator().iloc[-1], None)
             }
-        except: ma = {'sma20': price, 'sma50': price, 'sma200': price, 'ema12': price, 'ema26': price}
+        except: ma = {'sma20': None, 'sma50': None, 'sma200': None, 'ema12': None, 'ema26': None}
         
         # Bollinger
         try:
@@ -379,13 +447,15 @@ class Analyzer:
             except: patterns = {'chart': [], 'candlestick': [], 'harmonic': [], 'summary': {}}
         
         # AI Analysis
+        # Skipped in scans by default: it retrains ML models per stock (~0.5s each) and its
+        # output isn't used by the score or shown anywhere.
         ai_results = {}
-        if self.ai_engine:
+        if with_ai and self.ai_engine:
             try: ai_results = self.ai_engine.full_analysis(df)
             except: ai_results = {}
         
         return {
-            'price': price, 'prev': prev, 'rsi': rsi, 'macd': macd, 'ma': ma,
+            'price': price, 'prev': prev, 'liquidity_cr': liquidity_cr, 'rsi': rsi, 'macd': macd, 'ma': ma,
             'boll': boll, 'stoch': stoch, 'adx': adx, 'obv_trend': obv_trend,
             'wr': wr, 'cci': cci, 'atr': atr,
             'supertrend': {'val': st_val, 'sig': st_sig, 'dir': st_dir},
@@ -400,6 +470,7 @@ class Analyzer:
 
 class Scorer:
     WEIGHTS = {'rsi': 12, 'macd': 12, 'ma': 15, 'boll': 8, 'stoch': 8, 'adx': 8, 'vol': 8, 'mom': 8, 'st': 11, 'vwap': 10}
+    DEFAULT_WEIGHTS = dict(WEIGHTS)
     
     @classmethod
     def score(cls, data):
@@ -426,16 +497,20 @@ class Scorer:
     
     @staticmethod
     def _macd(m):
+        if m.get('hist') is None or m.get('macd') is None or m.get('signal') is None:
+            return 50   # not enough history for MACD - neutral
         s = 50 + (25 if safe_float(m['hist']) > 0 else -25) + (15 if safe_float(m['macd']) > safe_float(m['signal']) else -15)
         return max(0, min(100, s))
-    
+
     @staticmethod
     def _ma(price, ma):
         s = 50
         for v in ma.values():
+            if v is None:
+                continue   # stock too new for this average - skip rather than count as bearish
             s += 10 if price > safe_float(v) else -10
-        s50, s200 = safe_float(ma.get('sma50')), safe_float(ma.get('sma200'))
-        if s50 > 0 and s200 > 0:
+        s50, s200 = ma.get('sma50'), ma.get('sma200')
+        if s50 is not None and s200 is not None and s50 > 0 and s200 > 0:
             s += 10 if s50 > s200 else -10
         return max(0, min(100, s))
     
@@ -549,7 +624,9 @@ class App:
         
         try:
             if LOGO_PATH.exists():
-                self.root.iconbitmap(str(LOGO_PATH) if sys.platform == 'win32' else '')
+                # iconbitmap() only accepts .ico files; iconphoto() works with PNG
+                self._icon_img = tk.PhotoImage(file=str(LOGO_PATH))
+                self.root.iconphoto(True, self._icon_img)
         except: pass
         
         self.analyzer = Analyzer()
@@ -562,12 +639,19 @@ class App:
         self.watchlist_groups = {'All Stocks': [], 'Favorites': [], 'Swing Trades': [], 
                                  'Long Term': [], 'Dividend Picks': [], 'Momentum': []}
         self.current_group = 'All Stocks'
+        self._scroll_canvases = []
+        self._last_auto_report_date = None
+        self._auto_report_running = False
         self.load_watchlist()
         self.load_watchlist_groups()
+        self._load_weights()
+        self.min_liquidity_cr = self._load_app_settings().get('min_liquidity_cr', DEFAULT_MIN_LIQUIDITY_CR)
         self.build_ui()
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
         self.refresh_watchlist()
         self.center()
         self._setup_market_status()
+        self.root.after(30000, self._check_auto_report)
         logger.info("App started v7.0")
     
     def center(self):
@@ -735,6 +819,7 @@ class App:
         self.build_corporate_tab()
         self.build_charts_tab()
         self.build_sector_tab()
+        self.build_backtest_tab()
         self.build_settings_tab()
         self.build_help_tab()
         
@@ -752,7 +837,7 @@ class App:
         self.root.bind('<F5>', lambda e: self.start_scan())
         self.root.bind('<Control-i>', lambda e: self.import_list())
         self.root.bind('<Control-s>', lambda e: self.save_list())
-        self.root.bind('<Delete>', lambda e: self.del_stock())
+        self.root.bind('<Delete>', lambda e: None if self._typing_in(e.widget) else self.del_stock())
         self.root.bind('<Control-e>', lambda e: self.export_results())
         self.root.bind('<Control-p>', lambda e: self.export_pdf())
         self.root.bind('<Control-d>', lambda e: self.generate_daily_report())
@@ -761,7 +846,7 @@ class App:
         self.root.bind('<Escape>', lambda e: self._on_escape())
         self.root.bind('<Control-a>', lambda e: self._select_all_results())
         self.root.bind('<Control-l>', lambda e: self.view_log())
-        self.root.bind('<F1>', lambda e: self.nb.select(9))
+        self.root.bind('<F1>', lambda e: self.nb.select(self.help_tab))
     
     def build_watchlist_tab(self):
         T = THEME
@@ -803,7 +888,8 @@ class App:
         tab = tk.Frame(self.nb, bg=T['bg'])
         self.nb.add(tab, text="  Scan Results  ")
         
-        cols = ('Symbol', 'Price', 'Change%', 'RSI', 'SuperTrend', 'VWAP', 'Score', 'Recommendation', '52W High', '52W Low', 'ATR')
+        cols = ('Symbol', 'Price', 'Change%', 'RSI', 'SuperTrend', 'VWAP', 'Score', 'Recommendation', '52W High', '52W Low', 'ATR',
+                'Traded/day (Cr)')
         
         # Search bar above results
         search_frame = tk.Frame(tab, bg=T['bg'])
@@ -811,7 +897,7 @@ class App:
         
         tk.Label(search_frame, text="Search:", bg=T['bg'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=5)
         self.search_var = tk.StringVar()
-        self.search_var.trace('w', lambda *args: self.filter_results())
+        self.search_var.trace_add('write', lambda *args: self.filter_results())  # trace('w') was removed in Tk 9
         self.search_entry = tk.Entry(search_frame, textvariable=self.search_var, bg=T['input'], fg=T['fg'],
                                      font=('Segoe UI', 10), width=30, relief=tk.FLAT,
                                      highlightbackground=T['border'], highlightthickness=1)
@@ -827,6 +913,15 @@ class App:
                                 state='readonly', width=15)
         filter_cb.pack(side=tk.LEFT, padx=5)
         filter_cb.bind("<<ComboboxSelected>>", lambda e: self.filter_results())
+
+        self.hide_illiquid_var = tk.BooleanVar(value=False)
+        self.hide_illiquid_cb = tk.Checkbutton(search_frame, variable=self.hide_illiquid_var, command=self.filter_results,
+                                               text=f"Hide illiquid (< Rs {self.min_liquidity_cr:g} Cr/day)",
+                                               bg=T['bg'], fg=T['fg'], selectcolor=T['bg3'], activebackground=T['bg'],
+                                               font=('Segoe UI', 10))
+        self.hide_illiquid_cb.pack(side=tk.LEFT, padx=(20, 5))
+        Tooltip(self.hide_illiquid_cb, "Illiquid stocks: stop-loss and targets are unreliable because\n"
+                                       "prices can gap and orders may not fill. Threshold is set in Settings.")
         
         frame = tk.Frame(tab, bg=T['bg'])
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -862,9 +957,31 @@ class App:
         
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
-        
+        self._scroll_canvases.append(canvas)
+
         return frame
+
+    def _on_mousewheel(self, e):
+        """Scroll whichever scrollable tab canvas is under the mouse pointer."""
+        try:
+            w = self.root.winfo_containing(e.x_root, e.y_root) or getattr(e, 'widget', None)
+        except (KeyError, tk.TclError):
+            return  # pointer over an internal Tk widget (e.g. combobox dropdown)
+        while isinstance(w, tk.Misc):
+            if w in self._scroll_canvases:
+                w.yview_scroll(int(-1 * (e.delta / 120)), "units")
+                return
+            w = w.master
+
+    @staticmethod
+    def _typing_in(widget):
+        """True if keyboard focus is in a text-entry widget (so shortcuts like Delete shouldn't fire)."""
+        return isinstance(widget, (tk.Entry, tk.Text, tk.Spinbox, ttk.Entry))
+
+    @staticmethod
+    def _wl_symbol(display):
+        """Watchlist listbox rows look like 'SYMBOL  [Group1, Group2]' - return just the symbol."""
+        return display.split('  ')[0].strip()
     
     def build_breakdown_tab(self):
         self.bd_frame = self.build_scrollable_tab("Score Breakdown")
@@ -1059,6 +1176,8 @@ class App:
                             else:
                                 status = "Upcoming" if is_upcoming else "Past"
                                 tag = 'upcoming' if is_upcoming else 'past'
+                            if action.get('estimated'):
+                                status = f"est. {status}"   # projected from past years, not announced
 
                             amount_str = f"Rs.{action.get('amount', 0):.2f}" if action.get('amount', 0) > 0 else "-"
                             icon = action.get('icon', '')
@@ -1101,7 +1220,7 @@ class App:
 
             except Exception as e:
                 logger.error(f"Corporate scan error: {e}")
-                self.root.after(0, lambda: self.corp_status.configure(text=f"Error: {e}"))
+                self.root.after(0, lambda err=e: self.corp_status.configure(text=f"Error: {err}"))
                 import traceback
                 traceback.print_exc()
 
@@ -1133,8 +1252,9 @@ class App:
                         'purpose': f"{ev.get('type', 'Dividend')} - {ev.get('details', '')}",
                         'amount': ev.get('amount', 0), 'ex_date': ev.get('date', ''),
                         'record_date': '', 'days_until': ev.get('days_until'),
-                        'is_upcoming': True, 'is_past': False, 'source': 'Local DB',
-                        'icon': 'Div',
+                        'is_upcoming': True, 'is_past': False,
+                        'source': 'Estimate' if ev.get('estimated') else 'Local DB',
+                        'icon': 'Div', 'estimated': bool(ev.get('estimated')),
                     })
                 for div in divs[:5]:
                     if not any(a['ex_date'] == div['date'] for a in actions['_all_actions_list']):
@@ -1168,11 +1288,13 @@ class App:
                     else:
                         tag = 'past'
                         status = 'Past'
+                    if act.get('estimated'):
+                        status = f"est. {status}"
 
                     amount_str = f"Rs.{act.get('amount', 0):.2f}" if act.get('amount', 0) > 0 else "-"
                     vals = (symbol, name[:28], act.get('category', '').title(),
                             act.get('purpose', '')[:50], amount_str,
-                            act.get('ex_date', ''), '', str(days) if days else '', status, 'Local')
+                            act.get('ex_date', ''), '', str(days) if days is not None else '', status, 'Local')
                     self.root.after(0, lambda v=vals, t=tag:
                         self.corp_tree.insert('', tk.END, values=v, tags=(t,)))
 
@@ -1292,6 +1414,8 @@ class App:
 
                 lines.append(f"")
                 lines.append(f"  [{cat}] {purpose}")
+                if act.get('estimated'):
+                    lines.append("    ** ESTIMATE projected from previous years' dates - NOT an announced dividend **")
                 lines.append(f"    Ex-Date:      {ex_date}{days_str}")
                 if record_date:
                     lines.append(f"    Record Date:  {record_date}")
@@ -1470,6 +1594,8 @@ class App:
                 else:
                     status = "Upcoming" if is_upcoming else "Past"
                     tag = 'upcoming' if is_upcoming else 'past'
+                if action.get('estimated'):
+                    status = f"est. {status}"
 
                 amount_str = f"Rs.{action.get('amount', 0):.2f}" if action.get('amount', 0) > 0 else "-"
                 icon = action.get('icon', '')
@@ -1577,29 +1703,42 @@ class App:
         if not sel:
             wl_sel = self.wl_list.curselection()
             if wl_sel:
-                symbol = self.wl_list.get(wl_sel[0])
+                symbol = self._wl_symbol(self.wl_list.get(wl_sel[0]))
             else:
                 messagebox.showinfo("Info", "Select a stock first!")
                 return
         else:
-            symbol = self.tree.item(sel[0])['values'][0]
-        
+            symbol = str(self.tree.item(sel[0])['values'][0])
+
         period = self.chart_period_var.get()
-        
+
         for widget in self.chart_frame.winfo_children():
             widget.destroy()
-        
-        tk.Label(self.chart_frame, text=f"Loading {symbol}...",
-                bg=THEME['bg'], fg=THEME['fg'], font=('Segoe UI', 12)).pack(pady=20)
+
+        loading = tk.Label(self.chart_frame, text=f"Loading {symbol}...",
+                bg=THEME['bg'], fg=THEME['fg'], font=('Segoe UI', 12))
+        loading.pack(pady=20)
         self.root.update()
-        
-        def draw():
+
+        def fetch():
+            # Network fetch in the background; all Tk work happens in render() on the main thread
             try:
                 df = self.analyzer.fetch(symbol, period)
+                self.gui.schedule(render, df)
+            except Exception as e:
+                self.gui.schedule(fail, str(e))
+
+        def fail(msg):
+            loading.configure(text=msg, fg=THEME['danger'])
+            messagebox.showerror("Error", msg)
+
+        def render(df):
+            try:
                 if df is None or df.empty:
-                    self.root.after(0, lambda: messagebox.showerror("Error", f"No data for {symbol}"))
+                    fail(f"No data for {symbol}")
                     return
-                
+
+                loading.destroy()
                 fig = Figure(figsize=(14, 8), dpi=100, facecolor='#0a0e1a')
                 
                 ax1 = fig.add_subplot(211)
@@ -1630,9 +1769,9 @@ class App:
                 canvas.draw()
                 canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
-        
-        threading.Thread(target=draw, daemon=True).start()
+                fail(str(e))
+
+        threading.Thread(target=fetch, daemon=True).start()
     
     def build_sector_tab(self):
         """Build Sector Analysis tab."""
@@ -1715,6 +1854,219 @@ class App:
                 text=f"Rotation: {sector_scores[0][0]} LEADING ({sector_scores[0][1]:.1f}) | "
                      f"{sector_scores[-1][0]} LAGGING ({sector_scores[-1][1]:.1f}) | Spread: {spread:.1f} pts")
     
+    def build_backtest_tab(self):
+        """Build Backtest tab: does the score actually predict returns on these stocks?"""
+        T = THEME
+        tab = tk.Frame(self.nb, bg=T['bg'])
+        self.nb.add(tab, text="  Backtest  ")
+
+        header = tk.Frame(tab, bg=T['bg2'], height=50)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        tk.Label(header, text="Strategy Backtest", bg=T['bg2'], fg=T['gold'],
+                 font=('Segoe UI', 14, 'bold')).pack(side=tk.LEFT, padx=15)
+
+        self.bt_apply_btn = self.btn(header, "Apply Suggested Weights", T['success'], self.apply_suggested_weights)
+        self.bt_apply_btn.pack(side=tk.RIGHT, padx=10)
+        self.bt_apply_btn.configure(state=tk.DISABLED)
+        self.bt_run_btn = self.btn(header, "Run Backtest", T['accent'], self.run_backtest)
+        self.bt_run_btn.pack(side=tk.RIGHT, padx=5)
+
+        self.bt_horizon_var = tk.StringVar(value="10 days")
+        ttk.Combobox(header, textvariable=self.bt_horizon_var, values=["5 days", "10 days", "20 days"],
+                     state='readonly', width=8).pack(side=tk.RIGHT, padx=5)
+        tk.Label(header, text="Hold for:", bg=T['bg2'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.RIGHT)
+        self.bt_history_var = tk.StringVar(value="5 years")
+        ttk.Combobox(header, textvariable=self.bt_history_var, values=["2 years", "3 years", "5 years"],
+                     state='readonly', width=8).pack(side=tk.RIGHT, padx=(5, 15))
+        tk.Label(header, text="History:", bg=T['bg2'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.RIGHT)
+        self.bt_liquid_var = tk.BooleanVar(value=False)
+        self.bt_liquid_cb = tk.Checkbutton(header, variable=self.bt_liquid_var,
+                                           text=f"Liquid stocks only (>= Rs {self.min_liquidity_cr:g} Cr/day)",
+                                           bg=T['bg2'], fg=T['fg'], selectcolor=T['bg3'], activebackground=T['bg2'],
+                                           font=('Segoe UI', 9))
+        self.bt_liquid_cb.pack(side=tk.RIGHT, padx=10)
+
+        self.bt_status = tk.Label(tab, text="Tests the scoring system on your watchlist's past prices: for every past day it "
+                                            "scores each stock exactly like a scan would, then checks what the price did next.",
+                                  bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 10), wraplength=1300, justify=tk.LEFT)
+        self.bt_status.pack(anchor=tk.W, padx=15, pady=(8, 2))
+        self.bt_summary = tk.Label(tab, text="", bg=T['bg'], fg=T['fg'], font=('Segoe UI', 11, 'bold'),
+                                   wraplength=1300, justify=tk.LEFT)
+        self.bt_summary.pack(anchor=tk.W, padx=15, pady=(2, 6))
+
+        tables = tk.Frame(tab, bg=T['bg'])
+        tables.pack(fill=tk.BOTH, expand=True, padx=10)
+
+        # Left: performance by recommendation
+        left = tk.LabelFrame(tables, text=" What happened after each signal (newer 40% of history) ", bg=T['bg'],
+                             fg=T['accent'], font=('Segoe UI', 10, 'bold'))
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        cols = ('Weights', 'Signal', 'Times', 'Avg Return', 'Win Rate', 'vs Avg')
+        self.bt_bucket_tree = ttk.Treeview(left, columns=cols, show='headings', height=11)
+        for c, w in zip(cols, (80, 100, 65, 85, 75, 75)):
+            self.bt_bucket_tree.heading(c, text=c, anchor=tk.CENTER)
+            self.bt_bucket_tree.column(c, width=w, anchor=tk.CENTER)
+        self.bt_bucket_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.bt_bucket_tree.tag_configure('good', foreground='#34d399')
+        self.bt_bucket_tree.tag_configure('bad', foreground='#f87171')
+
+        # Right: each indicator's predictive power
+        right = tk.LabelFrame(tables, text=" Which indicators actually help ", bg=T['bg'],
+                              fg=T['accent'], font=('Segoe UI', 10, 'bold'))
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        cols = ('Indicator', 'Current Wt', 'Power (older)', 'Power (newer)', 'Suggested Wt', 'Verdict')
+        self.bt_ind_tree = ttk.Treeview(right, columns=cols, show='headings', height=11)
+        for c, w in zip(cols, (105, 80, 95, 95, 90, 90)):
+            self.bt_ind_tree.heading(c, text=c, anchor=tk.CENTER)
+            self.bt_ind_tree.column(c, width=w, anchor=tk.CENTER)
+        self.bt_ind_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.bt_ind_tree.tag_configure('good', foreground='#34d399')
+        self.bt_ind_tree.tag_configure('bad', foreground='#f87171')
+
+        tk.Label(tab, text="Power = rank correlation between the indicator's score and the next-period return "
+                           "(above 0 = higher score was followed by better returns; 0.03+ is meaningful for daily stock data).  "
+                           "Suggested weights are learned on the OLDER 60% of history and judged on the NEWER 40%, "
+                           "so the comparison is honest. Past results don't guarantee future returns; daily signals overlap, "
+                           "and delisted stocks aren't included.",
+                 bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 8), wraplength=1300, justify=tk.LEFT).pack(anchor=tk.W, padx=15, pady=6)
+
+        self._bt_result = None
+        self._bt_cache = None   # (key, samples, skipped) - reused when only the holding period changes
+
+    def run_backtest(self):
+        if not BACKTEST_OK or not MARKET_DATA_OK:
+            messagebox.showerror("Error", "backtest.py / market_data.py are missing.")
+            return
+        if not self.watchlist:
+            messagebox.showwarning("Warning", "Add stocks to the watchlist first!")
+            return
+        watchlist = list(self.watchlist)
+        years = int(self.bt_history_var.get().split()[0])
+        horizon = int(self.bt_horizon_var.get().split()[0])
+        weights = dict(Scorer.WEIGHTS)
+        min_liq = self.min_liquidity_cr if self.bt_liquid_var.get() else 0
+        key = (tuple(sorted(watchlist)), years)
+        cached = self._bt_cache if self._bt_cache and self._bt_cache[0] == key else None
+
+        self.bt_run_btn.configure(state=tk.DISABLED, text="RUNNING...")
+        self.bt_apply_btn.configure(state=tk.DISABLED)
+        self._bt_set_status(f"Loading {years} years of prices for {len(watchlist)} stocks...")
+
+        def work():
+            try:
+                progress = lambda msg, pct=None: self.gui.schedule(self._bt_set_status, msg)
+                if cached:
+                    result = backtest.run_backtest(None, Scorer, weights, horizon, progress,
+                                                   samples=cached[1], skipped=cached[2], min_liquidity_cr=min_liq)
+                else:
+                    data = market_data.load_history(watchlist, years=HISTORY_YEARS, progress=progress)
+                    data = {s: market_data.slice_period(df, f"{years}y") for s, df in data.items()}
+                    missing = [s for s in watchlist if s.upper() not in data]
+                    result = backtest.run_backtest(data, Scorer, weights, horizon, progress, min_liquidity_cr=min_liq)
+                    result['skipped'] = sorted(set(result.get('skipped', []) + missing))
+                    if 'samples' in result:
+                        self._bt_cache = (key, result['samples'], result['skipped'])
+                self.gui.schedule(self._show_backtest, result)
+            except Exception as e:
+                logger.error(f"Backtest error: {e}")
+                self.gui.schedule(self._show_backtest, {'error': str(e)})
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _bt_set_status(self, msg):
+        self.bt_status.configure(text=msg, fg=THEME['fg3'])
+
+    def _show_backtest(self, r):
+        self.bt_run_btn.configure(state=tk.NORMAL, text="Run Backtest")
+        for tree in (self.bt_bucket_tree, self.bt_ind_tree):
+            tree.delete(*tree.get_children())
+        if r.get('error'):
+            self.bt_status.configure(text=f"Backtest failed: {r['error']}", fg=THEME['danger'])
+            self.bt_summary.configure(text="")
+            return
+        self._bt_result = r
+        h = r['horizon']
+
+        skipped = f"  |  Skipped (too little history): {', '.join(r['skipped'][:8])}" if r['skipped'] else ""
+        if r.get('min_liquidity_cr'):
+            skipped += (f"  |  Liquid only: {r['excluded_illiquid']:,} stock-days below "
+                        f"Rs {r['min_liquidity_cr']:g} Cr/day excluded")
+        ret_word = "vs. your watchlist's average" if r['relative'] else "(absolute)"
+        self.bt_status.configure(
+            text=f"{r['n_stocks']} stocks, {r['start']} to {r['end']}, {r['n_samples']:,} stock-days scored  |  "
+                 f"Learned on {r['start']} to {r['split_date']}, tested on {r['split_date']} to {r['end']}  |  "
+                 f"Holding {h} trading days (avg stock: {r['baseline_return']:+.2f}%, up {r['baseline_win']:.0f}% of the time)"
+                 f"{skipped}", fg=THEME['fg3'])
+
+        cur, sug = r['current'], r['suggested']
+        def fmt(ev):
+            return f"power {ev['ic']:+.3f}, best-scored 20% beat worst-scored 20% by {ev['spread']:+.2f}% per {h} days"
+        lines = [f"Current weights: {fmt(cur)}"]
+        color = THEME['fg']
+        if sug:
+            lines.append(f"Suggested weights: {fmt(sug)}")
+            better_ic = sug['ic'] > cur['ic'] + 0.01
+            better_spread = sug['spread'] > cur['spread'] + 0.05
+            if better_ic and better_spread:
+                lines.append("=> The suggested weights predicted better on unseen data. Consider 'Apply Suggested Weights'.")
+                color = THEME['success']
+            elif better_ic or better_spread:
+                lines.append("=> Mixed result: the suggested weights "
+                             + ("ranked stocks better overall, but the best-vs-worst gap was about the same."
+                                if better_ic else "widened the best-vs-worst gap, but ranked stocks no better overall.")
+                             + " Applying them is optional - the improvement is modest.")
+            else:
+                lines.append("=> The suggested weights were not better on unseen data - keep your current weights.")
+            self.bt_apply_btn.configure(state=tk.NORMAL)
+        else:
+            lines.append("No indicator showed positive predictive power - no weights to suggest.")
+        if cur['ic'] < 0:
+            lines.append(f"Note: with the current weights, HIGHER scores were followed by slightly WORSE {h}-day returns ({ret_word}).")
+            color = THEME['warning'] if color == THEME['fg'] else color
+        self.bt_summary.configure(text="\n".join(lines), fg=color)
+
+        def pct(v):
+            return "-" if v is None else f"{v:+.2f}%"
+        for label, ev in (("Current", cur), ("Suggested", sug)):
+            if not ev:
+                continue
+            for b in ev['buckets']:
+                tag = ()
+                if b['vs_avg'] is not None and b['n'] >= 30:
+                    good = b['vs_avg'] > 0 if 'BUY' in b['rec'] else b['vs_avg'] < 0 if 'SELL' in b['rec'] else None
+                    tag = ('good',) if good else ('bad',) if good is False else ()
+                self.bt_bucket_tree.insert('', tk.END, values=(
+                    label, b['rec'], f"{b['n']:,}", pct(b['avg_return']),
+                    "-" if b['win_rate'] is None else f"{b['win_rate']:.0f}%", pct(b['vs_avg'])), tags=tag)
+
+        for c in r['components']:
+            tr, te = c['ic_train'], c['ic_test']
+            if tr == tr and te == te and tr > 0.01 and te > 0.01:
+                verdict, tag = "Helps", ('good',)
+            elif tr == tr and te == te and tr < -0.01 and te < -0.01:
+                verdict, tag = "Hurts", ('bad',)
+            else:
+                verdict, tag = "Weak / mixed", ()
+            self.bt_ind_tree.insert('', tk.END, values=(
+                c['name'], c['weight'], f"{tr:+.3f}" if tr == tr else "-", f"{te:+.3f}" if te == te else "-",
+                "-" if c['suggested'] is None else c['suggested'], verdict), tags=tag)
+
+    def apply_suggested_weights(self):
+        r = self._bt_result
+        if not r or not r.get('suggested_weights'):
+            return
+        w = r['suggested_weights']
+        names = backtest.COMPONENT_NAMES
+        detail = "\n".join(f"  {names[k]:<14} {Scorer.WEIGHTS.get(k, 0):>3}  ->  {w[k]:>3}" for k in names)
+        if not messagebox.askyesno("Apply Suggested Weights",
+                f"Change scoring weights?\n\n{detail}\n\n"
+                "You can restore the originals any time with Settings > Reset Defaults."):
+            return
+        self._set_weights(dict(w))
+        messagebox.showinfo("Applied", "Suggested weights applied and saved.\n\nRe-scan (F5) to see updated scores.")
+        self.run_backtest()   # refresh the table so 'Current Wt' shows the new weights
+
     def build_settings_tab(self):
         """Build Settings tab."""
         T = THEME
@@ -1730,8 +2082,8 @@ class App:
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
-        
+        self._scroll_canvases.append(canvas)
+
         # Header
         header = tk.Frame(content, bg=T['bg2'], height=50)
         header.pack(fill=tk.X)
@@ -1806,7 +2158,8 @@ class App:
                                        bg=T['bg'], fg=T['accent'], font=('Segoe UI', 11, 'bold'))
         schedule_frame.pack(fill=tk.X, padx=20, pady=10)
         
-        self.auto_report_var = tk.BooleanVar(value=False)
+        sched = self._load_schedule_config()
+        self.auto_report_var = tk.BooleanVar(value=sched['enabled'])
         tk.Checkbutton(schedule_frame, text="Enable Auto-Report Email", 
                       variable=self.auto_report_var,
                       bg=T['bg'], fg=T['fg'], selectcolor=T['bg3'],
@@ -1818,12 +2171,12 @@ class App:
         tk.Label(sched_row, text="Send Time:", bg=T['bg'], fg=T['fg'],
                 font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=5)
         
-        self.report_hour_var = tk.StringVar(value="18")
+        self.report_hour_var = tk.StringVar(value=str(sched['hour']))
         ttk.Combobox(sched_row, textvariable=self.report_hour_var,
                     values=[str(h) for h in range(24)], state='readonly', width=5).pack(side=tk.LEFT)
         tk.Label(sched_row, text=":", bg=T['bg'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.LEFT)
         
-        self.report_min_var = tk.StringVar(value="00")
+        self.report_min_var = tk.StringVar(value=f"{sched['minute']:02d}")
         ttk.Combobox(sched_row, textvariable=self.report_min_var,
                     values=[f"{m:02d}" for m in range(0, 60, 5)], state='readonly', width=5).pack(side=tk.LEFT)
         
@@ -1836,12 +2189,42 @@ class App:
         tk.Label(type_row, text="Report Type:", bg=T['bg'], fg=T['fg'],
                 font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=5)
         
-        self.report_type_var = tk.StringVar(value="Indian + US")
+        self.report_type_var = tk.StringVar(value=sched['report_type'])
         ttk.Combobox(type_row, textvariable=self.report_type_var,
                     values=["Indian Only", "Indian + US", "US Only"], state='readonly', width=15).pack(side=tk.LEFT)
         
-        self.btn(schedule_frame, "Save Schedule", T['success'], self.save_schedule).pack(anchor=tk.W, padx=10, pady=10)
+        sched_btns = tk.Frame(schedule_frame, bg=T['bg'])
+        sched_btns.pack(fill=tk.X, padx=10, pady=(10, 2))
+        self.btn(sched_btns, "Save Schedule", T['success'], self.save_schedule).pack(side=tk.LEFT, padx=(0, 5))
+        self.btn(sched_btns, "Install Windows Task", T['accent'], self.install_windows_task).pack(side=tk.LEFT, padx=5)
+        self.btn(sched_btns, "Remove Windows Task", T['danger'], self.remove_windows_task).pack(side=tk.LEFT, padx=5)
+
+        self.task_status_lbl = tk.Label(schedule_frame, text="Windows task: checking...", bg=T['bg'], fg=T['fg3'],
+                                        font=('Segoe UI', 9))
+        self.task_status_lbl.pack(anchor=tk.W, padx=10, pady=(2, 2))
+        tk.Label(schedule_frame, text="The Windows task emails the report on NSE trading days even when this app is closed "
+                                      "(weekends & NSE holidays are skipped; sent at most once a day).",
+                 bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 8)).pack(anchor=tk.W, padx=10, pady=(0, 10))
+        self.root.after(1500, self._update_task_status)
         
+        # ===== LIQUIDITY =====
+        liq_frame = tk.LabelFrame(content, text=" Liquidity Filter ",
+                                  bg=T['bg'], fg=T['accent'], font=('Segoe UI', 11, 'bold'))
+        liq_frame.pack(fill=tk.X, padx=20, pady=10)
+        liq_row = tk.Frame(liq_frame, bg=T['bg'])
+        liq_row.pack(fill=tk.X, padx=10, pady=8)
+        tk.Label(liq_row, text="Flag stocks trading less than Rs", bg=T['bg'], fg=T['fg'],
+                 font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=(5, 5))
+        self.min_liquidity_var = tk.StringVar(value=f"{self.min_liquidity_cr:g}")
+        tk.Spinbox(liq_row, from_=0, to=1000, increment=0.5, textvariable=self.min_liquidity_var, width=7,
+                   bg=T['input'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.LEFT)
+        tk.Label(liq_row, text="crore per day (average traded value, last 20 days)", bg=T['bg'], fg=T['fg'],
+                 font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=5)
+        self.btn(liq_row, "Save", T['success'], self.save_liquidity_setting).pack(side=tk.LEFT, padx=10)
+        tk.Label(liq_frame, text="Thinly traded stocks can gap past a stop-loss and orders may not fill, so their "
+                                 "targets are shown with a warning and they can be hidden in Scan Results.",
+                 bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 8)).pack(anchor=tk.W, padx=15, pady=(0, 8))
+
         # ===== SCORING WEIGHTS =====
         weights_frame = tk.LabelFrame(content, text=" Scoring Weights (must total 100%) ", 
                                       bg=T['bg'], fg=T['accent'], font=('Segoe UI', 11, 'bold'))
@@ -1859,17 +2242,22 @@ class App:
         for i, (key, name, default) in enumerate(weights):
             row_num = i // 2
             col_num = (i % 2) * 3
-            
+
             tk.Label(weights_grid, text=f"{name}:", bg=T['bg'], fg=T['fg'],
                     font=('Segoe UI', 10), width=14, anchor=tk.W).grid(row=row_num, column=col_num, padx=5, pady=4, sticky='w')
-            
-            var = tk.IntVar(value=default)
+
+            var = tk.IntVar(value=Scorer.WEIGHTS.get(key, default))   # saved weights, if any
             self.weight_vars[key] = var
-            
-            tk.Spinbox(weights_grid, from_=0, to=30, textvariable=var, width=5,
+
+            tk.Spinbox(weights_grid, from_=0, to=100, textvariable=var, width=5,
                       bg=T['input'], fg=T['fg'], font=('Segoe UI', 10)).grid(row=row_num, column=col_num+1, padx=5, pady=4)
-        
-        self.btn(weights_frame, "Apply Weights", T['success'], self.apply_weights).pack(anchor=tk.W, padx=10, pady=10)
+
+        weight_btns = tk.Frame(weights_frame, bg=T['bg'])
+        weight_btns.pack(fill=tk.X, padx=10, pady=10)
+        self.btn(weight_btns, "Apply Weights", T['success'], self.apply_weights).pack(side=tk.LEFT, padx=(0, 5))
+        self.btn(weight_btns, "Reset Defaults", T['bg3'], self.reset_weights).pack(side=tk.LEFT, padx=5)
+        tk.Label(weight_btns, text="Tip: the Backtest tab can suggest weights based on your stocks' history",
+                 bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=10)
         
         # ===== MODULE STATUS =====
         status_frame = tk.LabelFrame(content, text=" Module Status ", 
@@ -2119,31 +2507,222 @@ class App:
             traceback.print_exc()
     
     def save_schedule(self):
-        """Save auto-report schedule."""
+        """Save auto-report schedule (and keep the Windows task, if installed, in sync)."""
         config = {
             'enabled': self.auto_report_var.get(),
             'hour': int(self.report_hour_var.get()),
             'minute': int(self.report_min_var.get()),
             'report_type': self.report_type_var.get(),
         }
-        
-        config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schedule_config.json")
+
         try:
-            with open(config_file, 'w') as f:
+            with open(SCHEDULE_FILE, 'w') as f:
                 json.dump(config, f, indent=2)
-            messagebox.showinfo("Success", f"Schedule saved! Report will be sent at {config['hour']:02d}:{config['minute']:02d}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save: {e}")
-    
+            return
+
+        task_msg = ""
+        if SCHEDULER_OK and scheduled_report.task_status():
+            if config['enabled']:
+                ok, m = scheduled_report.install_task(config['hour'], config['minute'])
+                task_msg = f"\n\nWindows task updated: {m}" if ok else f"\n\nWindows task update FAILED: {m}"
+            else:
+                ok, m = scheduled_report.remove_task()
+                task_msg = "\n\nWindows task removed." if ok else f"\n\nCould not remove Windows task: {m}"
+
+        if config['enabled']:
+            msg = f"Schedule saved! Report will be emailed on trading days at {config['hour']:02d}:{config['minute']:02d}."
+            if not task_msg:
+                msg += ("\n\nNote: without the Windows task the app must be open at that time.\n"
+                        "Click 'Install Windows Task' to send it even when the app is closed.")
+        else:
+            msg = "Schedule saved (auto-report is disabled)."
+        messagebox.showinfo("Success", msg + task_msg)
+        self._update_task_status()
+
+    def install_windows_task(self):
+        """Register a weekday Windows Task Scheduler job that emails the report without the app open."""
+        if not SCHEDULER_OK:
+            messagebox.showerror("Error", "scheduled_report.py is missing.")
+            return
+        if REPORT_OK and not EmailConfig().is_configured:
+            messagebox.showwarning("Email Not Configured",
+                "Set up and test your email first (Email Report Configuration above), then install the task.")
+            return
+        self.auto_report_var.set(True)
+        hour, minute = int(self.report_hour_var.get()), int(self.report_min_var.get())
+        try:
+            with open(SCHEDULE_FILE, 'w') as f:
+                json.dump({'enabled': True, 'hour': hour, 'minute': minute,
+                           'report_type': self.report_type_var.get()}, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save schedule: {e}")
+            return
+        ok, msg = scheduled_report.install_task(hour, minute)
+        if ok:
+            messagebox.showinfo("Windows Task Installed",
+                f"{msg}.\n\nThe report will be emailed on NSE trading days even when this app is closed "
+                "(weekends and NSE holidays are skipped).\n\n"
+                "Your PC must be switched on and you must be logged in at that time.")
+        else:
+            messagebox.showerror("Task Install Failed", msg)
+        self._update_task_status()
+
+    def remove_windows_task(self):
+        if not SCHEDULER_OK:
+            return
+        ok, msg = scheduled_report.remove_task()
+        if ok:
+            messagebox.showinfo("Removed", "Windows task removed.\nThe report will only be sent while the app is open.")
+        else:
+            messagebox.showwarning("Not Removed", msg)
+        self._update_task_status()
+
+    def _update_task_status(self):
+        if not hasattr(self, 'task_status_lbl'):
+            return
+        status = scheduled_report.task_status() if SCHEDULER_OK else None
+        if status:
+            self.task_status_lbl.configure(text=f"Windows task: INSTALLED  |  next run: {status}", fg=THEME['success'])
+        else:
+            self.task_status_lbl.configure(text="Windows task: not installed (report is only sent while the app is open)",
+                                           fg=THEME['fg3'])
+
+    @staticmethod
+    def _load_schedule_config():
+        config = {'enabled': False, 'hour': 18, 'minute': 0, 'report_type': 'Indian + US'}
+        try:
+            if SCHEDULE_FILE.exists():
+                with open(SCHEDULE_FILE, 'r') as f:
+                    data = json.load(f)
+                config['enabled'] = bool(data.get('enabled', False))
+                config['hour'] = int(data.get('hour', 18))
+                config['minute'] = int(data.get('minute', 0))
+                config['report_type'] = data.get('report_type', 'Indian + US')
+        except Exception as e:
+            logger.error(f"Schedule config load error: {e}")
+        return config
+
+    def _check_auto_report(self):
+        """Runs every 30s while the app is open: sends the scheduled report once per trading day.
+        (Shares the sent-today marker and lock with the Windows task, so it's never sent twice.)"""
+        try:
+            sched = self._load_schedule_config()
+            now = datetime.now()
+            due = now.replace(hour=sched['hour'], minute=sched['minute'], second=0, microsecond=0)
+            # 10-minute window so a report isn't fired hours late when the app is opened after the scheduled time
+            if (sched['enabled'] and REPORT_OK and SCHEDULER_OK and not self._auto_report_running
+                    and self._last_auto_report_date != now.date()
+                    and due <= now < due + timedelta(minutes=10)):
+                self._last_auto_report_date = now.date()
+                self._run_auto_report(sched['report_type'])
+        except Exception as e:
+            logger.error(f"Auto-report check error: {e}")
+        self.root.after(30000, self._check_auto_report)
+
+    def _run_auto_report(self, report_type):
+        watchlist = list(self.watchlist)
+        self._auto_report_running = True
+        self.status_lbl.configure(text="Auto-report: generating...")
+        logger.info(f"Auto-report started ({report_type})")
+
+        def work():
+            try:
+                sent, msg = scheduled_report.run_scheduled_report(watchlist=watchlist, report_type=report_type)
+            except Exception as e:
+                msg = f"Auto-report failed: {e}"
+            logger.info(f"Auto-report: {msg}")
+
+            def done():
+                self._auto_report_running = False
+                self.status_lbl.configure(text=f"Auto-report: {msg}"[:90])
+            self.gui.schedule(done)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def apply_weights(self):
-        total = sum(v.get() for v in self.weight_vars.values())
+        try:
+            weights = {k: v.get() for k, v in self.weight_vars.items()}
+        except tk.TclError:
+            messagebox.showwarning("Warning", "Weights must be whole numbers!")
+            return
+        total = sum(weights.values())
         if total != 100:
             messagebox.showwarning("Warning", f"Weights must total 100%! Current: {total}")
             return
-        for k, v in self.weight_vars.items():
-            self.scorer.WEIGHTS[k] = v.get()
-        messagebox.showinfo("Success", "Weights applied!")
-    
+        self._set_weights(weights)
+        messagebox.showinfo("Success", "Weights applied and saved!\n\nRe-scan (F5) to see updated scores.")
+
+    def reset_weights(self):
+        self._set_weights(dict(Scorer.DEFAULT_WEIGHTS))
+        messagebox.showinfo("Reset", "Default weights restored.\n\nRe-scan (F5) to see updated scores.")
+
+    def _set_weights(self, weights):
+        """Use these weights for scoring from now on, and remember them across restarts."""
+        Scorer.WEIGHTS.update(weights)
+        if hasattr(self, 'weight_vars'):
+            for k, v in weights.items():
+                if k in self.weight_vars:
+                    self.weight_vars[k].set(v)
+        try:
+            with open(WEIGHTS_FILE, 'w') as f:
+                json.dump(weights, f, indent=2)
+        except Exception as e:
+            logger.error(f"Could not save weights: {e}")
+
+    @staticmethod
+    def _load_app_settings():
+        try:
+            if APP_SETTINGS_FILE.exists():
+                with open(APP_SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.error(f"Could not load app settings: {e}")
+        return {}
+
+    def save_liquidity_setting(self):
+        try:
+            value = float(self.min_liquidity_var.get())
+            if value < 0:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            messagebox.showwarning("Warning", "Enter a number of Rs crore, e.g. 1 or 0.5")
+            return
+        self.min_liquidity_cr = value
+        settings = self._load_app_settings()
+        settings['min_liquidity_cr'] = value
+        try:
+            with open(APP_SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save: {e}")
+            return
+        if REPORT_OK:
+            import daily_report
+            daily_report.MIN_LIQUIDITY_CR = value   # module read the old value when it was imported
+        self.hide_illiquid_cb.configure(text=f"Hide illiquid (< Rs {value:g} Cr/day)")
+        if hasattr(self, 'bt_liquid_cb'):
+            self.bt_liquid_cb.configure(text=f"Liquid stocks only (>= Rs {value:g} Cr/day)")
+        self.filter_results()
+        n = sum(1 for r in getattr(self, '_all_results', []) if self._is_illiquid(r))
+        messagebox.showinfo("Saved", f"Stocks trading less than Rs {value:g} crore/day are now flagged as illiquid."
+                            + (f"\n\n{n} stock(s) in the last scan are below this." if getattr(self, '_all_results', None) else ""))
+
+    @staticmethod
+    def _load_weights():
+        """Load saved scoring weights (ignored unless they're complete and total 100)."""
+        try:
+            if WEIGHTS_FILE.exists():
+                with open(WEIGHTS_FILE, 'r') as f:
+                    data = json.load(f)
+                weights = {k: int(data[k]) for k in Scorer.DEFAULT_WEIGHTS}
+                if sum(weights.values()) == 100 and min(weights.values()) >= 0:
+                    Scorer.WEIGHTS.update(weights)
+        except Exception as e:
+            logger.error(f"Could not load weights: {e}")
+
     def toggle_password_visibility(self):
         """Toggle password field visibility."""
         if hasattr(self, 'pw_entry') and hasattr(self, 'pw_visible'):
@@ -2226,6 +2805,7 @@ class App:
         T = THEME
         tab = tk.Frame(self.nb, bg=T['bg'])
         self.nb.add(tab, text="  Help  ")
+        self.help_tab = tab
         
         header = tk.Frame(tab, bg=T['bg2'], height=50)
         header.pack(fill=tk.X)
@@ -2241,8 +2821,8 @@ class App:
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
-        
+        self._scroll_canvases.append(canvas)
+
         sections = [
             ("KEYBOARD SHORTCUTS", [
                 ("F5", "Scan all stocks"), ("Ctrl+I", "Import"), ("Ctrl+S", "Save"),
@@ -2272,6 +2852,11 @@ class App:
                 ("Long Term", "Investment picks"),
                 ("Dividend Picks", "Income stocks"),
                 ("Custom", "Create your own groups (Ctrl+G)"),
+            ]),
+            ("LIQUIDITY", [
+                ("Traded/day (Cr)", "Average daily traded value over the last 20 sessions, in Rs crore"),
+                ("LOW", "Below the Settings threshold - stop-loss/targets less reliable"),
+                ("Hide illiquid", "Scan Results checkbox to hide LOW stocks"),
             ]),
             ("SECTOR ROTATION", [
                 ("LEADING", "Strong scores, outperforming - stay invested"),
@@ -2331,7 +2916,7 @@ class App:
         if not sel:
             messagebox.showinfo("Info", "Select a stock first!")
             return
-        stock = self.wl_list.get(sel[0]).split('  ')[0].strip()
+        stock = self._wl_symbol(self.wl_list.get(sel[0]))
         group = self.group_var.get()
         if group == 'All Stocks':
             messagebox.showinfo("Info", "Select a specific group first")
@@ -2345,7 +2930,7 @@ class App:
         sel = self.wl_list.curselection()
         if not sel:
             return
-        stock = self.wl_list.get(sel[0]).split('  ')[0].strip()
+        stock = self._wl_symbol(self.wl_list.get(sel[0]))
         group = self.group_var.get()
         if group == 'All Stocks':
             messagebox.showinfo("Info", "Can't remove from 'All Stocks'")
@@ -2405,9 +2990,13 @@ class App:
     def del_stock(self):
         sel = self.wl_list.curselection()
         if not sel: return
-        s = self.wl_list.get(sel[0])
+        s = self._wl_symbol(self.wl_list.get(sel[0]))
         if s in self.watchlist:
             self.watchlist.remove(s)
+        for members in self.watchlist_groups.values():
+            if s in members:
+                members.remove(s)
+        self.save_watchlist_groups()
         self.refresh_watchlist()
         self.save_watchlist()
     
@@ -2541,7 +3130,8 @@ class App:
                 wb = Workbook()
                 ws = wb.active
                 ws.title = "DR. NILESH SHAH ANALYSIS"
-                headers = ['Symbol', 'Price', 'Change%', 'RSI', 'Score', 'Recommendation', 'Stop Loss', 'Target 1', 'Target 2', 'Risk:Reward']
+                headers = ['Symbol', 'Price', 'Change%', 'RSI', 'Score', 'Recommendation', 'Stop Loss', 'Target 1', 'Target 2', 'Risk:Reward',
+                           'Traded/day (Rs Cr)', 'Liquidity']
                 for i, h in enumerate(headers, 1):
                     c = ws.cell(row=1, column=i, value=h)
                     c.font = Font(bold=True, color="FFFFFF")
@@ -2558,6 +3148,8 @@ class App:
                     ws.cell(row=row, column=8, value=t.get('t1', ''))
                     ws.cell(row=row, column=9, value=t.get('t2', ''))
                     ws.cell(row=row, column=10, value=f"1:{t.get('rr', 0)}")
+                    ws.cell(row=row, column=11, value=round(r.get('data', {}).get('liquidity_cr', 0), 2))
+                    ws.cell(row=row, column=12, value='LOW' if self._is_illiquid(r) else 'OK')
                 wb.save(fp)
             else:
                 with open(fp, 'w', newline='') as f:
@@ -2767,7 +3359,13 @@ class App:
             box.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
             tk.Label(box, text=label, bg=T['bg3'], fg=T['fg3'], font=('Segoe UI', 9)).pack()
             tk.Label(box, text=value, bg=T['bg3'], fg=color, font=('Segoe UI', 18, 'bold')).pack()
-        
+
+        ignored = summary.get('ignored_conflicts') or []
+        if ignored:
+            tk.Label(self.pt_frame, text=f"Ignored conflicting pattern(s): {', '.join(ignored)} - a stronger or more recent "
+                                         f"pattern points the other way",
+                     bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9, 'italic')).pack(pady=(0, 5))
+
         # Chart Patterns
         chart_patterns = patterns.get('chart', [])
         if chart_patterns:
@@ -2802,9 +3400,14 @@ class App:
     
     def sort_tree(self, col):
         items = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
-        try:
-            items.sort(key=lambda t: float(t[0].replace('%', '').replace('+', '').replace('$', '')))
-        except:
+        
+        def num(text):   # leading number of a cell, e.g. '+1.25%' -> 1.25, '0.42 LOW' -> 0.42
+            m = re.match(r'\s*([+-]?\d+(?:\.\d+)?)', text.replace(',', ''))
+            return float(m.group(1)) if m else None
+        
+        if all(num(t[0]) is not None for t in items):
+            items.sort(key=lambda t: num(t[0]))
+        else:
             items.sort(key=lambda t: t[0])
         if not hasattr(self, '_sort_col') or self._sort_col != col:
             self._sort_asc = True
@@ -2828,53 +3431,56 @@ class App:
         threading.Thread(target=self._scan, daemon=True).start()
     
     def _scan(self):
-        total = len(self.watchlist)
+        watchlist = list(self.watchlist)
+        total = len(watchlist)
         failed = []
+        t0 = time.time()
         
-        for i, sym in enumerate(self.watchlist):
-            success = False
-            for attempt in range(3):  # Retry up to 3 times
-                try:
-                    self.gui.schedule(self._status, f"Scanning {sym} ({i+1}/{total}) attempt {attempt+1}...", (i/total)*100)
-                    df = self.analyzer.fetch(sym)
-                    if df is None or df.empty or len(df) < 20:
-                        if attempt == 2:
-                            self.gui.schedule(self._add_error, sym, "Insufficient data")
-                            failed.append(sym)
-                        continue
-                    
-                    data = self.analyzer.analyze(df)
-                    score = self.scorer.score(data)
-                    change = ((data['price'] - data['prev']) / data['prev'] * 100) if data['prev'] > 0 else 0
-                    targets = TargetCalc.calc(data, score['rec'])
-                    
-                    # Calculate 52-week high/low
-                    high52 = float(df['High'].max()) if len(df) > 0 else data['price']
-                    low52 = float(df['Low'].min()) if len(df) > 0 else data['price']
-                    
-                    result = {
-                        'symbol': sym, 'price': data['price'], 'change': change,
-                        'rsi': data['rsi'], 'score': score['total'], 'rec': score['rec'],
-                        'breakdown': score['breakdown'], 'data': data, 'targets': targets,
-                        'st_sig': data['supertrend']['sig'], 'st_dir': data['supertrend']['dir'],
-                        'vwap_sig': data['vwap']['sig'],
-                        'patterns': data.get('patterns', {}), 'ai': data.get('ai', {}),
-                        'high52': high52, 'low52': low52
-                    }
-                    self.results.append(result)
-                    self.gui.schedule(self._add_tree, result)
-                    success = True
-                    break
-                    
-                except Exception as e:
-                    logger.error(f"Scan {sym} attempt {attempt+1}: {e}")
-                    if attempt == 2:
-                        self.gui.schedule(self._add_error, sym, str(e)[:30])
-                        failed.append(sym)
-                    time.sleep(1)
-            
-            time.sleep(0.2)
+        # 1. Download every stock's prices in one batch (disk-cached; re-scans only fetch recent days)
+        self.gui.schedule(self._status, f"Downloading prices for {total} stocks...", 2)
+        try:
+            frames = self.analyzer.fetch_many(
+                watchlist, progress=lambda msg: self.gui.schedule(self._status, msg, 5))
+        except Exception as e:
+            logger.error(f"Batch download failed: {e}")
+            frames = {}
         
+        # 2. Analyse each stock (CPU only - no network)
+        for i, sym in enumerate(watchlist):
+            self.gui.schedule(self._status, f"Analysing {sym} ({i+1}/{total})...", 10 + (i / total) * 90)
+            df = frames.get(sym)
+            if df is None or df.empty or len(df) < 20:
+                self.gui.schedule(self._add_error, sym, "No data / delisted")
+                failed.append(sym)
+                continue
+            try:
+                data = self.analyzer.analyze(df)
+                score = self.scorer.score(data)
+                change = ((data['price'] - data['prev']) / data['prev'] * 100) if data['prev'] > 0 else 0
+                targets = TargetCalc.calc(data, score['rec'])
+                
+                # 52-week high/low (df holds 2 years, so use the last year only)
+                last_year = df[df.index > df.index[-1] - pd.DateOffset(weeks=52)]
+                high52 = float(last_year['High'].max()) if len(last_year) > 0 else data['price']
+                low52 = float(last_year['Low'].min()) if len(last_year) > 0 else data['price']
+                
+                result = {
+                    'symbol': sym, 'price': data['price'], 'change': change,
+                    'rsi': data['rsi'], 'score': score['total'], 'rec': score['rec'],
+                    'breakdown': score['breakdown'], 'data': data, 'targets': targets,
+                    'st_sig': data['supertrend']['sig'], 'st_dir': data['supertrend']['dir'],
+                    'vwap_sig': data['vwap']['sig'],
+                    'patterns': data.get('patterns', {}), 'ai': data.get('ai', {}),
+                    'high52': high52, 'low52': low52
+                }
+                self.results.append(result)
+                self.gui.schedule(self._add_tree, result)
+            except Exception as e:
+                logger.error(f"Scan {sym}: {e}")
+                self.gui.schedule(self._add_error, sym, str(e)[:30])
+                failed.append(sym)
+        
+        logger.info(f"Scan: {total - len(failed)}/{total} stocks in {time.time() - t0:.1f}s")
         self.results.sort(key=lambda x: x['symbol'])
         self.gui.schedule(self._scan_done, failed)
     
@@ -2891,12 +3497,13 @@ class App:
         high52 = r.get('high52', 0)
         low52 = r.get('low52', 0)
         atr = safe_float(data.get('atr', 0))
+        liq = self._liquidity_text(r)
         
         self.tree.insert('', tk.END, values=(
             r['symbol'], f"{r['price']:.2f}", f"{r['change']:+.2f}%",
             f"{r['rsi']:.1f}", r.get('st_sig', ''), r.get('vwap_sig', ''),
             f"{r['score']:.1f}", r['rec'],
-            f"{high52:.2f}", f"{low52:.2f}", f"{atr:.2f}"
+            f"{high52:.2f}", f"{low52:.2f}", f"{atr:.2f}", liq
         ), tags=(tag,))
         
         self.tree.tag_configure('sb', background='#059669', foreground='white')
@@ -2931,7 +3538,7 @@ class App:
         """Add error entry to tree."""
         self.tree.insert('', tk.END, values=(
             symbol, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', f'Error: {error}',
-            'N/A', 'N/A', 'N/A'
+            'N/A', 'N/A', 'N/A', 'N/A'
         ), tags=('error',))
         self.tree.tag_configure('error', background='#636e72', foreground='white')
     
@@ -2951,7 +3558,17 @@ class App:
                 continue
             if rec_filter != "All" and r['rec'] != rec_filter:
                 continue
+            if self.hide_illiquid_var.get() and self._is_illiquid(r):
+                continue
             self._add_tree(r)
+    
+    def _is_illiquid(self, r):
+        return r.get('data', {}).get('liquidity_cr', 0) < self.min_liquidity_cr
+    
+    def _liquidity_text(self, r):
+        liq = r.get('data', {}).get('liquidity_cr', 0)
+        text = f"{liq:,.2f}" if liq < 100 else f"{liq:,.0f}"
+        return f"{text}  LOW" if self._is_illiquid(r) else text
     
     def update_dash(self):
         if not self.results: return
@@ -2967,7 +3584,7 @@ class App:
     def show_details(self, event):
         sel = self.tree.selection()
         if not sel: return
-        sym = self.tree.item(sel[0])['values'][0]
+        sym = str(self.tree.item(sel[0])['values'][0])  # Treeview turns numeric symbols (BSE codes) into int
         r = next((x for x in self.results if x['symbol'] == sym), None)
         if not r: return
         self.update_breakdown(r)
@@ -3039,6 +3656,14 @@ class App:
         rec_c = '#059669' if rec in ['STRONG BUY', 'BUY'] else '#ef4444' if rec in ['SELL', 'STRONG SELL'] else '#d97706'
         tk.Label(self.tg_frame, text=f"{rec} | {t.get('pos', '')}", bg=T['bg'], fg=rec_c,
                 font=('Segoe UI', 14, 'bold')).pack(pady=10)
+
+        if self._is_illiquid(r):
+            liq = r.get('data', {}).get('liquidity_cr', 0)
+            tk.Label(self.tg_frame, text=f"LOW LIQUIDITY: only about Rs {liq:.2f} crore traded per day "
+                                         f"(threshold Rs {self.min_liquidity_cr:g} Cr).\n"
+                                         "Price can gap past the stop-loss and orders may not fill - treat these levels with caution.",
+                     bg='#78350f', fg='#fde68a', font=('Segoe UI', 10, 'bold'), padx=12, pady=8,
+                     justify=tk.LEFT).pack(fill=tk.X, padx=100, pady=(0, 10))
         
         levels = [
             ("STOP LOSS", t.get('sl', 0), '#ef4444', 'Exit if price falls below'),
@@ -3119,27 +3744,35 @@ class App:
         if result is None: return
         
         include_us = result
-        self.status_lbl.configure(text="Generating daily report...")
-        self.root.update()
-        
-        try:
-            generator = DailyReportGenerator()
-            report = generator.generate_report(watchlist={'NSE': self.watchlist}, include_us=include_us, include_india=True)
-            pdf_path = generator.generate_pdf_report(report)
-            
-            summary = report.get('summary', {})
-            msg = (f"Daily Report Generated!\n\n"
-                   f"Stocks: {summary.get('total_stocks', 0)}\n"
-                   f"Buy: {summary.get('strong_buy', 0) + summary.get('buy', 0)}\n"
-                   f"Hold: {summary.get('hold', 0)}\n"
-                   f"Sell: {summary.get('sell', 0) + summary.get('strong_sell', 0)}\n"
-                   f"Avg Score: {summary.get('avg_score', 0)}\n"
-                   f"PDF: {pdf_path}")
-            
-            messagebox.showinfo("Report Generated", msg)
-            self.status_lbl.configure(text="Daily report generated!")
-        except Exception as e:
-            messagebox.showerror("Error", f"Report generation failed: {e}")
+        watchlist = list(self.watchlist)
+        self.status_lbl.configure(text="Generating daily report (this can take a few minutes)...")
+
+        # Analysing ~130 stocks takes minutes - run in the background so the window doesn't freeze
+        def work():
+            try:
+                generator = DailyReportGenerator()
+                report = generator.generate_report(watchlist={'NSE': watchlist}, include_us=include_us, include_india=True)
+                pdf_path = generator.generate_pdf_report(report)
+
+                summary = report.get('summary', {})
+                wl = report.get('sections', {}).get('watchlist', {})
+                msg = (f"Daily Report Generated!\n\n"
+                       f"Watchlist stocks: {wl.get('total', 0)}\n"
+                       f"Market stocks: {summary.get('total_stocks', 0)}\n"
+                       f"Buy: {summary.get('strong_buy', 0) + summary.get('buy', 0)}\n"
+                       f"Hold: {summary.get('hold', 0)}\n"
+                       f"Sell: {summary.get('sell', 0) + summary.get('strong_sell', 0)}\n"
+                       f"Avg Score: {summary.get('avg_score', 0)}\n"
+                       f"PDF: {pdf_path}")
+
+                self.root.after(0, lambda: messagebox.showinfo("Report Generated", msg))
+                self.root.after(0, lambda: self.status_lbl.configure(text="Daily report generated!"))
+            except Exception as e:
+                logger.error(f"Daily report error: {e}")
+                self.root.after(0, lambda: self.status_lbl.configure(text="Report failed"))
+                self.root.after(0, lambda err=e: messagebox.showerror("Error", f"Report generation failed: {err}"))
+
+        threading.Thread(target=work, daemon=True).start()
     
     def send_email_report(self):
         """Send report via email - gives user choice between watchlist or full market report."""
@@ -3277,7 +3910,7 @@ class App:
                 
             except Exception as e:
                 self.root.after(0, lambda: self.status_lbl.configure(text="Email failed"))
-                self.root.after(0, lambda: messagebox.showerror("Email Failed", f"Error: {e}"))
+                self.root.after(0, lambda err=e: messagebox.showerror("Email Failed", f"Error: {err}"))
                 import traceback
                 traceback.print_exc()
         
@@ -3352,15 +3985,17 @@ class App:
         
         # All results table
         html += '<div class="section"><h2>All Watchlist Results</h2><table>'
-        html += '<tr><th>#</th><th>Symbol</th><th>Price</th><th>Change%</th><th>RSI</th><th>SuperTrend</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th></tr>'
+        html += '<tr><th>#</th><th>Symbol</th><th>Price</th><th>Change%</th><th>RSI</th><th>SuperTrend</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>Traded/day (Cr)</th></tr>'
         
         for i, r in enumerate(sorted_results, 1):
             t = r.get('targets', {})
             rec_class = r['rec'].lower().replace(' ', '-')
             row_class = 'top-pick' if r['rec'] in ['STRONG BUY', 'BUY'] else 'avoid' if r['rec'] in ['SELL', 'STRONG SELL'] else ''
-            html += f'<tr class="{row_class}"><td>{i}</td><td><b>{r["symbol"]}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{r["rsi"]:.0f}</td><td>{r.get("st_sig", "")}</td><td>{r["score"]:.0f}</td><td><span class="{rec_class}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td></tr>'
+            html += f'<tr class="{row_class}"><td>{i}</td><td><b>{r["symbol"]}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{r["rsi"]:.0f}</td><td>{r.get("st_sig", "")}</td><td>{r["score"]:.0f}</td><td><span class="{rec_class}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>{self._liquidity_text(r)}</td></tr>'
         
-        html += '</table></div>'
+        html += '</table>'
+        html += (f'<p style="font-size:11px;color:#666">LOW = average traded value below Rs {self.min_liquidity_cr:g} crore/day: '
+                 'stop-loss and targets are less reliable for these stocks.</p></div>')
         
         # Stocks to avoid
         avoid_list = [r for r in sorted_results if r['rec'] in ['SELL', 'STRONG SELL']][:5]
@@ -3525,7 +4160,7 @@ class App:
                     
             except Exception as e:
                 self.root.after(0, lambda: self.status_lbl.configure(text="Error"))
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Email failed: {e}"))
+                self.root.after(0, lambda err=e: messagebox.showerror("Error", f"Email failed: {err}"))
                 import traceback
                 traceback.print_exc()
         

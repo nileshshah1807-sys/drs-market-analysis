@@ -56,15 +56,44 @@ NSE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br',
+    # No 'br': requests can't decode Brotli unless the optional brotli package is installed,
+    # and NSE then returns undecodable bytes (-> 0 actions)
+    'Accept-Encoding': 'gzip, deflate',
     'Referer': 'https://www.nseindia.com/companies-listing/corporate-filings-actions',
 }
 
 BSE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': '*/*',
+    'Accept-Encoding': 'gzip, deflate',
     'Referer': 'https://www.bseindia.com/corporates/corporate_act.aspx',
 }
+
+
+def days_until_date(date_str: str) -> Optional[int]:
+    """Calendar days from today until a YYYY-MM-DD date (0 = today). None if unparseable."""
+    try:
+        return (datetime.strptime(date_str, '%Y-%m-%d').date() - datetime.now().date()).days
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_amount(purpose: str) -> float:
+    """Extract dividend amount from purpose text, e.g. 'Rs. 10', 'Rs.10.50', 'Rs. - 0.4000', 'INR 10', '10.50 per share'."""
+    if not purpose:
+        return 0.0
+    import re
+    patterns = [
+        r'(?:Rs|Re)\.?\s*-?\s*(\d+\.?\d*)',
+        r'INR\s*-?\s*(\d+\.?\d*)',
+        r'(\d+\.?\d*)\s*per\s*share',
+        r'(\d+\.?\d*)\s*\/-',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, purpose, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+    return 0.0
 
 
 # ============================================================
@@ -127,17 +156,21 @@ class NSECorporateActions:
         self._cookies_set = False
     
     def _ensure_cookies(self):
-        """NSE requires visiting main page first to get cookies."""
+        """Visit the NSE main page first to pick up cookies.
+
+        Best effort only: the homepage often returns 403 to scripts while the API
+        itself still answers, so a failure here must not stop the API call.
+        """
         if self._cookies_set:
             return True
+        self._cookies_set = True  # only try once per session
         try:
             resp = self.session.get(NSE_BASE, timeout=15)
-            if resp.status_code == 200:
-                self._cookies_set = True
-                return True
+            if resp.status_code != 200:
+                logger.info(f"NSE homepage returned {resp.status_code}; trying API without cookies")
         except Exception as e:
             logger.warning(f"NSE cookie init failed: {e}")
-        return False
+        return True
     
     def fetch_all_actions(self, from_date: str = None, to_date: str = None) -> List[Dict]:
         """Fetch all corporate actions from NSE.
@@ -225,19 +258,20 @@ class NSECorporateActions:
         
         for record in records:
             try:
-                # NSE fields: symbol, series, exDate, purpose, recordDate, bcStartDate, bcEndDate, ndStartDate, ndEndDate, actualPaymentDate
-                purpose = record.get('purpose', record.get('Subject', ''))
-                ex_date = record.get('exDate', record.get('ExDate', ''))
-                record_date = record.get('recordDate', record.get('BCrdtDt', ''))
-                symbol = record.get('symbol', record.get('ScripCode', ''))
-                
+                # Current NSE fields: symbol, comp, series, subject, exDate, recDate, bcStartDate, bcEndDate, faceVal, isin
+                # (older responses used purpose/company/recordDate - keep those as fallbacks)
+                purpose = record.get('subject') or record.get('purpose') or record.get('Subject') or ''
+                ex_date = record.get('exDate') or record.get('ExDate') or ''
+                record_date = record.get('recDate') or record.get('recordDate') or record.get('BCrdtDt') or ''
+                symbol = record.get('symbol') or record.get('ScripCode') or ''
+
                 # Parse purpose to extract amount if dividend
                 amount = self._extract_amount(purpose)
                 category = classify_action(purpose)
-                
+
                 result = {
                     'symbol': symbol,
-                    'company': record.get('company', record.get('LONG_NAME', symbol)),
+                    'company': record.get('comp') or record.get('company') or record.get('LONG_NAME') or symbol,
                     'series': record.get('series', 'EQ'),
                     'ex_date': self._format_date(ex_date),
                     'record_date': self._format_date(record_date),
@@ -250,16 +284,14 @@ class NSECorporateActions:
                     'source': 'NSE',
                     'raw': record,
                 }
-                
+
                 # Calculate days until ex-date
                 if result['ex_date']:
-                    try:
-                        ex_dt = datetime.strptime(result['ex_date'], '%Y-%m-%d')
-                        result['days_until'] = (ex_dt - datetime.now()).days
+                    result['days_until'] = days_until_date(result['ex_date'])
+                    if result['days_until'] is not None:
                         result['is_upcoming'] = result['days_until'] >= 0
                         result['is_past'] = result['days_until'] < 0
-                    except:
-                        result['days_until'] = None
+                    else:
                         result['is_upcoming'] = True
                         result['is_past'] = False
                 
@@ -272,30 +304,13 @@ class NSECorporateActions:
     
     def _extract_amount(self, purpose: str) -> float:
         """Extract dividend amount from purpose string."""
-        if not purpose:
-            return 0.0
-        
-        import re
-        # Match patterns like "Rs. 10", "Rs.10.50", "INR 10", "10.50 per share"
-        patterns = [
-            r'Rs\.?\s*(\d+\.?\d*)',
-            r'INR\s*(\d+\.?\d*)',
-            r'(\d+\.?\d*)\s*per\s*share',
-            r'(\d+\.?\d*)\s*\/-',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, purpose, re.IGNORECASE)
-            if match:
-                return float(match.group(1))
-        
-        return 0.0
-    
+        return extract_amount(purpose)
+
     def _format_date(self, date_str: str) -> str:
         """Format date to YYYY-MM-DD."""
-        if not date_str:
+        if not date_str or str(date_str).strip() == '-':
             return ''
-        
+
         # Try various formats
         for fmt in ['%d-%b-%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%d %b %Y', '%Y-%m-%dT%H:%M:%S']:
             try:
@@ -313,6 +328,10 @@ class NSECorporateActions:
 
 class BSECorporateActions:
     """Fetch corporate actions from BSE India API."""
+    
+    # The old /CorporateAction/w endpoint now returns an HTML page; DefaultData/w is what
+    # bseindia.com's own corporate-actions page uses and returns JSON.
+    URL = f"{BSE_BASE}/BseIndiaAPI/api/DefaultData/w"
     
     def __init__(self):
         self.session = requests.Session()
@@ -336,24 +355,7 @@ class BSECorporateActions:
         if not to_date:
             to_date = (datetime.now() + timedelta(days=90)).strftime('%d/%m/%Y')
         
-        # BSE API endpoint for corporate actions
-        url = f"{BSE_BASE}/BseIndiaAPI/api/CorporateAction/w"
-        params = {
-            'Indx': 'CA',
-            'StrDate': from_date,
-            'EndDate': to_date,
-        }
-        
-        try:
-            resp = self.session.get(url, params=params, timeout=30)
-            if resp.status_code == 200:
-                data = resp.json()
-                return self._parse_bse_response(data)
-        except Exception as e:
-            logger.error(f"BSE fetch error: {e}")
-        
-        # Fallback: try CSV download
-        return self._fetch_csv(from_date, to_date)
+        return self._fetch(from_date, to_date)
     
     def fetch_symbol_actions(self, scrip_code: str, from_date: str = None, to_date: str = None) -> List[Dict]:
         """Fetch corporate actions for a specific BSE scrip code."""
@@ -365,22 +367,35 @@ class BSECorporateActions:
         if not to_date:
             to_date = (datetime.now() + timedelta(days=365)).strftime('%d/%m/%Y')
         
-        url = f"{BSE_BASE}/BseIndiaAPI/api/CorporateAction/w"
+        return self._fetch(from_date, to_date, scrip_code)
+    
+    def _fetch(self, from_date: str, to_date: str, scrip_code: str = '') -> List[Dict]:
+        """Query BSE. Dates are DD/MM/YYYY; the API wants YYYYMMDD."""
+        try:
+            fdate = datetime.strptime(from_date, '%d/%m/%Y').strftime('%Y%m%d')
+            tdate = datetime.strptime(to_date, '%d/%m/%Y').strftime('%Y%m%d')
+        except ValueError as e:
+            logger.error(f"BSE date error: {e}")
+            return []
+        
         params = {
-            'Indx': 'CA',
-            'Scripcode': scrip_code,
-            'StrDate': from_date,
-            'EndDate': to_date,
+            'Fdate': fdate,
+            'TDate': tdate,
+            'Purposecode': '',
+            'ddlcategorys': 'E',
+            'ddlindustrys': '',
+            'scripcode': scrip_code,
+            'segment': '0',
+            'strSearch': 'S',
         }
         
         try:
-            resp = self.session.get(url, params=params, timeout=30)
+            resp = self.session.get(self.URL, params=params, timeout=30)
             if resp.status_code == 200:
-                data = resp.json()
-                return self._parse_bse_response(data)
+                return self._parse_bse_response(resp.json())
+            logger.warning(f"BSE API returned {resp.status_code}")
         except Exception as e:
-            logger.error(f"BSE symbol fetch error: {e}")
-        
+            logger.error(f"BSE fetch error: {e}")
         return []
     
     def _parse_bse_response(self, data) -> List[Dict]:
@@ -397,21 +412,25 @@ class BSECorporateActions:
         
         for record in records:
             try:
-                purpose = record.get('PURPOSE', record.get('Purpose', ''))
-                ex_date = record.get('Ex_Date', record.get('EX_DATE', ''))
-                symbol = record.get('SCRIP_CD', record.get('ScripCode', ''))
+                # DefaultData fields: scrip_code, short_name, long_name, Ex_date ('01 Sep 2026'),
+                # Purpose, RD_Date, BCRD_FROM, BCRD_TO, payment_date
+                purpose = record.get('Purpose') or record.get('PURPOSE') or ''
+                ex_date = record.get('Ex_date') or record.get('Ex_Date') or record.get('EX_DATE') or ''
+                scrip_code = str(record.get('scrip_code') or record.get('SCRIP_CD') or record.get('ScripCode') or '')
+                short_name = (record.get('short_name') or '').strip()
                 
                 amount = self._extract_amount(purpose)
                 category = classify_action(purpose)
                 
                 result = {
-                    'symbol': str(symbol),
-                    'company': record.get('SCRIP_NAME', record.get('ScripName', str(symbol))),
+                    'symbol': short_name or scrip_code,
+                    'scrip_code': scrip_code,
+                    'company': (record.get('long_name') or record.get('SCRIP_NAME') or short_name or scrip_code).rstrip('-$').strip(),
                     'series': record.get('SERIES', 'EQ'),
                     'ex_date': self._format_date(ex_date),
-                    'record_date': self._format_date(record.get('RD_DATE', record.get('RecordDate', ''))),
-                    'bc_start': self._format_date(record.get('BC_FROM', '')),
-                    'bc_end': self._format_date(record.get('BC_TO', '')),
+                    'record_date': self._format_date(record.get('RD_Date') or record.get('RD_DATE') or ''),
+                    'bc_start': self._format_date(record.get('BCRD_FROM') or record.get('BC_FROM') or ''),
+                    'bc_end': self._format_date(record.get('BCRD_TO') or record.get('BC_TO') or ''),
                     'purpose': purpose,
                     'category': category,
                     'icon': get_action_icon(category),
@@ -421,13 +440,11 @@ class BSECorporateActions:
                 }
                 
                 if result['ex_date']:
-                    try:
-                        ex_dt = datetime.strptime(result['ex_date'], '%Y-%m-%d')
-                        result['days_until'] = (ex_dt - datetime.now()).days
+                    result['days_until'] = days_until_date(result['ex_date'])
+                    if result['days_until'] is not None:
                         result['is_upcoming'] = result['days_until'] >= 0
                         result['is_past'] = result['days_until'] < 0
-                    except:
-                        result['days_until'] = None
+                    else:
                         result['is_upcoming'] = True
                         result['is_past'] = False
                 
@@ -438,44 +455,15 @@ class BSECorporateActions:
         
         return results
     
-    def _fetch_csv(self, from_date: str, to_date: str) -> List[Dict]:
-        """Fallback: fetch BSE corporate actions CSV."""
-        try:
-            url = "https://www.bseindia.com/corporates/corporate_act.aspx"
-            params = {
-                'ddlPeriod': 'Last30Days',
-                'ddlDeType': 'All',
-            }
-            resp = self.session.get(url, params=params, timeout=30)
-            if resp.status_code == 200:
-                # Try to parse CSV content
-                return []
-        except:
-            pass
-        return []
-    
     def _extract_amount(self, purpose: str) -> float:
         """Extract dividend amount."""
-        if not purpose:
-            return 0.0
-        import re
-        patterns = [
-            r'Rs\.?\s*(\d+\.?\d*)',
-            r'INR\s*(\d+\.?\d*)',
-            r'(\d+\.?\d*)\s*per\s*share',
-            r'(\d+\.?\d*)\s*\/-',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, purpose, re.IGNORECASE)
-            if match:
-                return float(match.group(1))
-        return 0.0
+        return extract_amount(purpose)
     
     def _format_date(self, date_str: str) -> str:
         """Format date to YYYY-MM-DD."""
-        if not date_str:
+        if not date_str or str(date_str).strip() == '-':
             return ''
-        for fmt in ['%d-%b-%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%d %b %Y']:
+        for fmt in ['%d-%b-%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%d %b %Y', '%Y%m%d']:
             try:
                 dt = datetime.strptime(str(date_str).strip(), fmt)
                 return dt.strftime('%Y-%m-%d')
@@ -497,7 +485,7 @@ BSE_SCRIP_MAP = {
     'SUNPHARMA': '524715', 'TITAN': '500114', 'BAJAJFINSV': '532978',
     'WIPRO': '507685', 'HCLTECH': '532281', 'ULTRACEMCO': '532538',
     'NTPC': '532555', 'NESTLEIND': '500790', 'POWERGRID': '532898',
-    'TATAMOTORS': '500570', 'M&M': '500520', 'JSWSTEEL': '500228',
+    'TATAMOTORS': '500570', 'TMPV': '500570', 'M&M': '500520', 'JSWSTEEL': '500228',
     'TATASTEEL': '500470', 'TECHM': '532755', 'ADANIENT': '512599',
     'ONGC': '500312', 'HINDALCO': '532230', 'INDUSINDBK': '532187',
     'DIVISLAB': '532488', 'DRREDDY': '500124', 'CIPLA': '500087',
@@ -506,8 +494,8 @@ BSE_SCRIP_MAP = {
     'TATACONSUM': '500800', 'BAJAJ-AUTO': '532977', 'APOLLOHOSP': '508869',
     'BRITANNIA': '500825', 'PIDILITIND': '500331', 'SBILIFE': '540999',
     'HDFCLIFE': '540777', 'ICICIPRULI': '540133',
-    'BALMLAWRIE': '523319', 'NAPEROL': '500295', 'GNFC': '500670',
-    'CREATIVE': '543517', 'EMAMIPAPER': '533208', 'EMPIREIND': '500302',
+    'BALMLAWRIE': '523319', 'NAPEROL': '500298', 'GNFC': '500670',
+    'CREATIVE': '539527', 'EMAMIPAPER': '533208', 'EMPIREIND': '509525',
     'VEDL': '500295', 'LTIM': '540251', 'MPHASIS': '526299',
     'PERSISTENT': '533179', 'COFORGE': '532541', 'LTTS': '540115',
     'BEL': '500049', 'HAL': '541154', 'IRCTC': '542830',
@@ -585,23 +573,15 @@ class CorporateActionsEngine:
             logger.error(f"BSE bulk fetch failed: {e}")
             self.fetch_errors.append(f"BSE: {e}")
         
-        # Step 3: Load local database as fallback
-        local_data = {}
+        # Step 3: Local database (+ Yahoo history) is used lazily below, only for stocks
+        # without live NSE/BSE data - loading it for every stock up front is slow.
+        local_ca = None
         try:
             from corporate_actions import CorporateActions as LocalCA
             local_ca = LocalCA()
-            if callback:
-                callback("Loading local dividend database...", 40)
-            for sym in watchlist:
-                local_actions = local_ca.get_actions(sym, 'NSE')
-                if local_actions:
-                    local_data[sym.upper()] = local_actions
         except Exception as e:
             logger.warning(f"Local database load failed: {e}")
-        
-        if callback:
-            callback(f"Local DB: {len(local_data)} stocks", 50)
-        
+
         # Step 4: Merge all sources and map to watchlist
         all_actions = nse_actions + bse_actions
         
@@ -631,11 +611,12 @@ class CorporateActionsEngine:
             if sym_upper in nse_by_symbol:
                 symbol_acts.extend(nse_by_symbol[sym_upper])
             
-            # From BSE bulk
+            # From BSE bulk - match on exact BSE symbol or scrip code. (Substring-matching the
+            # company name matched e.g. 'LT' against every '... LTD' company.)
+            scrip_code = BSE_SCRIP_MAP.get(sym_upper, sym_upper if sym_upper.isdigit() else None)
             for bse_act in bse_actions:
                 bse_sym = bse_act.get('symbol', '').upper()
-                bse_company = bse_act.get('company', '').upper()
-                if sym_upper == bse_sym or symbol.upper() in bse_company:
+                if sym_upper == bse_sym or (scrip_code and bse_act.get('scrip_code') == scrip_code):
                     is_dup = any(
                         existing.get('ex_date') == bse_act.get('ex_date') and 
                         existing.get('purpose', '').lower()[:20] == bse_act.get('purpose', '').lower()[:20]
@@ -644,9 +625,25 @@ class CorporateActionsEngine:
                     if not is_dup:
                         symbol_acts.append(bse_act)
             
+            # Nothing in the bulk window - ask NSE for this symbol's wider history (live data
+            # is better than the local database's estimates, so try this first)
+            if not symbol_acts:
+                try:
+                    individual = self.nse.fetch_symbol_actions(symbol)
+                    if individual:
+                        symbol_acts.extend(individual)
+                    time.sleep(0.3)
+                except Exception as e:
+                    logger.warning(f"Individual fetch failed for {symbol}: {e}")
+
             # If no live data, use local database
-            if not symbol_acts and sym_upper in local_data:
-                local = local_data[sym_upper]
+            local = None
+            if not symbol_acts and local_ca is not None:
+                try:
+                    local = local_ca.get_actions(symbol, 'NSE')
+                except Exception as e:
+                    logger.warning(f"Local lookup failed for {symbol}: {e}")
+            if local:
                 
                 # Convert upcoming events
                 for ev in local.get('upcoming_events', []):
@@ -658,14 +655,16 @@ class CorporateActionsEngine:
                         'record_date': '',
                         'bc_start': '',
                         'bc_end': '',
-                        'purpose': f"{ev.get('type', 'Dividend')} - Rs.{ev.get('amount', 0):.2f}",
+                        'purpose': f"{ev.get('type', 'Dividend')} - Rs.{ev.get('amount', 0):.2f}"
+                                   + (" (ESTIMATED - not announced)" if ev.get('estimated') else ""),
                         'category': classify_action(ev.get('type', '')),
                         'icon': get_action_icon(classify_action(ev.get('type', ''))),
                         'amount': ev.get('amount', 0),
-                        'source': 'Local DB',
-                        'days_until': ev.get('days_until'),
+                        'source': 'Estimate' if ev.get('estimated') else 'Local DB',
+                        'days_until': days_until_date(ev.get('date', '')),
                         'is_upcoming': True,
                         'is_past': False,
+                        'estimated': bool(ev.get('estimated')),
                     })
                 
                 # Convert historical dividends
@@ -673,12 +672,8 @@ class CorporateActionsEngine:
                     date_str = div.get('date', '')
                     is_dup = any(a.get('ex_date') == date_str for a in symbol_acts)
                     if not is_dup:
-                        try:
-                            div_dt = datetime.strptime(date_str, '%Y-%m-%d')
-                            days_until = (div_dt - datetime.now()).days
-                        except:
-                            days_until = None
-                        
+                        days_until = days_until_date(date_str)
+
                         symbol_acts.append({
                             'symbol': symbol,
                             'company': local.get('name', symbol),
@@ -717,21 +712,12 @@ class CorporateActionsEngine:
                         'is_upcoming': False,
                         'is_past': True,
                     })
-            
-            # If still no data, try individual NSE fetch
-            if not symbol_acts:
-                try:
-                    individual = self.nse.fetch_symbol_actions(symbol)
-                    if individual:
-                        symbol_acts.extend(individual)
-                    time.sleep(0.3)
-                except Exception as e:
-                    logger.warning(f"Individual fetch failed for {symbol}: {e}")
-            
+
             # Sort: upcoming first (by days_until ascending), then past (by date descending)
+            # (days_until can be None when the ex-date is missing/unparseable - sort those last)
             upcoming = sorted(
                 [a for a in symbol_acts if a.get('is_upcoming', True) and (a.get('days_until') is None or a.get('days_until', 0) >= 0)],
-                key=lambda x: x.get('days_until', 9999)
+                key=lambda x: x['days_until'] if x.get('days_until') is not None else 9999
             )
             past = sorted(
                 [a for a in symbol_acts if a.get('is_past', False) or (a.get('days_until') is not None and a.get('days_until', 0) < 0)],
