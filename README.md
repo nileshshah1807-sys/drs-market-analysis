@@ -1,116 +1,102 @@
-# Indian Stock Technical Scanner & Recommender
+# DR. NILESH SHAH'S MARKET ANALYSIS
 
-A powerful desktop application for technical analysis of Indian stocks (NSE/BSE) that scans your watchlist, calculates technical indicators, scores stocks 0-100, and provides buy/sell recommendations.
+Desktop app for technical analysis of Indian stocks (NSE/BSE). It scans your watchlist, scores each stock 0-100 from ten indicators, gives Buy/Hold/Sell signals with stop-loss and targets, tracks corporate actions, and emails a daily report.
 
-## Quick Start
+The app is **`dr_shah_analysis.py`**. Older versions are in `old_versions/` and aren't needed.
 
-### Windows
-1. Double-click `run_app.bat`
-2. Or open Command Prompt and run:
+## Quick Start (Windows)
+
+1. Double-click **`run_app.bat`**. It installs any missing packages, then starts the app.
+2. Or from Command Prompt in this folder:
    ```
-   pip install -r requirements.txt
-   python stock_scanner.py
+   python -m pip install -r requirements.txt
+   python dr_shah_analysis.py
    ```
 
-### Linux/Mac
-1. Open Terminal in this folder
-2. Run:
-   ```bash
-   chmod +x run_app.sh
-   ./run_app.sh
-   ```
-   Or manually:
-   ```bash
-   pip3 install -r requirements.txt
-   python3 stock_scanner.py
-   ```
+Mac/Linux: `./run_app.sh`
+
+Use `python -m pip`, not plain `pip`: if you have more than one Python installed, plain `pip` can install packages into a different Python than the one that runs the app.
 
 ## Features
 
-- **Technical Analysis Engine** with 10+ indicators
-- **Scoring System** (0-100) based on weighted parameters
-- **Recommendations**: Strong Buy, Buy, Hold, Sell, Strong Sell
-- **Watchlist Management**: Add, delete, import, export
-- **Import Support**: JSON, CSV, TXT, Excel (.xlsx, .xls), PDF
-- **Export Results**: Excel with formatting, CSV
-- **Color-coded Results** for quick decision making
+| Tab | What it does |
+|-----|--------------|
+| Watchlist | Add/remove stocks, groups, sector filter, import (Excel, CSV, TXT, JSON, PDF) |
+| Scan Results | Score, signal, 52-week range, ATR and daily traded value for every stock (F5 to scan) |
+| Score Breakdown / Stop-Loss & Targets / Pattern Analysis | Double-click a stock for details |
+| Corporate Actions | Live dividends, splits, bonus, buybacks from NSE and BSE |
+| Charts | Price with 20/50-day averages and volume |
+| Sector | Sector averages and rotation |
+| Backtest | Checks whether the score predicted returns on your stocks' history; suggests weights |
+| Settings | Email, scheduled report, liquidity threshold, scoring weights |
 
-## Technical Indicators Used
+Exports: Excel, CSV, PDF, and email (watchlist or full market report).
 
-| Indicator | Weight | Description |
-|-----------|--------|-------------|
-| RSI (14) | 15% | Relative Strength Index |
-| MACD | 15% | Moving Average Convergence Divergence |
-| Moving Averages | 20% | SMA 20, 50, 200 & EMA 12, 26 |
-| Bollinger Bands | 10% | Price volatility bands |
-| Stochastic | 10% | Stochastic Oscillator |
-| ADX | 10% | Average Directional Index |
-| Volume (OBV) | 10% | On Balance Volume |
-| Momentum | 10% | Williams %R & CCI |
+## Scoring
 
-## Scoring System
+Default indicator weights (change them in Settings, or apply the Backtest tab's suggestions):
 
-| Score | Recommendation | Meaning |
-|-------|----------------|---------|
-| 75-100 | STRONG BUY | High confidence buy signal |
-| 60-74 | BUY | Moderate buy signal |
-| 45-59 | HOLD | Neutral position |
-| 30-44 | SELL | Consider selling |
-| 0-29 | STRONG SELL | High confidence sell signal |
+| Indicator | Weight |
+|-----------|--------|
+| RSI (14) | 12% |
+| MACD | 12% |
+| Moving averages (SMA 20/50/200, EMA 12/26) | 15% |
+| SuperTrend | 11% |
+| VWAP | 10% |
+| Bollinger Bands | 8% |
+| Stochastic | 8% |
+| ADX | 8% |
+| Volume (OBV) | 8% |
+| Momentum (Williams %R, CCI) | 8% |
 
-## How to Use
+| Score | Signal |
+|-------|--------|
+| 75-100 | STRONG BUY |
+| 60-74 | BUY |
+| 45-59 | HOLD |
+| 30-44 | SELL |
+| 0-29 | STRONG SELL |
 
-1. **Add stocks** to watchlist (e.g., RELIANCE, TCS, INFY, HDFCBANK)
-2. Click **"Scan All Stocks"**
-3. View results in Scan Results tab
-4. Double-click any stock for detailed breakdown
-5. Export results as needed
+Stocks trading less than Rs 1 crore a day (adjustable) are marked **LOW** liquidity: their stop-loss and targets are less reliable.
 
-## Popular Indian Stock Symbols
+## Daily email report
+
+- Settings > Email Report Configuration: enter a Gmail address and a Gmail **App Password** (https://myaccount.google.com/apppasswords), then Save and Test.
+- The password is stored in **Windows Credential Manager**, not in `email_config.json`.
+- Settings > Auto Report Scheduling > **Install Windows Task** emails the report on NSE trading days even when the app is closed (weekends and NSE holidays are skipped).
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `dr_shah_analysis.py` | Main app |
+| `market_data.py` | Batch price downloads with a disk cache (`data_cache/`) |
+| `backtest.py` | Backtest engine |
+| `daily_report.py` | Daily report, PDF and email |
+| `scheduled_report.py` | Scheduled email (Windows Task Scheduler) |
+| `corporate_actions_engine.py`, `corporate_actions.py` | Corporate actions (live + fallback) |
+| `pattern_recognition.py`, `ai_engine.py` | Chart/candlestick patterns, ML engine |
+| `run_app.bat`, `run.bat`, `install_dependencies.bat`, `setup.bat` | Launchers and installers |
+
+Your own data (watchlist, settings, reports, cache, log) stays on your PC and is not tracked by git.
+
+## Version control (git)
+
+Every change is recorded, so any edit can be reviewed or undone:
 
 ```
-RELIANCE    - Reliance Industries
-TCS         - Tata Consultancy Services
-INFY        - Infosys
-HDFCBANK    - HDFC Bank
-ICICIBANK   - ICICI Bank
-SBIN        - State Bank of India
-WIPRO       - Wipro
-TATAMOTORS  - Tata Motors
-TATASTEEL   - Tata Steel
-ADANIENT    - Adani Enterprises
-BHARTIARTL  - Bharti Airtel
-ITC         - ITC Limited
-KOTAKBANK   - Kotak Mahindra Bank
-LT          - Larsen & Toubro
-MARUTI      - Maruti Suzuki
+git log --oneline          # list saved versions
+git diff                   # see unsaved changes
+git checkout -- <file>     # discard unsaved changes to a file
+git revert <commit>        # undo a saved change
 ```
 
 ## Troubleshooting
 
-### "tkinter not available" error
-- **Windows**: Reinstall Python and check "tcl/tk and IDLE" option
-- **Linux**: `sudo apt-get install python3-tk`
-- **Mac**: `brew install python-tk`
-
-### "No module named..." error
-Run: `pip install -r requirements.txt`
-
-### Application doesn't start
-1. Check Python version (3.7+ required)
-2. Run `python test_app.py` to verify dependencies
-3. Check error message for specific issue
-
-## Files
-
-- `stock_scanner.py` - Main application
-- `requirements.txt` - Python dependencies
-- `run_app.bat` - Windows launcher
-- `run_app.sh` - Linux/Mac launcher
-- `test_app.py` - Test script for dependencies
-- `sample_watchlist.json` - Sample watchlist
-- `watchlist.json` - Your saved watchlist (auto-created)
+- **"No module named ..."**: run `python -m pip install -r requirements.txt`
+- **"tkinter not available"**: reinstall Python with the "tcl/tk and IDLE" option ticked
+- **App doesn't start**: run `install_dependencies.bat`, then check `dr_shah_analysis.log`
 
 ## Disclaimer
 
-This application is for **educational and informational purposes only**. The recommendations are based on technical analysis and should NOT be considered as financial advice. Always do your own research and consult a financial advisor before investing.
+For educational and informational purposes only. The signals come from technical analysis and are **not** financial advice. Do your own research and consult a financial advisor before investing.

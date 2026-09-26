@@ -1,9 +1,12 @@
 #!/bin/bash
 
 echo "========================================"
-echo " Indian Stock Technical Scanner"
+echo " DR. NILESH SHAH'S MARKET ANALYSIS"
 echo "========================================"
 echo ""
+
+# Run from this script's folder
+cd "$(dirname "$0")"
 
 # Check if Python is installed
 if ! command -v python3 &> /dev/null; then
@@ -19,10 +22,10 @@ fi
 PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 echo "Python version: $PYTHON_VERSION"
 
-# Install dependencies
+# Install dependencies into the same Python that runs the app
 echo "Installing dependencies..."
-pip3 install -r requirements.txt --quiet 2>/dev/null || pip install -r requirements.txt --quiet
+python3 -m pip install -r requirements.txt --quiet
 
 echo ""
 echo "Starting application..."
-python3 stock_scanner.py 2>/dev/null || python stock_scanner.py
+python3 dr_shah_analysis.py

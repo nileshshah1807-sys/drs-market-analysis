@@ -93,23 +93,34 @@ FILES IN THIS FOLDER:
 ----------------------
 
 Required files (must be in same folder):
-- dr_shah_analysis.py    (Main app)
-- daily_report.py        (Daily report module)
-- ai_engine.py           (AI/ML engine)
-- pattern_recognition.py (Pattern detection)
-- live_trading.py        (Live trading module)
-- logo_new.png           (Logo image)
+- dr_shah_analysis.py          (Main app)
+- daily_report.py              (Daily report + email)
+- market_data.py               (Fast price downloads + cache)
+- backtest.py                  (Backtest tab)
+- scheduled_report.py          (Email report via Windows Task Scheduler)
+- corporate_actions_engine.py  (Live NSE/BSE corporate actions)
+- corporate_actions.py         (Dividend fallback data)
+- pattern_recognition.py       (Pattern detection)
+- ai_engine.py                 (AI/ML engine)
+- logo_new.png                 (Logo image)
 
 Helper files:
-- install_dependencies.bat (Auto-install packages)
-- run_app.bat              (Quick launcher)
-- setup.bat                (Setup script)
+- run_app.bat              (Launcher - installs missing packages first)
+- run.bat                  (Launcher - starts the app directly)
+- install_dependencies.bat (Install all packages)
+- setup.bat                (Setup check)
+- live_trading.py          (Not used by the app; kept for the setup checks)
 
-Optional files:
-- watchlist.json           (Your saved watchlist)
-- email_config.json        (Email settings)
-- alerts.log               (Alert history)
+Your data (created as you use the app, not tracked by git):
+- watchlist.json, watchlist_groups.json, my_watchlist.json
+- email_config.json        (Email settings - no password)
+- schedule_config.json, weights_config.json, app_settings.json
+- data_cache\              (Downloaded prices - safe to delete)
+- reports\                 (Generated PDF reports)
 - dr_shah_analysis.log     (App log)
+
+old_versions\              (Earlier scanner versions and one-off repair
+                            scripts - not needed to run the app)
 
 
 QUICK COMMANDS:
