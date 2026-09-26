@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Email settings (addresses; older versions also held the password)
+email_config.json
+
+# Your personal data - changes every time you use the app
+watchlist.json
+my_watchlist.json
+watchlist_groups.json
+schedule_config.json
+weights_config.json
+app_settings.json
+alerts.json
+market_news.json
+
+# Generated / cached files
+data_cache/
+reports/
+*.log
+auto_report_state.json
+auto_report.lock
+nse_holidays.json
+uploads/

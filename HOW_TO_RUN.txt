@@ -1,0 +1,84 @@
+============================================================
+DR. NILESH SHAH'S MARKET ANALYSIS
+How to Run Guide
+============================================================
+
+STEP 1: INSTALL ALL DEPENDENCIES
+---------------------------------
+
+Option A: Double-click "install_dependencies.bat" (Windows)
+   This will automatically install all required packages.
+
+Option B: Open Command Prompt and run:
+   pip install yfinance pandas numpy ta scikit-learn openpyxl reportlab pdfplumber schedule Pillow pytz
+
+
+STEP 2: VERIFY INSTALLATION
+-----------------------------
+
+Run this command to verify:
+   python -c "import yfinance, pandas, numpy, ta, sklearn, openpyxl, reportlab, pdfplumber; print('All OK!')"
+
+
+STEP 3: RUN THE APP
+---------------------
+
+Option A: Double-click "run_app.bat"
+Option B: Run: python dr_shah_analysis.py
+
+
+TROUBLESHOOTING
+-----------------
+
+Problem: "No module named 'ta'"
+Fix: pip install ta
+
+Problem: "No module named 'yfinance'"  
+Fix: pip install yfinance
+
+Problem: "Daily report module not found"
+Fix: Make sure daily_report.py is in the same folder as dr_shah_analysis.py
+
+Problem: "No module named 'reportlab'"
+Fix: pip install reportlab
+
+Problem: App doesn't start
+Fix: Run install_dependencies.bat first
+
+
+FILES IN THIS FOLDER:
+----------------------
+
+Required files (must be in same folder):
+- dr_shah_analysis.py    (Main app)
+- daily_report.py        (Daily report module)
+- ai_engine.py           (AI/ML engine)
+- pattern_recognition.py (Pattern detection)
+- live_trading.py        (Live trading module)
+- logo_new.png           (Logo image)
+
+Helper files:
+- install_dependencies.bat (Auto-install packages)
+- run_app.bat              (Quick launcher)
+- setup.bat                (Setup script)
+
+Optional files:
+- watchlist.json           (Your saved watchlist)
+- email_config.json        (Email settings)
+- alerts.log               (Alert history)
+- dr_shah_analysis.log     (App log)
+
+
+QUICK COMMANDS:
+----------------
+
+Install everything:
+   pip install yfinance pandas numpy ta scikit-learn openpyxl reportlab pdfplumber schedule Pillow pytz
+
+Run app:
+   python dr_shah_analysis.py
+
+Check Python version:
+   python --version
+
+============================================================
