@@ -3,6 +3,13 @@ DR. NILESH SHAH'S MARKET ANALYSIS
 How to Run Guide
 ============================================================
 
+EASIEST: Double-click "DR Nilesh Shah Market Analysis.exe" in this folder.
+          (No Python needed. Keep it next to the "_internal" folder.)
+          To rebuild it after changing the code: double-click build_exe.bat
+
+The steps below are only needed to run from the Python source code.
+
+
 STEP 1: INSTALL ALL DEPENDENCIES
 ---------------------------------
 

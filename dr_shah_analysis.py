@@ -8,6 +8,12 @@ Version 6.0 - Clean Version (No Live Trading)
 import sys
 import os
 import json
+
+# A windowed .exe has no console: give print()/warnings somewhere harmless to write
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
 import csv
 import threading
 import time
@@ -37,11 +43,13 @@ except ImportError as e:
     input("Press Enter...")
     sys.exit(1)
 
+PDF_IMPORT_ERROR = ""
 try:
     import pdfplumber
     PDF_OK = True
-except ImportError:
+except Exception as e:   # not just ImportError: a missing native DLL raises OSError
     PDF_OK = False
+    PDF_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
 try:
     from reportlab.lib.pagesizes import letter, A4
@@ -139,7 +147,8 @@ except ImportError:
     MATPLOTLIB_OK = False
 
 # Logging
-log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dr_shah_analysis.log')
+from app_paths import FROZEN, DATA_DIR, RESOURCE_DIR
+log_file = str(DATA_DIR / 'dr_shah_analysis.log')
 logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s', filemode='a')
 logger = logging.getLogger(__name__)
 # yfinance logs every .NS miss (BSE-only stocks fall back to .BO) - keep the app log readable
@@ -149,8 +158,8 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 # CONFIGURATION
 # ============================================================
 
-BASE_DIR = Path(__file__).parent
-LOGO_PATH = BASE_DIR / "logo_new.png"
+BASE_DIR = DATA_DIR                          # your data (next to the .exe when packaged)
+LOGO_PATH = RESOURCE_DIR / "logo_new.png"    # bundled inside the .exe when packaged
 WATCHLIST_FILE = BASE_DIR / "watchlist.json"
 SCHEDULE_FILE = BASE_DIR / "schedule_config.json"
 WEIGHTS_FILE = BASE_DIR / "weights_config.json"
@@ -2789,7 +2798,7 @@ class App:
         try:
             if REPORT_OK:
                 EmailConfig().delete_stored_password()   # also remove it from Windows Credential Manager
-            config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "email_config.json")
+            config_file = str(DATA_DIR / "email_config.json")
             if os.path.exists(config_file):
                 os.remove(config_file)
             
@@ -4031,7 +4040,7 @@ class App:
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         
-        pdf_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports', 
+        pdf_file = os.path.join(str(DATA_DIR), 'reports', 
                                 f'watchlist_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf')
         os.makedirs(os.path.dirname(pdf_file), exist_ok=True)
         
@@ -4172,16 +4181,90 @@ class App:
         threading.Thread(target=do_send, daemon=True).start()
 
 
+def _self_test():
+    """Check that every part of the (packaged) app works. Run: "DR Nilesh Shah Market Analysis.exe" --self-test
+    Results are written to self_test_result.txt next to the .exe."""
+    import tempfile
+    lines, failed = [f"Self-test {datetime.now():%Y-%m-%d %H:%M:%S} | frozen={FROZEN} | data folder: {DATA_DIR}"], []
+
+    def check(name, fn):
+        try:
+            lines.append(f"PASS  {name}: {fn()}")
+        except Exception as e:
+            failed.append(name)
+            lines.append(f"FAIL  {name}: {type(e).__name__}: {e}")
+
+    def modules():
+        flags = dict(market_data=MARKET_DATA_OK, backtest=BACKTEST_OK, scheduler=SCHEDULER_OK, report=REPORT_OK,
+                     patterns=PATTERN_OK, corp_engine=CORP_ENGINE_OK, charts=MATPLOTLIB_OK, pdf_export=REPORTLAB_OK,
+                     pdf_import=PDF_OK, images=PIL_OK)
+        missing = [k for k, v in flags.items() if not v]
+        if missing:
+            raise RuntimeError(f"not loaded: {missing}" + (f" (pdf_import: {PDF_IMPORT_ERROR})" if PDF_IMPORT_ERROR else ""))
+        return "all loaded"
+    check("modules", modules)
+    check("logo", lambda: f"{LOGO_PATH.exists()} ({LOGO_PATH.name})" if LOGO_PATH.exists() else 1 / 0)
+
+    data = {}
+    def prices():
+        data.update(market_data.load_history(['RELIANCE', 'CREATIVE'], years=2))
+        return {s: len(df) for s, df in data.items()}
+    check("price download (NSE + BSE fallback)", prices)
+    check("analysis + score", lambda: (lambda d: f"{Scorer.score(d)['total']} / patterns {d['patterns']['summary']['total_patterns']}")(
+        Analyzer().analyze(data['RELIANCE'])))
+    check("backtest", lambda: f"{backtest.build_samples({'RELIANCE': data['RELIANCE']}, Scorer)[0].shape[0]} stock-days")
+
+    def keyring_backend():
+        import daily_report, keyring
+        if not daily_report.KEYRING_OK:
+            raise RuntimeError(type(keyring.get_keyring()).__name__)
+        return type(keyring.get_keyring()).__name__
+    check("Windows Credential Manager", keyring_backend)
+
+    def chart():
+        root = tk.Tk(); root.withdraw()
+        fig = Figure(figsize=(4, 3)); fig.add_subplot(111).plot([1, 2, 3])
+        FigureCanvasTkAgg(fig, master=root).draw(); root.destroy()
+        return f"TkAgg on Tk {tk.TkVersion}"
+    check("chart", chart)
+
+    def pdf():
+        path = os.path.join(tempfile.gettempdir(), 'dr_shah_selftest.pdf')
+        SimpleDocTemplate(path, pagesize=A4).build([Paragraph("Self-test", getSampleStyleSheet()['Normal'])])
+        with pdfplumber.open(path) as p:
+            text = p.pages[0].extract_text()
+        os.remove(path)
+        return f"written and read back ('{text.strip()}')"
+    check("PDF export + import", pdf)
+    check("NSE corporate actions", lambda: f"{len(CorporateActionsEngine().nse.fetch_all_actions())} actions")
+    check("NSE holiday calendar", lambda: f"{len(scheduled_report._nse_holidays(datetime.now().year))} holidays")
+
+    lines.append("RESULT: " + ("ALL PASSED" if not failed else f"{len(failed)} FAILED: {', '.join(failed)}"))
+    (DATA_DIR / "self_test_result.txt").write_text("\n".join(lines), encoding='utf-8')
+    return 0 if not failed else 1
+
+
 def main():
+    if '--self-test' in sys.argv:
+        sys.exit(_self_test())
+    if '--scheduled-report' in sys.argv:
+        # Started by Windows Task Scheduler (packaged .exe): email the report without opening the window
+        import scheduled_report
+        sys.exit(scheduled_report.main())
     try:
         root = tk.Tk()
         app = App(root)
         root.mainloop()
     except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        input("Press Enter...")
+        logger.exception("Fatal error")
+        if FROZEN:   # no console to show the error in
+            messagebox.showerror("DR. NILESH SHAH'S MARKET ANALYSIS",
+                                 f"The app could not start:\n\n{e}\n\nDetails are in dr_shah_analysis.log")
+        else:
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+            input("Press Enter...")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@ from email.mime.base import MIMEBase
 from email import encoders
 from typing import Dict, List, Optional
 
+from app_paths import DATA_DIR, RESOURCE_DIR
+
 # Data imports
 try:
     import yfinance as yf
@@ -125,7 +127,7 @@ NYSE_TOP25 = [
 def _load_min_liquidity():
     """Liquidity threshold (Rs crore/day) set in the app's Settings tab."""
     try:
-        return float(json.loads((Path(__file__).parent / "app_settings.json").read_text()).get('min_liquidity_cr', 1.0))
+        return float(json.loads((DATA_DIR / "app_settings.json").read_text()).get('min_liquidity_cr', 1.0))
     except Exception:
         return 1.0
 
@@ -141,7 +143,7 @@ class EmailConfig:
     """Email configuration and sending."""
     
     def __init__(self):
-        self.config_file = Path(__file__).parent / "email_config.json"
+        self.config_file = DATA_DIR / "email_config.json"
         self.smtp_server = "smtp.gmail.com"
         self.smtp_port = 587
         self.sender_email = ""
@@ -366,9 +368,14 @@ class EmailConfig:
 
 # Windows Credential Manager (via the keyring package) for the email app password
 KEYRING_SERVICE = "DR Nilesh Shah Market Analysis - Email"
+_FAIL_BACKENDS = ('Keyring', 'FailKeyring', 'NullKeyring')
 try:
     import keyring
-    KEYRING_OK = type(keyring.get_keyring()).__name__ not in ('Keyring', 'FailKeyring', 'NullKeyring')
+    if type(keyring.get_keyring()).__name__ in _FAIL_BACKENDS and sys.platform == 'win32':
+        # In the packaged .exe keyring may not discover its backends - use Windows' one directly
+        from keyring.backends.Windows import WinVaultKeyring
+        keyring.set_keyring(WinVaultKeyring())
+    KEYRING_OK = type(keyring.get_keyring()).__name__ not in _FAIL_BACKENDS
 except Exception:
     KEYRING_OK = False
 
@@ -617,7 +624,7 @@ class NewsFetcher:
     
     def __init__(self):
         self.news_api_key = None
-        self.news_file = Path(__file__).parent / "market_news.json"
+        self.news_file = DATA_DIR / "market_news.json"
     
     def fetch_news(self, query="stock market India", max_articles=10):
         """Fetch news from Yahoo Finance RSS or other sources."""
@@ -697,8 +704,8 @@ class DailyReportGenerator:
         self.analyzer = StockAnalyzer()
         self.news_fetcher = NewsFetcher()
         self.email_config = EmailConfig()
-        self.logo_path = Path(__file__).parent / "logo_new.png"
-        self.reports_dir = Path(__file__).parent / "reports"
+        self.logo_path = RESOURCE_DIR / "logo_new.png"
+        self.reports_dir = DATA_DIR / "reports"
         self.reports_dir.mkdir(exist_ok=True)
         self.report_data = {}
     

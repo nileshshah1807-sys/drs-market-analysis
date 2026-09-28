@@ -25,7 +25,9 @@ import subprocess
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
-BASE_DIR = Path(__file__).parent
+from app_paths import FROZEN, DATA_DIR
+
+BASE_DIR = DATA_DIR
 SCHEDULE_FILE = BASE_DIR / "schedule_config.json"
 WATCHLIST_FILE = BASE_DIR / "watchlist.json"
 STATE_FILE = BASE_DIR / "auto_report_state.json"
@@ -214,7 +216,10 @@ def install_task(hour: int, minute: int):
     """Create/replace a weekday Windows task at hour:minute. Returns (ok, message)."""
     if sys.platform != 'win32':
         return False, "Windows Task Scheduler is only available on Windows"
-    command = subprocess.list2cmdline([_pythonw(), str(Path(__file__).resolve())])
+    if FROZEN:   # packaged .exe: the task runs the .exe itself in report-only mode (no window)
+        command = subprocess.list2cmdline([sys.executable, '--scheduled-report'])
+    else:
+        command = subprocess.list2cmdline([_pythonw(), str(Path(__file__).resolve())])
     if len(command) > 261:
         return False, "Install path is too long for Task Scheduler (max 261 characters)"
     r = _schtasks('/Create', '/TN', TASK_NAME, '/TR', command, '/SC', 'WEEKLY',

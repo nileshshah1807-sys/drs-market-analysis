@@ -6,8 +6,10 @@ The app is **`dr_shah_analysis.py`**. Older versions are in `old_versions/` and 
 
 ## Quick Start (Windows)
 
-1. Double-click **`run_app.bat`**. It installs any missing packages, then starts the app.
-2. Or from Command Prompt in this folder:
+1. Double-click **`DR Nilesh Shah Market Analysis.exe`**. No Python needed.
+   Keep it in this folder, next to the `_internal` folder and your data files.
+2. Or run from source: double-click **`run_app.bat`** (installs any missing packages, then starts the app).
+3. Or from Command Prompt in this folder:
    ```
    python -m pip install -r requirements.txt
    python dr_shah_analysis.py
@@ -79,6 +81,19 @@ Stocks trading less than Rs 1 crore a day (adjustable) are marked **LOW** liquid
 | `run_app.bat`, `run.bat`, `install_dependencies.bat`, `setup.bat` | Launchers and installers |
 
 Your own data (watchlist, settings, reports, cache, log) stays on your PC and is not tracked by git.
+
+## Building the .exe
+
+Double-click **`build_exe.bat`**. It builds the app with PyInstaller (about 2 minutes) and installs
+`DR Nilesh Shah Market Analysis.exe` + `_internal\` into this folder. Close the app first.
+The recipe is in `DR_Nilesh_Shah_Market_Analysis.spec`.
+
+To check a build works: `"DR Nilesh Shah Market Analysis.exe" --self-test` writes `self_test_result.txt`.
+
+To use the app on another PC, copy the `.exe` **and** the `_internal` folder together (e.g. in a zip).
+There you'll need to enter the Gmail App Password again in Settings (it's stored in this PC's
+Credential Manager). Windows may show a "Windows protected your PC" warning for a downloaded,
+unsigned app: click "More info" > "Run anyway".
 
 ## Version control (git)
 

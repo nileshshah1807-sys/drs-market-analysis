@@ -23,3 +23,10 @@ auto_report_state.json
 auto_report.lock
 nse_holidays.json
 uploads/
+
+# Packaged app (rebuild with build_exe.bat)
+build/
+dist/
+_internal/
+*.exe
+self_test_result.txt

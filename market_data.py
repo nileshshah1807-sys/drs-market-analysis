@@ -29,7 +29,8 @@ import yfinance as yf
 logger = logging.getLogger(__name__)
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-CACHE_DIR = Path(__file__).parent / "data_cache"
+from app_paths import DATA_DIR
+CACHE_DIR = DATA_DIR / "data_cache"
 COLUMNS = ['Open', 'High', 'Low', 'Close', 'Volume']
 MIN_ROWS = 20
 FRESH_MINUTES = 10          # cached data younger than this is used without any download
