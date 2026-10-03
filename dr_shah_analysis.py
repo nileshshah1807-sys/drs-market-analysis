@@ -597,7 +597,7 @@ class TargetCalc:
                      'risk': round(sl - price, 2), 'reward': round(atr * 2.5, 2), 'pos': 'SHORT'})
         else:
             sl = price - atr * 1.5
-            r.update({'sl': round(sl, 2), 't1': round(price + atr * 1.5, 2), 't2': round(price + atr * 2.5, 2), 't3': round(price - atr * 2.5, 2),
+            r.update({'sl': round(sl, 2), 't1': round(price + atr * 1.5, 2), 't2': round(price + atr * 2.5, 2), 't3': round(price + atr * 4, 2),
                      'risk': round(price - sl, 2), 'reward': round(atr * 1.5, 2), 'pos': 'HOLD'})
         
         r['rr'] = round(r['reward'] / r['risk'], 2) if r.get('risk', 0) > 0 else 0
