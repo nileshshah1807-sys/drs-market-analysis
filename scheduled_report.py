@@ -153,8 +153,13 @@ def is_trading_day(day: date = None, india: bool = True):
 # Send the report
 # ------------------------------------------------------------
 
-def run_scheduled_report(force: bool = False, watchlist: list = None, report_type: str = None):
-    """Generate and email the daily report, following the schedule rules. Returns (sent: bool, message)."""
+def run_scheduled_report(force: bool = False, watchlist: list = None, report_type: str = None,
+                         max_late_hours: float = None):
+    """Generate and email the daily report, following the schedule rules. Returns (sent: bool, message).
+
+    max_late_hours: skip if it's this long past the scheduled time (the Windows task starts late
+    when the PC was off or asleep; a report sent next morning would block that evening's one).
+    """
     sched = load_schedule()
     today = date.today()
     report_type = report_type or sched['report_type']
@@ -169,6 +174,12 @@ def run_scheduled_report(force: bool = False, watchlist: list = None, report_typ
         ok, reason = is_trading_day(today, india=include_india)
         if not ok:
             return False, f"Skipped: {reason}"
+        if max_late_hours is not None:
+            due = datetime.now().replace(hour=sched['hour'], minute=sched['minute'], second=0, microsecond=0)
+            late = (datetime.now() - due).total_seconds() / 3600
+            if late > max_late_hours or late < -0.25:
+                return False, (f"Skipped: started at {datetime.now():%H:%M}, outside the window for the "
+                               f"{sched['hour']:02d}:{sched['minute']:02d} report")
 
     if not _acquire_lock():
         return False, "Another report is already being generated"
@@ -222,11 +233,71 @@ def install_task(hour: int, minute: int):
         command = subprocess.list2cmdline([_pythonw(), str(Path(__file__).resolve())])
     if len(command) > 261:
         return False, "Install path is too long for Task Scheduler (max 261 characters)"
-    r = _schtasks('/Create', '/TN', TASK_NAME, '/TR', command, '/SC', 'WEEKLY',
-                  '/D', 'MON,TUE,WED,THU,FRI', '/ST', f"{hour:02d}:{minute:02d}", '/F')
+    # Registered from XML (not /SC WEEKLY flags) so the task also runs on battery power and
+    # starts late if the PC was off/asleep at the time - schtasks' defaults block both.
+    xml_path = Path(os.environ.get('TEMP', str(BASE_DIR))) / 'dr_shah_task.xml'
+    try:
+        xml_path.write_text(_task_xml(hour, minute), encoding='utf-16')
+        r = _schtasks('/Create', '/TN', TASK_NAME, '/XML', str(xml_path), '/F')
+    finally:
+        try:
+            xml_path.unlink()
+        except OSError:
+            pass
     if r.returncode == 0:
         return True, f"Windows task installed: weekdays at {hour:02d}:{minute:02d}"
     return False, (r.stderr or r.stdout).strip()
+
+
+def _task_xml(hour: int, minute: int) -> str:
+    from xml.sax.saxutils import escape
+    if FROZEN:
+        program, arguments = sys.executable, '--scheduled-report'
+    else:
+        program, arguments = _pythonw(), subprocess.list2cmdline([str(Path(__file__).resolve())])
+    domain, name = os.environ.get('USERDOMAIN', ''), os.environ.get('USERNAME', '')
+    user = f"{domain}\\{name}" if domain else name
+    start = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Emails the DR. NILESH SHAH'S MARKET ANALYSIS daily report on NSE trading days.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>{start:%Y-%m-%dT%H:%M:%S}</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByWeek>
+        <DaysOfWeek><Monday /><Tuesday /><Wednesday /><Thursday /><Friday /></DaysOfWeek>
+        <WeeksInterval>1</WeeksInterval>
+      </ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{escape(user)}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{escape(program)}</Command>
+      <Arguments>{escape(arguments)}</Arguments>
+      <WorkingDirectory>{escape(str(BASE_DIR))}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
 
 
 def remove_task():
@@ -265,7 +336,7 @@ def main():
                         format='%(asctime)s - [Scheduled] %(message)s', filemode='a')
     logging.getLogger('yfinance').setLevel(logging.CRITICAL)
     force = '--force' in sys.argv
-    sent, msg = run_scheduled_report(force=force)
+    sent, msg = run_scheduled_report(force=force, max_late_hours=3)
     logger.info(msg)
     print(msg)
     return 0 if sent or not msg.startswith(("Email failed", "Report failed")) else 1

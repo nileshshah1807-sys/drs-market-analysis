@@ -267,8 +267,16 @@ class Analyzer:
     def __init__(self):
         self.cache = DataCache(4)
         self.pattern_detector = PatternDetector() if PATTERN_OK else None
-        self.ai_engine = AIEngine() if AI_OK else None
-    
+        self._ai_engine = None
+
+    @property
+    def ai_engine(self):
+        """Created on first use only: building it trains ML models (~2.6 s), which used to
+        slow every app start although scans don't use its output."""
+        if self._ai_engine is None and AI_OK:
+            self._ai_engine = AIEngine()
+        return self._ai_engine
+
     def fetch(self, symbol, period="2y"):
         key = f"{symbol}_{period}"
         cached = self.cache.get(key)
@@ -1799,7 +1807,7 @@ class App:
         cols = ('Sector', 'Stocks', 'Avg Score', 'Buy', 'Hold', 'Sell', 'Best', 'Rotation', 'Rank')
         self.sector_tree = ttk.Treeview(tab, columns=cols, show='headings', height=15)
         
-        widths = {'Sector': 100, 'Stocks': 60, 'Avg Score': 80, 'Buy': 50, 'Hold': 50,
+        widths = {'Sector': 170, 'Stocks': 60, 'Avg Score': 80, 'Buy': 50, 'Hold': 50,
                   'Sell': 50, 'Best': 90, 'Rotation': 110, 'Rank': 50}
         for col in cols:
             self.sector_tree.heading(col, text=col, anchor=tk.CENTER)
@@ -1816,16 +1824,34 @@ class App:
         if not self.results:
             messagebox.showinfo("Info", "Scan stocks first!")
             return
+        if getattr(self, '_sector_busy', False):
+            return
+        results = list(self.results)
+        self._sector_busy = True
+        self.sector_status.configure(text="Looking up sectors (first time only - cached afterwards)...")
         
+        def work():
+            sectors = {}
+            if MARKET_DATA_OK:
+                try:
+                    sectors = market_data.get_sectors([r['symbol'] for r in results])
+                except Exception as e:
+                    logger.error(f"Sector lookup failed: {e}")
+            self.gui.schedule(self._show_sectors, results, sectors)
+        threading.Thread(target=work, daemon=True).start()
+    
+    def _show_sectors(self, results, yahoo_sectors):
+        """Fill the Sector tab. Sector = Yahoo Finance's sector; if Yahoo has none, the built-in
+        list; otherwise 'Other'. (The built-in list alone only knew ~90 large caps.)"""
+        self._sector_busy = False
         for item in self.sector_tree.get_children():
             self.sector_tree.delete(item)
         
+        builtin = {s: sector for sector, stocks in SECTOR_MAP.items() for s in stocks}
         sector_data = {}
-        for r in self.results:
-            for sector, stocks in SECTOR_MAP.items():
-                if r['symbol'] in stocks:
-                    sector_data.setdefault(sector, []).append(r)
-                    break
+        for r in results:
+            sector = yahoo_sectors.get(r['symbol']) or builtin.get(r['symbol']) or 'Other'
+            sector_data.setdefault(sector, []).append(r)
         
         sector_scores = []
         for sector, stocks in sector_data.items():
@@ -1860,8 +1886,10 @@ class App:
         
         if sector_scores:
             self.sector_status.configure(
-                text=f"Rotation: {sector_scores[0][0]} LEADING ({sector_scores[0][1]:.1f}) | "
-                     f"{sector_scores[-1][0]} LAGGING ({sector_scores[-1][1]:.1f}) | Spread: {spread:.1f} pts")
+                text=f"Strongest: {sector_scores[0][0]} ({sector_scores[0][1]:.1f}) | "
+                     f"Weakest: {sector_scores[-1][0]} ({sector_scores[-1][1]:.1f}) | Spread: {spread:.1f} pts")
+        else:
+            self.sector_status.configure(text="No sector information found for the scanned stocks.")
     
     def build_backtest_tab(self):
         """Build Backtest tab: does the score actually predict returns on these stocks?"""
@@ -2921,9 +2949,10 @@ class App:
             if name not in self.watchlist_groups:
                 self.watchlist_groups[name] = []
                 self.group_cb.configure(values=list(self.watchlist_groups.keys()))
-                self.group_var.set(name)
-                self._switch_group()
                 self.save_watchlist_groups()
+                # Stay on the current list (a new group is empty, so switching to it shows nothing)
+                messagebox.showinfo("Group Created", f"Group '{name}' created.\n\n"
+                                    f"To fill it: show 'All Stocks', select a stock and click 'Add to Group'.")
 
     def _add_to_group(self):
         sel = self.wl_list.curselection()
@@ -2933,12 +2962,49 @@ class App:
         stock = self._wl_symbol(self.wl_list.get(sel[0]))
         group = self.group_var.get()
         if group == 'All Stocks':
-            messagebox.showinfo("Info", "Select a specific group first")
+            # The list shows every stock here - ask which group to add to. (Picking a group in
+            # the dropdown filters the list to that group's members, so it can't be used for this.)
+            group = self._ask_group(stock)
+            if not group:
+                return
+        members = self.watchlist_groups.setdefault(group, [])
+        if stock in members:
+            messagebox.showinfo("Info", f"{stock} is already in '{group}'")
             return
-        if stock not in self.watchlist_groups[group]:
-            self.watchlist_groups[group].append(stock)
-            self.save_watchlist_groups()
-            messagebox.showinfo("Added", f"{stock} added to '{group}'")
+        members.append(stock)
+        self.save_watchlist_groups()
+        self.refresh_watchlist()
+        messagebox.showinfo("Added", f"{stock} added to '{group}'")
+    
+    def _ask_group(self, stock):
+        """Small dialog: which group should this stock go into? Returns the name or None."""
+        groups = [g for g in self.watchlist_groups if g != 'All Stocks']
+        if not groups:
+            messagebox.showinfo("Info", "Create a group first (New Group).")
+            return None
+        T = THEME
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Add to Group")
+        dlg.configure(bg=T['bg'])
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        tk.Label(dlg, text=f"Add {stock} to which group?", bg=T['bg'], fg=T['fg'],
+                 font=('Segoe UI', 11)).pack(padx=25, pady=(18, 6))
+        var = tk.StringVar(value=groups[0])
+        ttk.Combobox(dlg, textvariable=var, values=groups, state='readonly', width=24).pack(padx=25, pady=4)
+        result = {}
+        def ok():
+            result['group'] = var.get()
+            dlg.destroy()
+        row = tk.Frame(dlg, bg=T['bg'])
+        row.pack(pady=15)
+        self.btn(row, "Add", T['success'], ok).pack(side=tk.LEFT, padx=5)
+        self.btn(row, "Cancel", T['bg3'], dlg.destroy).pack(side=tk.LEFT, padx=5)
+        dlg.bind('<Return>', lambda e: ok())
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return result.get('group')
 
     def _remove_from_group(self):
         sel = self.wl_list.curselection()
@@ -3095,7 +3161,7 @@ class App:
                 for col in df.columns:
                     for v in df[col].dropna():
                         s = str(v).strip().upper()
-                        if s and len(s) >= 2 and s.replace('-', '').isalpha():
+                        if self._looks_like_symbol(s):
                             imported.append(s)
             elif ext == '.pdf':
                 if not PDF_OK:
@@ -3107,7 +3173,7 @@ class App:
                         if text:
                             for w in text.split():
                                 s = re.sub(r'[^A-Za-z0-9&-]', '', w.strip()).upper()
-                                if s and len(s) >= 2 and s.isalpha() and len(s) <= 15:
+                                if self._looks_like_symbol(s):
                                     imported.append(s)
             elif ext == '.json':
                 with open(fp, 'r') as f:
@@ -3120,17 +3186,40 @@ class App:
                 with open(fp, 'r') as f:
                     imported = [l.strip() for l in f if l.strip()]
             
-            added = 0
-            for s in set(str(x).strip().upper() for x in imported if str(x).strip()):
-                if s not in self.watchlist and len(s) >= 2:
-                    self.watchlist.append(s)
-                    added += 1
-            
+            candidates = sorted({str(x).strip().upper() for x in imported if str(x).strip()} - set(self.watchlist))
+            candidates = [s for s in candidates if self._looks_like_symbol(s)]
+
+            rejected = []
+            if ext in ('.xlsx', '.xls', '.pdf') and candidates and MARKET_DATA_OK:
+                # Excel cells / PDF words are guesses (headings like "Symbol", ordinary words):
+                # keep only the ones Yahoo Finance knows as NSE/BSE stocks
+                self.status_lbl.configure(text=f"Checking {len(candidates)} possible symbols...")
+                self.root.update()
+                found = market_data.load_history(candidates, years=HISTORY_YEARS)
+                self.status_lbl.configure(text="Ready")
+                if not found:
+                    messagebox.showerror("Import", "Couldn't verify any symbols from this file.\n\n"
+                                         "Check your internet connection, or import a CSV/TXT list instead.")
+                    return
+                rejected = [s for s in candidates if s not in found]
+                candidates = [s for s in candidates if s in found]
+
+            self.watchlist.extend(candidates)
             self.refresh_watchlist()
             self.save_watchlist()
-            messagebox.showinfo("Imported", f"Added {added} stocks from {os.path.basename(fp)}")
+            msg = f"Added {len(candidates)} stocks from {os.path.basename(fp)}"
+            if rejected:
+                shown = ', '.join(rejected[:15]) + (' ...' if len(rejected) > 15 else '')
+                msg += f"\n\nSkipped {len(rejected)} entries that aren't NSE/BSE stocks:\n{shown}"
+            messagebox.showinfo("Imported", msg)
         except Exception as e:
             messagebox.showerror("Error", str(e))
+    
+    @staticmethod
+    def _looks_like_symbol(s):
+        """NSE/BSE-style symbol: 2-20 chars of A-Z, 0-9, & or -, with at least one letter
+        (e.g. RELIANCE, M&M, BAJAJ-AUTO, 20MICRONS). Pure numbers are allowed as BSE codes."""
+        return bool(re.fullmatch(r'[A-Z0-9&-]{2,20}', s)) and (any(ch.isalpha() for ch in s) or s.isdigit())
     
     def export_results(self):
         if not self.results:
@@ -3409,7 +3498,21 @@ class App:
                 tk.Label(p_frame, text=f" {pattern.get('signal', '')} ", bg=signal_color, fg='white', font=('Segoe UI', 9, 'bold'), padx=8, pady=2).pack(side=tk.LEFT, padx=10)
         else:
             tk.Label(self.pt_frame, text="No candlestick patterns detected", bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 11)).pack(pady=10)
-        
+
+        # Harmonic Patterns (they're included in the counts above, so list them too)
+        harmonic_patterns = patterns.get('harmonic', [])
+        if harmonic_patterns:
+            section = tk.LabelFrame(self.pt_frame, text=" HARMONIC PATTERNS ", bg=T['bg'], fg=T['accent'], font=('Segoe UI', 12, 'bold'))
+            section.pack(fill=tk.X, padx=80, pady=10)
+            for pattern in harmonic_patterns:
+                p_frame = tk.Frame(section, bg=T['card'], padx=10, pady=8)
+                p_frame.pack(fill=tk.X, padx=10, pady=4)
+                signal_color = T['success'] if pattern.get('signal') == 'BULLISH' else T['danger'] if pattern.get('signal') == 'BEARISH' else T['warning']
+                tk.Label(p_frame, text=pattern.get('name', ''), bg=T['card'], fg=T['fg'], font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
+                tk.Label(p_frame, text=f" {pattern.get('signal', '')} ", bg=signal_color, fg='white', font=('Segoe UI', 9, 'bold'), padx=8, pady=2).pack(side=tk.LEFT, padx=10)
+                if pattern.get('description'):
+                    tk.Label(p_frame, text=pattern['description'], bg=T['card'], fg=T['fg3'], font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=5)
+
         self.nb.select(4)
     
     def sort_tree(self, col):
@@ -4212,7 +4315,13 @@ def _self_test():
     check("price download (NSE + BSE fallback)", prices)
     check("analysis + score", lambda: (lambda d: f"{Scorer.score(d)['total']} / patterns {d['patterns']['summary']['total_patterns']}")(
         Analyzer().analyze(data['RELIANCE'])))
-    check("backtest", lambda: f"{backtest.build_samples({'RELIANCE': data['RELIANCE']}, Scorer)[0].shape[0]} stock-days")
+    def full_backtest():   # the whole thing incl. statistics (SciPy-free since 1 Oct fix)
+        r = backtest.run_backtest(data, Scorer, dict(Scorer.WEIGHTS), 10)
+        if 'error' in r:
+            raise RuntimeError(r['error'])
+        return f"{r['n_samples']} stock-days, power {r['current']['ic']:+.3f}"
+    check("backtest (full)", full_backtest)
+    check("sector lookup", lambda: market_data.get_sectors(['RELIANCE']))
 
     def keyring_backend():
         import daily_report, keyring

@@ -143,7 +143,9 @@ def _ic(a: pd.Series, b: pd.Series) -> float:
     """Spearman rank correlation (information coefficient)."""
     if len(a) < 30 or a.nunique() < 2:
         return float('nan')
-    return float(a.corr(b, method='spearman'))
+    # Spearman = Pearson correlation of the ranks. Computed directly because pandas'
+    # corr(method='spearman') needs SciPy, which the packaged .exe doesn't include.
+    return float(a.rank().corr(b.rank()))
 
 
 def _total(samples: pd.DataFrame, weights: dict) -> pd.Series:

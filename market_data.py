@@ -58,6 +58,11 @@ def _cache_path(ticker: str) -> Path:
     return CACHE_DIR / f"{safe}.pkl"
 
 
+# Cache files hold plain numpy arrays (not a pickled DataFrame): a DataFrame pickled by
+# pandas with pyarrow installed can't be unpickled where pyarrow is missing (the .exe).
+CACHE_FORMAT = 2
+
+
 def _read_cache(ticker: str):
     path = _cache_path(ticker)
     if not path.exists():
@@ -65,10 +70,14 @@ def _read_cache(ticker: str):
     try:
         with open(path, 'rb') as f:
             entry = pickle.load(f)
+        if isinstance(entry, dict) and entry.get('format') == CACHE_FORMAT:
+            df = pd.DataFrame(entry['values'], index=pd.DatetimeIndex(entry['index']), columns=list(entry['columns']))
+            return {'df': df, 'years': entry['years'], 'saved': entry['saved']}
         if isinstance(entry, dict) and isinstance(entry.get('df'), pd.DataFrame):
-            return entry
+            return entry   # older format - re-saved in the new format on the next update
     except Exception as e:
-        logger.warning(f"Cache read failed for {ticker}: {e}")
+        # e.g. an old-format file written with pyarrow: treat as a cache miss and download again
+        logger.info(f"Cache entry for {ticker} unreadable ({e}); downloading again")
     return None
 
 
@@ -77,7 +86,10 @@ def _write_cache(ticker: str, df: pd.DataFrame, years: int):
         CACHE_DIR.mkdir(exist_ok=True)
         tmp = _cache_path(ticker).with_suffix('.tmp')
         with open(tmp, 'wb') as f:
-            pickle.dump({'df': df, 'years': years, 'saved': datetime.now()}, f)
+            pickle.dump({'format': CACHE_FORMAT, 'columns': [str(c) for c in df.columns],
+                         'index': df.index.values.astype('datetime64[ns]'),
+                         'values': df.to_numpy(dtype='float64'),
+                         'years': years, 'saved': datetime.now()}, f)
         os.replace(tmp, _cache_path(ticker))
     except Exception as e:
         logger.warning(f"Cache write failed for {ticker}: {e}")
@@ -243,3 +255,76 @@ def slice_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
     offset = {'mo': pd.DateOffset(months=n), 'y': pd.DateOffset(years=n),
               'd': pd.DateOffset(days=n), 'wk': pd.DateOffset(weeks=n)}[unit]
     return df[df.index > df.index[-1] - offset]
+
+
+# ------------------------------------------------------------
+# Sectors (Yahoo Finance), cached in data_cache/sectors.json
+# ------------------------------------------------------------
+
+SECTOR_RECHECK_DAYS = 30   # stocks Yahoo had no sector for are looked up again after this
+
+
+def _lookup_sector(symbol: str):
+    """Sector name; '' if Yahoo knows the stock but has no sector; None if the lookup failed
+    (network/rate limit) - failures aren't cached, so they're retried next time."""
+    import time as _time
+    import yfinance as _yf
+    failed = False
+    for suffix in ('.NS', '.BO'):
+        info = None
+        for attempt in range(2):
+            try:
+                info = _yf.Ticker(symbol + suffix).info or {}
+                break
+            except Exception:
+                _time.sleep(1)
+        if info is None:
+            failed = True
+            continue
+        name = f"{info.get('longName') or ''} {info.get('shortName') or ''}"
+        # Yahoo labels Indian ETFs (NIFTYBEES, GOLDBEES...) as plain equities - spot them by name
+        if info.get('quoteType') in ('ETF', 'MUTUALFUND') or ' ETF' in f" {name.upper()}" or 'BEES' in name.upper():
+            return 'ETFs & Funds'
+        if info.get('sector'):
+            return info['sector']
+        if name.strip():
+            return ''          # found, but Yahoo has no sector for it
+    return None if failed else ''
+
+
+def get_sectors(symbols, progress=None) -> dict:
+    """{symbol: sector name ('' if unknown)} - looked up once from Yahoo, then cached."""
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    path = CACHE_DIR / "sectors.json"
+    try:
+        cache = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        cache = {}
+    today = datetime.now().date()
+    
+    def stale(s):
+        entry = cache.get(s)
+        if not entry:
+            return True
+        if entry.get('sector'):
+            return False
+        try:
+            return (today - datetime.strptime(entry.get('checked', ''), '%Y-%m-%d').date()).days > SECTOR_RECHECK_DAYS
+        except ValueError:
+            return True
+    
+    todo = [s for s in dict.fromkeys(s.upper() for s in symbols) if stale(s)]
+    if todo:
+        if progress:
+            progress(f"Looking up sectors for {len(todo)} stocks...")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for s, sector in zip(todo, pool.map(_lookup_sector, todo)):
+                if sector is not None:          # don't remember failed lookups
+                    cache[s] = {'sector': sector, 'checked': today.isoformat()}
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            path.write_text(json.dumps(cache, indent=1, sort_keys=True), encoding='utf-8')
+        except Exception as e:
+            logger.warning(f"Could not save sector cache: {e}")
+    return {s: cache.get(s.upper(), {}).get('sector', '') for s in symbols}

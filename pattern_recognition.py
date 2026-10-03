@@ -631,6 +631,16 @@ class PatternDetector:
         """Check if candle is bearish."""
         return o > c
     
+    @staticmethod
+    def _prior_trend(c, lookback: int = 5, threshold: float = 0.01) -> str:
+        """Trend over the candles BEFORE the last one: 'UP', 'DOWN' or 'FLAT'.
+        Hammer/Hanging Man and Inverted Hammer/Shooting Star have the same shape -
+        what tells them apart is the trend they appear after, not the candle colour."""
+        if len(c) < lookback + 2 or c[-lookback - 2] == 0:
+            return 'FLAT'
+        change = (c[-2] - c[-lookback - 2]) / c[-lookback - 2]
+        return 'UP' if change > threshold else 'DOWN' if change < -threshold else 'FLAT'
+    
     def _single_candle_patterns(self, o, h, l, c) -> List[Dict]:
         """Detect single candlestick patterns."""
         patterns = []
@@ -688,9 +698,11 @@ class PatternDetector:
                     'reliability': 55
                 })
         
-        # Hammer (bullish)
+        trend = self._prior_trend(c)
+        
+        # Hammer (bullish) - long lower shadow after a decline
         if lower_ratio > 0.6 and body_ratio < 0.3 and upper_ratio < 0.1:
-            if self._is_bullish(o[i], c[i]):
+            if trend == 'DOWN':
                 patterns.append({
                     'name': 'Hammer',
                     'signal': 'BULLISH',
@@ -700,9 +712,9 @@ class PatternDetector:
                     'reliability': 72
                 })
         
-        # Hanging Man (bearish)
+        # Hanging Man (bearish) - same shape after a rise
         if lower_ratio > 0.6 and body_ratio < 0.3 and upper_ratio < 0.1:
-            if self._is_bearish(o[i], c[i]):
+            if trend == 'UP':
                 patterns.append({
                     'name': 'Hanging Man',
                     'signal': 'BEARISH',
@@ -712,9 +724,9 @@ class PatternDetector:
                     'reliability': 65
                 })
         
-        # Inverted Hammer
+        # Inverted Hammer - long upper shadow after a decline
         if upper_ratio > 0.6 and body_ratio < 0.3 and lower_ratio < 0.1:
-            if self._is_bullish(o[i], c[i]):
+            if trend == 'DOWN':
                 patterns.append({
                     'name': 'Inverted Hammer',
                     'signal': 'BULLISH',
@@ -724,9 +736,9 @@ class PatternDetector:
                     'reliability': 60
                 })
         
-        # Shooting Star
+        # Shooting Star - same shape after a rise
         if upper_ratio > 0.6 and body_ratio < 0.3 and lower_ratio < 0.1:
-            if self._is_bearish(o[i], c[i]):
+            if trend == 'UP':
                 patterns.append({
                     'name': 'Shooting Star',
                     'signal': 'BEARISH',
@@ -990,6 +1002,8 @@ class PatternDetector:
         
         # Check last 5 swings for harmonic patterns
         X, A, B, C, D = swings[-5], swings[-4], swings[-3], swings[-2], swings[-1]
+        if len(close) - 1 - D['index'] > MAX_PATTERN_AGE:
+            return patterns   # pattern completed too long ago to matter now
         
         xa = abs(A['price'] - X['price'])
         ab = abs(B['price'] - A['price'])
