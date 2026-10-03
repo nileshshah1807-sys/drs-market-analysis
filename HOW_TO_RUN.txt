@@ -77,6 +77,27 @@ NEW FEATURES
    "Clear Config" removes it from Credential Manager too.
 
 
+7. VS NIFTY, SCORE CHANGES AND HISTORY
+   Scan Results shows "vs Nifty 3M" (the stock's 3-month return minus the
+   Nifty 50's) and "Score Chg" (change since your previous scan day).
+   After each scan the app lists stocks whose signal changed; the watchlist
+   email includes them too. Score Breakdown shows a score-history chart.
+   Every scan is saved in score_history.csv (opens in Excel).
+
+8. SCORING WEIGHTS RE-CHECK
+   Weights applied from the Backtest tab are re-checked against the default
+   weights every 30 days (or click "Re-check Weights"). If the defaults do
+   better on recent data, the app tells you. Settings > Reset Defaults
+   restores the original weights.
+
+9. ONE COPY AT A TIME
+   Opening the app while it's already running brings the open window to the
+   front, so two copies can't overwrite each other's watchlist and settings.
+
+10. FULL AUTOMATIC TEST
+   Double-click run_tests.bat - tests every feature on a throwaway copy.
+
+
 TROUBLESHOOTING
 -----------------
 

@@ -24,19 +24,20 @@ Use `python -m pip`, not plain `pip`: if you have more than one Python installed
 | Tab | What it does |
 |-----|--------------|
 | Watchlist | Add/remove stocks, groups, sector filter, import (Excel, CSV, TXT, JSON, PDF) |
-| Scan Results | Score, signal, 52-week range, ATR and daily traded value for every stock (F5 to scan) |
+| Scan Results | Score, signal, **change since the last scan**, **performance vs the Nifty 50**, 52-week range, ATR and daily traded value (F5 to scan). Signal changes are listed after each scan |
 | Score Breakdown / Stop-Loss & Targets / Pattern Analysis | Double-click a stock for details |
 | Corporate Actions | Live dividends, splits, bonus, buybacks from NSE and BSE |
 | Charts | Price with 20/50-day averages and volume |
 | Sector | Sector averages and rotation |
-| Backtest | Checks whether the score predicted returns on your stocks' history; suggests weights |
+| Backtest | Checks whether the score predicted returns on your stocks' history; suggests weights and re-checks applied weights every 30 days |
 | Settings | Email, scheduled report, liquidity threshold, scoring weights |
 
 Exports: Excel, CSV, PDF, and email (watchlist or full market report).
 
 ## Scoring
 
-Default indicator weights (change them in Settings, or apply the Backtest tab's suggestions):
+Default indicator weights (change them in Settings, or apply the Backtest tab's suggestions -
+the Backtest tab shows which weights are in use; Settings > Reset Defaults restores these):
 
 | Indicator | Weight |
 |-----------|--------|
@@ -74,6 +75,7 @@ Stocks trading less than Rs 1 crore a day (adjustable) are marked **LOW** liquid
 | `dr_shah_analysis.py` | Main app |
 | `market_data.py` | Batch price downloads with a disk cache (`data_cache/`) |
 | `backtest.py` | Backtest engine |
+| `score_history.py` | Score history (`score_history.csv`, one row per stock per day - opens in Excel) |
 | `daily_report.py` | Daily report, PDF and email |
 | `scheduled_report.py` | Scheduled email (Windows Task Scheduler) |
 | `corporate_actions_engine.py`, `corporate_actions.py` | Corporate actions (live + fallback) |
@@ -94,6 +96,13 @@ To use the app on another PC, copy the `.exe` **and** the `_internal` folder tog
 There you'll need to enter the Gmail App Password again in Settings (it's stored in this PC's
 Credential Manager). Windows may show a "Windows protected your PC" warning for a downloaded,
 unsigned app: click "More info" > "Run anyway".
+
+## Testing
+
+Double-click **`run_tests.bat`** (about 5 minutes). It runs every feature of the app twice - as Python
+and as the packaged .exe would - on a throwaway copy with a copy of your watchlist, so your data,
+email and Windows task are never touched (emails go to a fake mail server). It ends with
+"ALL PASSED" or a list of problems. The test is in `tests/`.
 
 ## Version control (git)
 
