@@ -20,6 +20,7 @@ import re
 import logging
 import pickle
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -27,7 +28,27 @@ import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+
+
+class _YahooErrorCapture(logging.Handler):
+    """Collects yfinance's error messages instead of printing/logging them. They name the
+    tickers that failed and why - used to retry tickers Yahoo rate-limited."""
+    def __init__(self):
+        super().__init__(logging.ERROR)
+        self.messages = []
+    
+    def emit(self, record):
+        try:
+            self.messages.append(record.getMessage())
+        except Exception:
+            pass
+
+
+_yahoo_errors = _YahooErrorCapture()
+_yf_logger = logging.getLogger('yfinance')
+_yf_logger.handlers = [_yahoo_errors]
+_yf_logger.setLevel(logging.ERROR)
+_yf_logger.propagate = False      # keep "possibly delisted" etc. out of the app log
 
 from app_paths import DATA_DIR
 CACHE_DIR = DATA_DIR / "data_cache"
@@ -44,6 +65,7 @@ EXCHANGE_SUFFIXES = {
     'NYSE': [''],
     'NASDAQ': [''],
     'US': [''],
+    'INDEX': [''],          # market indices, e.g. '^NSEI' (Nifty 50)
 }
 
 _lock = threading.Lock()
@@ -133,20 +155,43 @@ def _extract(data, ticker: str) -> pd.DataFrame:
     return _clean(data)
 
 
+def _rate_limited_tickers(messages) -> set:
+    """Tickers that yfinance reported as rate-limited ("Too Many Requests").
+    Its messages look like: ['ABC.NS', 'XYZ.NS']: YFRateLimitError('Too Many Requests...')"""
+    limited = set()
+    for msg in messages:
+        m = re.match(r"\s*\[(.*?)\]:\s*(.*)", msg, re.S)
+        if m and ('RateLimit' in m.group(2) or 'Too Many Requests' in m.group(2)):
+            limited.update(t.strip(" '\"") for t in m.group(1).split(','))
+    return limited
+
+
 def _download(tickers, **kwargs) -> dict:
-    """Batch-download tickers. Returns {ticker: DataFrame} (possibly empty frames)."""
+    """Batch-download tickers. Returns {ticker: DataFrame} (possibly empty frames).
+    Tickers Yahoo rate-limited are retried (after 2 s, then 4 s) instead of being reported
+    as having no data."""
     out = {}
     tickers = list(dict.fromkeys(tickers))
     for i in range(0, len(tickers), BATCH_SIZE):
-        chunk = tickers[i:i + BATCH_SIZE]
-        try:
-            data = yf.download(chunk, group_by='ticker', threads=True, progress=False,
-                               auto_adjust=True, **kwargs)
-        except Exception as e:
-            logger.error(f"Batch download failed ({len(chunk)} tickers): {e}")
-            data = None
-        for t in chunk:
-            out[t] = _extract(data, t)
+        pending, delay = tickers[i:i + BATCH_SIZE], 2
+        for attempt in range(3):
+            _yahoo_errors.messages = []
+            try:
+                data = yf.download(pending, group_by='ticker', threads=True, progress=False,
+                                   auto_adjust=True, **kwargs)
+            except Exception as e:
+                logger.error(f"Batch download failed ({len(pending)} tickers): {e}")
+                data = None
+            for t in pending:
+                out[t] = _extract(data, t)
+            limited = [t for t in pending if out[t].empty and t in _rate_limited_tickers(_yahoo_errors.messages)]
+            if not limited or attempt == 2:
+                if limited:
+                    logger.warning(f"Yahoo rate limit: no data for {len(limited)} tickers after retries")
+                break
+            logger.info(f"Yahoo rate limit for {len(limited)} tickers - retrying in {delay} s")
+            time.sleep(delay)
+            pending, delay = limited, delay * 2
     return out
 
 

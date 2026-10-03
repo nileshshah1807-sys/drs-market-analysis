@@ -12,6 +12,8 @@ watchlist_groups.json
 schedule_config.json
 weights_config.json
 app_settings.json
+score_history.csv
+.app.lock
 alerts.json
 market_news.json
 

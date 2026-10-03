@@ -13,7 +13,7 @@ from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 hiddenimports = (
     # local modules imported inside try/except or functions
     ['pattern_recognition', 'ai_engine', 'daily_report', 'corporate_actions',
-     'corporate_actions_engine', 'market_data', 'backtest', 'scheduled_report', 'app_paths',
+     'corporate_actions_engine', 'market_data', 'backtest', 'scheduled_report', 'app_paths', 'score_history',
      'tkinter.simpledialog']
     # Windows Credential Manager backend for the email password
     + collect_submodules('keyring.backends')

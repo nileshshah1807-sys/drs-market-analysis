@@ -19,6 +19,7 @@ import threading
 import time
 import re
 import queue
+import hashlib
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -120,6 +121,14 @@ try:
 except ImportError:
     pass
 
+# Score history (score_history.csv: every scan, for "Score Chg" and the history chart)
+HISTORY_OK = False
+try:
+    import score_history
+    HISTORY_OK = True
+except ImportError:
+    pass
+
 # Scheduled (Windows Task Scheduler) email report
 SCHEDULER_OK = False
 try:
@@ -151,8 +160,8 @@ from app_paths import FROZEN, DATA_DIR, RESOURCE_DIR
 log_file = str(DATA_DIR / 'dr_shah_analysis.log')
 logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s', filemode='a')
 logger = logging.getLogger(__name__)
-# yfinance logs every .NS miss (BSE-only stocks fall back to .BO) - keep the app log readable
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+# yfinance's own error messages (e.g. every .NS miss for BSE-only stocks) are captured by
+# market_data (to detect rate limiting) and kept out of the app log there
 
 # ============================================================
 # CONFIGURATION
@@ -604,6 +613,117 @@ class TargetCalc:
         return r
 
 
+# ============================================================
+# RELATIVE STRENGTH vs NIFTY 50
+# ============================================================
+
+NIFTY_SYMBOL = '^NSEI'
+RS_PERIODS = {'1M': 21, '3M': 63, '6M': 126}     # trading days
+
+
+def relative_strength(df, index_df, periods=RS_PERIODS):
+    """Stock return minus Nifty 50 return over each period, in percentage points
+    (+5.0 = the stock beat the Nifty by 5%). None where there isn't enough history."""
+    out = {label: None for label in periods}
+    if index_df is None or len(index_df) == 0 or df is None or len(df) < 2:
+        return out
+    index_close = index_df['Close']
+    for label, n in periods.items():
+        if len(df) <= n:
+            continue
+        start, end = df.index[-1 - n], df.index[-1]
+        s0, s1 = safe_float(df['Close'].iloc[-1 - n]), safe_float(df['Close'].iloc[-1])
+        i0, i1 = safe_float(index_close.asof(start)), safe_float(index_close.asof(end))
+        if s0 > 0 and i0 > 0 and i1 > 0:
+            out[label] = round((s1 / s0 - i1 / i0) * 100, 2)
+    return out
+
+
+# ============================================================
+# SETTINGS & SCORING WEIGHTS (shared by the app and scripts)
+# ============================================================
+
+def load_app_settings():
+    try:
+        if APP_SETTINGS_FILE.exists():
+            with open(APP_SETTINGS_FILE, 'r') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.error(f"Could not load app settings: {e}")
+    return {}
+
+
+def save_app_settings(settings):
+    with open(APP_SETTINGS_FILE, 'w') as f:
+        json.dump(settings, f, indent=2)
+
+
+def save_weights(weights, meta=None):
+    """Use these weights for scoring from now on and remember them (weights_config.json).
+    `meta` records where they came from (default / manual / backtest) for the monthly re-check."""
+    Scorer.WEIGHTS.update(weights)
+    with open(WEIGHTS_FILE, 'w') as f:
+        json.dump(weights, f, indent=2)
+    settings = load_app_settings()
+    settings['weights_meta'] = meta or {'source': 'manual', 'applied': datetime.now().strftime('%Y-%m-%d')}
+    save_app_settings(settings)
+
+
+# ============================================================
+# ONE COPY AT A TIME
+# ============================================================
+
+APP_TITLE = "DR. NILESH SHAH'S MARKET ANALYSIS"
+
+
+def single_instance_lock():
+    """Stops a second copy of the app (e.g. the .exe and the Python version) running on the
+    same data folder - both would save the watchlist/settings and overwrite each other's changes.
+    Returns a lock to keep for the app's lifetime, or None if another copy is already running."""
+    name = "DRNileshShahMarketAnalysis-" + hashlib.md5(str(DATA_DIR).lower().encode('utf-8')).hexdigest()[:16]
+    if sys.platform == 'win32':
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return True                       # couldn't check - don't block the app
+        if ctypes.get_last_error() == 183:    # ERROR_ALREADY_EXISTS: another copy holds it
+            kernel32.CloseHandle(handle)
+            return None
+        return handle                         # released automatically when the app exits
+    lock = DATA_DIR / ".app.lock"             # other systems: a lock file with our process id
+    try:
+        os.kill(int(lock.read_text()), 0)
+        return None
+    except (OSError, ValueError):
+        lock.write_text(str(os.getpid()))
+        return lock
+
+
+def focus_running_app():
+    """Bring the already-running copy's window to the front. True if found."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        user32.FindWindowW.restype = wintypes.HWND
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        hwnd = user32.FindWindowW(None, APP_TITLE)
+        if not hwnd:
+            return False
+        user32.ShowWindow(hwnd, 9)            # SW_RESTORE (un-minimise)
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
 class Tooltip:
     def __init__(self, widget, text):
         self.widget = widget
@@ -669,6 +789,7 @@ class App:
         self.center()
         self._setup_market_status()
         self.root.after(30000, self._check_auto_report)
+        self.root.after(120000, self._auto_recheck_weights)   # monthly re-check of backtest weights
         logger.info("App started v7.0")
     
     def center(self):
@@ -905,8 +1026,11 @@ class App:
         tab = tk.Frame(self.nb, bg=T['bg'])
         self.nb.add(tab, text="  Scan Results  ")
         
-        cols = ('Symbol', 'Price', 'Change%', 'RSI', 'SuperTrend', 'VWAP', 'Score', 'Recommendation', '52W High', '52W Low', 'ATR',
-                'Traded/day (Cr)')
+        cols = ('Symbol', 'Price', 'Change%', 'vs Nifty 3M', 'RSI', 'SuperTrend', 'VWAP', 'Score', 'Score Chg',
+                'Recommendation', '52W High', '52W Low', 'ATR', 'Traded/day (Cr)')
+        col_widths = {'Symbol': 105, 'Price': 85, 'Change%': 75, 'vs Nifty 3M': 95, 'RSI': 55, 'SuperTrend': 85,
+                      'VWAP': 80, 'Score': 60, 'Score Chg': 75, 'Recommendation': 115, '52W High': 85,
+                      '52W Low': 85, 'ATR': 65, 'Traded/day (Cr)': 110}
         
         # Search bar above results
         search_frame = tk.Frame(tab, bg=T['bg'])
@@ -951,7 +1075,7 @@ class App:
         self.tree = ttk.Treeview(frame, columns=cols, show='headings', yscrollcommand=sy.set, xscrollcommand=sx.set)
         for c in cols:
             self.tree.heading(c, text=c, anchor=tk.CENTER, command=lambda c=c: self.sort_tree(c))
-            self.tree.column(c, width=110, anchor=tk.CENTER)
+            self.tree.column(c, width=col_widths.get(c, 100), anchor=tk.CENTER)
         
         self.tree.pack(fill=tk.BOTH, expand=True)
         sy.config(command=self.tree.yview)
@@ -1924,6 +2048,13 @@ class App:
                                            font=('Segoe UI', 9))
         self.bt_liquid_cb.pack(side=tk.RIGHT, padx=10)
 
+        weights_row = tk.Frame(tab, bg=T['bg'])
+        weights_row.pack(fill=tk.X, padx=10, pady=(8, 0))
+        self.btn(weights_row, "Re-check Weights", T['bg3'], self.recheck_weights).pack(side=tk.RIGHT, padx=5)
+        self.bt_weights_lbl = tk.Label(weights_row, text="", bg=T['bg'], fg=T['fg'], font=('Segoe UI', 10, 'bold'),
+                                       wraplength=1150, justify=tk.LEFT)
+        self.bt_weights_lbl.pack(side=tk.LEFT, anchor=tk.W, padx=5)
+
         self.bt_status = tk.Label(tab, text="Tests the scoring system on your watchlist's past prices: for every past day it "
                                             "scores each stock exactly like a scan would, then checks what the price did next.",
                                   bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 10), wraplength=1300, justify=tk.LEFT)
@@ -1970,6 +2101,7 @@ class App:
 
         self._bt_result = None
         self._bt_cache = None   # (key, samples, skipped) - reused when only the holding period changes
+        self._update_weights_status()
 
     def run_backtest(self):
         if not BACKTEST_OK or not MARKET_DATA_OK:
@@ -2004,6 +2136,7 @@ class App:
                     result['skipped'] = sorted(set(result.get('skipped', []) + missing))
                     if 'samples' in result:
                         self._bt_cache = (key, result['samples'], result['skipped'])
+                result['years'] = years
                 self.gui.schedule(self._show_backtest, result)
             except Exception as e:
                 logger.error(f"Backtest error: {e}")
@@ -2100,8 +2233,15 @@ class App:
                 f"Change scoring weights?\n\n{detail}\n\n"
                 "You can restore the originals any time with Settings > Reset Defaults."):
             return
-        self._set_weights(dict(w))
-        messagebox.showinfo("Applied", "Suggested weights applied and saved.\n\nRe-scan (F5) to see updated scores.")
+        today = datetime.now().strftime('%Y-%m-%d')
+        self._set_weights(dict(w), {
+            'source': 'backtest', 'applied': today, 'last_check': today,
+            'horizon': r['horizon'], 'years': r.get('years', 5), 'liquid_only': bool(r.get('min_liquidity_cr')),
+            'tested_power': {'suggested': round(r['suggested']['ic'], 4), 'previous': round(r['current']['ic'], 4)},
+        })
+        messagebox.showinfo("Applied", "Suggested weights applied and saved.\n\nRe-scan (F5) to see updated scores.\n\n"
+                            f"The app re-checks them against the default weights every {self.WEIGHTS_RECHECK_DAYS} days "
+                            "and tells you if the defaults start doing better.")
         self.run_backtest()   # refresh the table so 'Current Wt' shows the new weights
 
     def build_settings_tab(self):
@@ -2688,36 +2828,151 @@ class App:
         if total != 100:
             messagebox.showwarning("Warning", f"Weights must total 100%! Current: {total}")
             return
-        self._set_weights(weights)
+        self._set_weights(weights, {'source': 'manual', 'applied': datetime.now().strftime('%Y-%m-%d')})
         messagebox.showinfo("Success", "Weights applied and saved!\n\nRe-scan (F5) to see updated scores.")
 
     def reset_weights(self):
-        self._set_weights(dict(Scorer.DEFAULT_WEIGHTS))
+        self._set_weights(dict(Scorer.DEFAULT_WEIGHTS), {'source': 'default', 'applied': datetime.now().strftime('%Y-%m-%d')})
         messagebox.showinfo("Reset", "Default weights restored.\n\nRe-scan (F5) to see updated scores.")
 
-    def _set_weights(self, weights):
-        """Use these weights for scoring from now on, and remember them across restarts."""
-        Scorer.WEIGHTS.update(weights)
+    def _set_weights(self, weights, meta=None):
+        """Use these weights for scoring from now on, and remember them (and where they came from)."""
+        try:
+            save_weights(weights, meta)
+        except Exception as e:
+            Scorer.WEIGHTS.update(weights)
+            logger.error(f"Could not save weights: {e}")
         if hasattr(self, 'weight_vars'):
             for k, v in weights.items():
                 if k in self.weight_vars:
                     self.weight_vars[k].set(v)
-        try:
-            with open(WEIGHTS_FILE, 'w') as f:
-                json.dump(weights, f, indent=2)
-        except Exception as e:
-            logger.error(f"Could not save weights: {e}")
+        self._update_weights_status()
 
     @staticmethod
     def _load_app_settings():
+        return load_app_settings()
+
+    # ---------- weights from the backtest: status + monthly re-check ----------
+
+    WEIGHTS_RECHECK_DAYS = 30
+
+    @staticmethod
+    def _weights_meta():
+        meta = load_app_settings().get('weights_meta') or {}
+        if not meta:   # no record yet: describe what's in use
+            meta = {'source': 'default' if Scorer.WEIGHTS == Scorer.DEFAULT_WEIGHTS else 'manual'}
+        return meta
+
+    def _update_weights_status(self):
+        if not hasattr(self, 'bt_weights_lbl'):
+            return
+        meta, T = self._weights_meta(), THEME
+        source = meta.get('source')
+        color = T['fg']
+        if source == 'backtest':
+            text = (f"Scoring weights: SUGGESTED by the backtest (applied {meta.get('applied', '?')}, "
+                    f"{meta.get('horizon', 10)}-day holding).")
+            last = meta.get('last_result') or {}
+            if last.get('verdict') == 'worse':
+                text += (f"  Re-check {meta.get('last_check')}: the DEFAULT weights did better over {last.get('since')} to "
+                         f"{last.get('until')} (power {last.get('default_ic', 0):+.3f} vs yours {last.get('current_ic', 0):+.3f}). "
+                         "Consider Settings > Reset Defaults, or re-run the backtest and apply fresh suggestions.")
+                color = T['warning']
+            elif last.get('verdict') == 'ok':
+                text += (f"  Re-check {meta.get('last_check')}: still at least as good as the defaults "
+                         f"(power {last.get('current_ic', 0):+.3f} vs {last.get('default_ic', 0):+.3f}).")
+                color = T['success']
+            try:
+                due = datetime.strptime(meta.get('last_check') or meta.get('applied'), '%Y-%m-%d') + timedelta(days=self.WEIGHTS_RECHECK_DAYS)
+                text += f"  Next automatic re-check: {due:%Y-%m-%d}."
+            except (TypeError, ValueError):
+                pass
+        elif source == 'manual':
+            when = f" on {meta['applied']}" if meta.get('applied') else ""
+            text = f"Scoring weights: set manually{when}. 'Re-check Weights' compares them with the defaults on recent history."
+        else:
+            text = "Scoring weights: DEFAULT. Run a backtest, then 'Apply Suggested Weights' to tune them to your stocks."
+        self.bt_weights_lbl.configure(text=text, fg=color)
+
+    def recheck_weights(self, auto=False):
+        """Compare the weights in use with the defaults on the most recent ~6 months of history."""
+        if not BACKTEST_OK or not MARKET_DATA_OK or not self.watchlist:
+            return
+        if Scorer.WEIGHTS == Scorer.DEFAULT_WEIGHTS:
+            if not auto:
+                messagebox.showinfo("Re-check Weights", "You're using the default weights - nothing to compare.\n\n"
+                                    "Run a backtest and click 'Apply Suggested Weights' to tune them to your stocks.")
+            return
+        if getattr(self, '_recheck_running', False):
+            return
+        self._recheck_running = True
+        meta = self._weights_meta()
+        horizon, years = int(meta.get('horizon', 10)), int(meta.get('years', 5))
+        min_liq = self.min_liquidity_cr if meta.get('liquid_only') else 0
+        watchlist, current = list(self.watchlist), dict(Scorer.WEIGHTS)
+        self.bt_weights_lbl.configure(text="Re-checking the scoring weights on recent history...", fg=THEME['fg3'])
+
+        def work():
+            try:
+                data = market_data.load_history(watchlist, years=HISTORY_YEARS)
+                data = {s: market_data.slice_period(df, f"{years}y") for s, df in data.items()}
+                samples, _ = backtest.build_samples(data, Scorer)
+                result = backtest.compare_weights(samples, current, dict(Scorer.DEFAULT_WEIGHTS), horizon,
+                                                  min_liquidity_cr=min_liq)
+            except Exception as e:
+                result = {'error': str(e)}
+            self.gui.schedule(self._recheck_done, result, auto)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _recheck_done(self, result, auto):
+        self._recheck_running = False
+        if 'error' in result:
+            logger.error(f"Weights re-check failed: {result['error']}")
+            self._update_weights_status()
+            if not auto:
+                messagebox.showerror("Re-check Weights", f"Re-check failed: {result['error']}")
+            return
+        cur, dflt = result['a'], result['b']
+        verdict = 'worse' if cur['ic'] < dflt['ic'] - 0.01 else 'ok'
+        settings = load_app_settings()
+        meta = settings.get('weights_meta') or self._weights_meta()
+        meta['last_check'] = datetime.now().strftime('%Y-%m-%d')
+        meta['last_result'] = {'verdict': verdict, 'since': result['since'], 'until': result['until'],
+                               'current_ic': round(cur['ic'], 4), 'default_ic': round(dflt['ic'], 4),
+                               'current_spread': round(cur['spread'], 3), 'default_spread': round(dflt['spread'], 3),
+                               'samples': result['n_samples']}
+        settings['weights_meta'] = meta
         try:
-            if APP_SETTINGS_FILE.exists():
-                with open(APP_SETTINGS_FILE, 'r') as f:
-                    data = json.load(f)
-                return data if isinstance(data, dict) else {}
+            save_app_settings(settings)
         except Exception as e:
-            logger.error(f"Could not load app settings: {e}")
-        return {}
+            logger.error(f"Could not save re-check result: {e}")
+        logger.info(f"Weights re-check: {verdict} (yours {cur['ic']:+.3f} vs default {dflt['ic']:+.3f})")
+        self._update_weights_status()
+        summary = (f"Recent history {result['since']} to {result['until']} ({result['n_samples']:,} stock-days, "
+                   f"{result['horizon']}-day holding):\n\n"
+                   f"Your weights:      power {cur['ic']:+.3f}, best-vs-worst {cur['spread']:+.2f}%\n"
+                   f"Default weights:  power {dflt['ic']:+.3f}, best-vs-worst {dflt['spread']:+.2f}%\n\n")
+        if verdict == 'worse':
+            messagebox.showwarning("Scoring Weights Re-check", summary +
+                                   "The DEFAULT weights predicted better recently. Consider Settings > Reset Defaults, "
+                                   "or re-run the backtest and apply fresh suggestions.")
+        elif not auto:
+            messagebox.showinfo("Scoring Weights Re-check", summary + "Your weights are still at least as good as the defaults.")
+
+    def _auto_recheck_weights(self):
+        """Runs after start-up: re-checks weights applied from the backtest every 30 days."""
+        meta = self._weights_meta()
+        if meta.get('source') != 'backtest':
+            return
+        try:
+            last = datetime.strptime(meta.get('last_check') or meta.get('applied'), '%Y-%m-%d')
+        except (TypeError, ValueError):
+            last = datetime.min
+        if (datetime.now() - last).days >= self.WEIGHTS_RECHECK_DAYS:
+            if self.scanning:
+                self.root.after(60000, self._auto_recheck_weights)   # don't compete with a scan
+            else:
+                self.recheck_weights(auto=True)
 
     def save_liquidity_setting(self):
         try:
@@ -2894,6 +3149,13 @@ class App:
                 ("Long Term", "Investment picks"),
                 ("Dividend Picks", "Income stocks"),
                 ("Custom", "Create your own groups (Ctrl+G)"),
+            ]),
+            ("MARKET COMPARISON & HISTORY", [
+                ("vs Nifty 3M", "Stock's 3-month return minus the Nifty 50's (+5% = beat the market by 5 points)"),
+                ("Score Chg", "Change in score since the previous scan day ('new' = first scan)"),
+                ("Signal changes", "Listed after each scan and in the watchlist email"),
+                ("Score history", "Chart under Score Breakdown; all scans are in score_history.csv"),
+                ("Re-check Weights", "Backtest tab: compares your weights with the defaults (automatic monthly)"),
             ]),
             ("LIQUIDITY", [
                 ("Traded/day (Cr)", "Average daily traded value over the last 20 sessions, in Rs crore"),
@@ -3234,7 +3496,8 @@ class App:
                 ws = wb.active
                 ws.title = "DR. NILESH SHAH ANALYSIS"
                 headers = ['Symbol', 'Price', 'Change%', 'RSI', 'Score', 'Recommendation', 'Stop Loss', 'Target 1', 'Target 2', 'Risk:Reward',
-                           'Traded/day (Rs Cr)', 'Liquidity']
+                           'Traded/day (Rs Cr)', 'Liquidity', 'vs Nifty 1M (%)', 'vs Nifty 3M (%)', 'vs Nifty 6M (%)',
+                           'Score Chg', 'Previous Signal']
                 for i, h in enumerate(headers, 1):
                     c = ws.cell(row=1, column=i, value=h)
                     c.font = Font(bold=True, color="FFFFFF")
@@ -3253,6 +3516,12 @@ class App:
                     ws.cell(row=row, column=10, value=f"1:{t.get('rr', 0)}")
                     ws.cell(row=row, column=11, value=round(r.get('data', {}).get('liquidity_cr', 0), 2))
                     ws.cell(row=row, column=12, value='LOW' if self._is_illiquid(r) else 'OK')
+                    rs = r.get('rs') or {}
+                    for col, period in ((13, '1M'), (14, '3M'), (15, '6M')):
+                        ws.cell(row=row, column=col, value=rs.get(period))
+                    if r.get('prev_score') is not None:
+                        ws.cell(row=row, column=16, value=round(r['score'] - r['prev_score'], 1))
+                        ws.cell(row=row, column=17, value=f"{r.get('prev_rec', '')} ({r.get('prev_date', '')})")
                 wb.save(fp)
             else:
                 with open(fp, 'w', newline='') as f:
@@ -3519,21 +3788,24 @@ class App:
         items = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
         
         def num(text):   # leading number of a cell, e.g. '+1.25%' -> 1.25, '0.42 LOW' -> 0.42
-            m = re.match(r'\s*([+-]?\d+(?:\.\d+)?)', text.replace(',', ''))
+            m = re.match(r'\s*([+-]?\d+(?:\.\d+)?)', str(text).replace(',', ''))
             return float(m.group(1)) if m else None
-        
-        if all(num(t[0]) is not None for t in items):
-            items.sort(key=lambda t: num(t[0]))
-        else:
-            items.sort(key=lambda t: t[0])
+
         if not hasattr(self, '_sort_col') or self._sort_col != col:
             self._sort_asc = True
             self._sort_col = col
-        elif self._sort_col == col:
+        else:
             self._sort_asc = not self._sort_asc
-        if not self._sort_asc:
-            items.reverse()
-        for index, (val, k) in enumerate(items):
+
+        numbered = [(num(v), v, k) for v, k in items]
+        if sum(n is not None for n, _, _ in numbered) >= max(1, len(numbered) // 2):
+            # mostly numbers: sort numerically, and keep text cells ('N/A', 'new') at the bottom
+            # in both directions (one 'N/A' used to make the whole column sort as text)
+            ordered = sorted([x for x in numbered if x[0] is not None], key=lambda x: x[0], reverse=not self._sort_asc)
+            ordered += [x for x in numbered if x[0] is None]
+        else:
+            ordered = sorted(numbered, key=lambda x: str(x[1]), reverse=not self._sort_asc)
+        for index, (_, _, k) in enumerate(ordered):
             self.tree.move(k, '', index)
     
     def start_scan(self):
@@ -3561,7 +3833,15 @@ class App:
         except Exception as e:
             logger.error(f"Batch download failed: {e}")
             frames = {}
-        
+
+        # Nifty 50, for each stock's relative strength
+        nifty = None
+        if MARKET_DATA_OK:
+            try:
+                nifty = market_data.load_history([NIFTY_SYMBOL], years=HISTORY_YEARS, exchange='INDEX').get(NIFTY_SYMBOL)
+            except Exception as e:
+                logger.warning(f"Nifty 50 download failed (relative strength not shown): {e}")
+
         # 2. Analyse each stock (CPU only - no network)
         for i, sym in enumerate(watchlist):
             self.gui.schedule(self._status, f"Analysing {sym} ({i+1}/{total})...", 10 + (i / total) * 90)
@@ -3588,7 +3868,8 @@ class App:
                     'st_sig': data['supertrend']['sig'], 'st_dir': data['supertrend']['dir'],
                     'vwap_sig': data['vwap']['sig'],
                     'patterns': data.get('patterns', {}), 'ai': data.get('ai', {}),
-                    'high52': high52, 'low52': low52
+                    'high52': high52, 'low52': low52,
+                    'rs': relative_strength(df, nifty)
                 }
                 self.results.append(result)
                 self.gui.schedule(self._add_tree, result)
@@ -3599,7 +3880,22 @@ class App:
         
         logger.info(f"Scan: {total - len(failed)}/{total} stocks in {time.time() - t0:.1f}s")
         self.results.sort(key=lambda x: x['symbol'])
-        self.gui.schedule(self._scan_done, failed)
+
+        # 3. Compare with the previous scan day, then save this scan to the score history
+        changes = []
+        if HISTORY_OK and self.results:
+            try:
+                prev = score_history.previous([r['symbol'] for r in self.results])
+                for r in self.results:
+                    p = prev.get(r['symbol'])
+                    if p and p.get('score'):
+                        r['prev_score'], r['prev_rec'], r['prev_date'] = float(p['score']), p['rec'], p['date']
+                        if p['rec'] != r['rec']:
+                            changes.append(f"{r['symbol']}: {p['rec']} -> {r['rec']}  (since {p['date']})")
+                score_history.record(self.results)
+            except Exception as e:
+                logger.error(f"Score history: {e}")
+        self.gui.schedule(self._scan_done, failed, changes)
     
     def _status(self, msg, pct):
         self.status_lbl.configure(text=msg)
@@ -3615,11 +3911,14 @@ class App:
         low52 = r.get('low52', 0)
         atr = safe_float(data.get('atr', 0))
         liq = self._liquidity_text(r)
-        
+        rs3 = (r.get('rs') or {}).get('3M')
+        rs_text = f"{rs3:+.1f}%" if rs3 is not None else "N/A"
+        chg_text = f"{r['score'] - r['prev_score']:+.1f}" if r.get('prev_score') is not None else "new"
+
         self.tree.insert('', tk.END, values=(
-            r['symbol'], f"{r['price']:.2f}", f"{r['change']:+.2f}%",
+            r['symbol'], f"{r['price']:.2f}", f"{r['change']:+.2f}%", rs_text,
             f"{r['rsi']:.1f}", r.get('st_sig', ''), r.get('vwap_sig', ''),
-            f"{r['score']:.1f}", r['rec'],
+            f"{r['score']:.1f}", chg_text, r['rec'],
             f"{high52:.2f}", f"{low52:.2f}", f"{atr:.2f}", liq
         ), tags=(tag,))
         
@@ -3629,7 +3928,7 @@ class App:
         self.tree.tag_configure('sell', background='#ef4444', foreground='white')
         self.tree.tag_configure('ss', background='#dc2626', foreground='white')
     
-    def _scan_done(self, failed=None):
+    def _scan_done(self, failed=None, changes=None):
         self.scanning = False
         self.scan_btn.configure(state=tk.NORMAL, text="SCAN ALL STOCKS")
         self.progress['value'] = 100
@@ -3649,14 +3948,17 @@ class App:
         msg = f"Scanned {len(self.results)} stocks!"
         if failed:
             msg += f"\n{len(failed)} failed: {', '.join(failed[:5])}"
+        if changes:
+            msg += f"\n\nSignal changes since the last scan ({len(changes)}):\n" + "\n".join(changes[:15])
+            if len(changes) > 15:
+                msg += f"\n... and {len(changes) - 15} more (see the 'Score Chg' column)"
         messagebox.showinfo("Done", msg)
     
     def _add_error(self, symbol, error):
         """Add error entry to tree."""
-        self.tree.insert('', tk.END, values=(
-            symbol, 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', f'Error: {error}',
-            'N/A', 'N/A', 'N/A', 'N/A'
-        ), tags=('error',))
+        values = [symbol] + ['N/A'] * (len(self.tree['columns']) - 1)
+        values[list(self.tree['columns']).index('Recommendation')] = f'Error: {error}'
+        self.tree.insert('', tk.END, values=values, tags=('error',))
         self.tree.tag_configure('error', background='#636e72', foreground='white')
     
     def filter_results(self):
@@ -3729,7 +4031,23 @@ class App:
         tk.Label(self.bd_frame, text=r['rec'], bg=T['bg'], fg=color, font=('Segoe UI', 16, 'bold')).pack(pady=5)
         tk.Label(self.bd_frame, text=f"Price: {r['price']:.2f} | Change: {r['change']:+.2f}%",
                 bg=T['bg'], fg=T['fg'], font=('Segoe UI', 12)).pack(pady=5)
-        
+
+        # Relative strength: did the stock beat the Nifty 50?
+        rs = r.get('rs') or {}
+        if any(v is not None for v in rs.values()):
+            rs_row = tk.Frame(self.bd_frame, bg=T['bg'])
+            rs_row.pack(pady=(2, 8))
+            tk.Label(rs_row, text="vs Nifty 50:", bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 11)).pack(side=tk.LEFT, padx=4)
+            for label, v in rs.items():
+                text = f"{label} {v:+.1f}%" if v is not None else f"{label} N/A"
+                fg = T['fg3'] if v is None else T['success'] if v > 0 else T['danger'] if v < 0 else T['fg']
+                tk.Label(rs_row, text=text, bg=T['bg'], fg=fg, font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT, padx=8)
+            rs3 = rs.get('3M')
+            if rs3 is not None:
+                verdict = "beating" if rs3 > 0 else "lagging"
+                tk.Label(self.bd_frame, text=f"Over 3 months the stock is {verdict} the market by {abs(rs3):.1f} percentage points.",
+                         bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9)).pack()
+
         names = {'rsi': 'RSI', 'macd': 'MACD', 'ma': 'Moving Avg', 'boll': 'Bollinger',
                 'stoch': 'Stochastic', 'adx': 'ADX', 'vol': 'Volume', 'mom': 'Momentum',
                 'st': 'SuperTrend', 'vwap': 'VWAP'}
@@ -3750,7 +4068,49 @@ class App:
             
             lbl = "Strong" if val >= 70 else "Good" if val >= 50 else "Weak" if val >= 30 else "Bearish"
             tk.Label(row, text=lbl, bg=T['bg'], fg=c, font=('Segoe UI', 9), width=8).pack(side=tk.LEFT)
-    
+
+        self._draw_score_history(r)
+
+    def _draw_score_history(self, r):
+        """Score history chart (one point per scan day) under the breakdown."""
+        if not HISTORY_OK:
+            return
+        T = THEME
+        try:
+            hist = score_history.history(r['symbol'])
+        except Exception as e:
+            logger.error(f"Score history read failed: {e}")
+            return
+        box = tk.LabelFrame(self.bd_frame, text=" SCORE HISTORY ", bg=T['bg'], fg=T['accent'],
+                            font=('Segoe UI', 11, 'bold'))
+        box.pack(fill=tk.X, padx=100, pady=(18, 10))
+        if len(hist) < 2 or not MATPLOTLIB_OK:
+            tk.Label(box, text="The history builds up as you scan on different days - one point per day.",
+                     bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 10)).pack(pady=8)
+            return
+        dates = [datetime.strptime(h['date'], '%Y-%m-%d') for h in hist]
+        scores = [safe_float(h['score']) for h in hist]
+        fig = Figure(figsize=(9, 2.6), dpi=100, facecolor=T['bg'])
+        ax = fig.add_subplot(111)
+        ax.set_facecolor(T['card'])
+        for level, col in ((75, '#059669'), (60, '#10b981'), (45, '#d97706'), (30, '#ef4444')):
+            ax.axhline(level, color=col, linewidth=0.8, linestyle='--', alpha=0.7)
+        ax.plot(dates, scores, color='#60a5fa', linewidth=1.8, marker='o', markersize=4)
+        ax.set_ylim(0, 100)
+        ax.set_ylabel('Score', color='#94a3b8', fontsize=9)
+        ax.tick_params(colors='#94a3b8', labelsize=8)
+        ax.grid(True, alpha=0.15)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        chart = FigureCanvasTkAgg(fig, master=box)
+        chart.draw()
+        chart.get_tk_widget().pack(fill=tk.X, padx=5, pady=5)
+        first, last = hist[0], hist[-1]
+        tk.Label(box, text=f"{len(hist)} scan days | first {first['date']}: {safe_float(first['score']):.1f} ({first['rec']})  ->  "
+                           f"latest {last['date']}: {safe_float(last['score']):.1f} ({last['rec']})   "
+                           f"(dashed lines: 75 Strong Buy, 60 Buy, 45 Hold, 30 Sell)",
+                 bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9)).pack(pady=(0, 6))
+
     def update_targets(self, r):
         T = THEME
         for w in self.tg_frame.winfo_children():
@@ -4090,6 +4450,17 @@ class App:
                 </div>
         """
         
+        # Signal changes since the previous scan day (from the score history)
+        changed = [r for r in sorted_results if r.get('prev_rec') and r['prev_rec'] != r['rec']]
+        if changed:
+            html += '<div class="section"><h2>Signal Changes Since Last Scan</h2><table>'
+            html += '<tr><th>Symbol</th><th>Before</th><th>Now</th><th>Score</th><th>Score Chg</th><th>Since</th></tr>'
+            for r in changed:
+                html += (f'<tr><td><b>{r["symbol"]}</b></td><td>{r["prev_rec"]}</td>'
+                         f'<td><span class="{r["rec"].lower().replace(" ", "-")}">{r["rec"]}</span></td>'
+                         f'<td>{r["score"]:.0f}</td><td>{r["score"] - r["prev_score"]:+.1f}</td><td>{r.get("prev_date", "")}</td></tr>')
+            html += '</table></div>'
+
         # Top picks section
         top_picks = [r for r in sorted_results if r['rec'] in ['STRONG BUY', 'BUY']][:5]
         if top_picks:
@@ -4102,13 +4473,15 @@ class App:
         
         # All results table
         html += '<div class="section"><h2>All Watchlist Results</h2><table>'
-        html += '<tr><th>#</th><th>Symbol</th><th>Price</th><th>Change%</th><th>RSI</th><th>SuperTrend</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>Traded/day (Cr)</th></tr>'
-        
+        html += '<tr><th>#</th><th>Symbol</th><th>Price</th><th>Change%</th><th>vs Nifty 3M</th><th>RSI</th><th>SuperTrend</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>Traded/day (Cr)</th></tr>'
+
         for i, r in enumerate(sorted_results, 1):
             t = r.get('targets', {})
             rec_class = r['rec'].lower().replace(' ', '-')
             row_class = 'top-pick' if r['rec'] in ['STRONG BUY', 'BUY'] else 'avoid' if r['rec'] in ['SELL', 'STRONG SELL'] else ''
-            html += f'<tr class="{row_class}"><td>{i}</td><td><b>{r["symbol"]}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{r["rsi"]:.0f}</td><td>{r.get("st_sig", "")}</td><td>{r["score"]:.0f}</td><td><span class="{rec_class}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>{self._liquidity_text(r)}</td></tr>'
+            rs3 = (r.get('rs') or {}).get('3M')
+            rs_cell = f"{rs3:+.1f}%" if rs3 is not None else "N/A"
+            html += f'<tr class="{row_class}"><td>{i}</td><td><b>{r["symbol"]}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{rs_cell}</td><td>{r["rsi"]:.0f}</td><td>{r.get("st_sig", "")}</td><td>{r["score"]:.0f}</td><td><span class="{rec_class}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>{self._liquidity_text(r)}</td></tr>'
         
         html += '</table>'
         html += (f'<p style="font-size:11px;color:#666">LOW = average traded value below Rs {self.min_liquidity_cr:g} crore/day: '
@@ -4299,6 +4672,7 @@ def _self_test():
 
     def modules():
         flags = dict(market_data=MARKET_DATA_OK, backtest=BACKTEST_OK, scheduler=SCHEDULER_OK, report=REPORT_OK,
+                     score_history=HISTORY_OK,
                      patterns=PATTERN_OK, corp_engine=CORP_ENGINE_OK, charts=MATPLOTLIB_OK, pdf_export=REPORTLAB_OK,
                      pdf_import=PDF_OK, images=PIL_OK)
         missing = [k for k, v in flags.items() if not v]
@@ -4315,6 +4689,16 @@ def _self_test():
     check("price download (NSE + BSE fallback)", prices)
     check("analysis + score", lambda: (lambda d: f"{Scorer.score(d)['total']} / patterns {d['patterns']['summary']['total_patterns']}")(
         Analyzer().analyze(data['RELIANCE'])))
+
+    def vs_nifty():
+        nifty = market_data.load_history([NIFTY_SYMBOL], years=2, exchange='INDEX').get(NIFTY_SYMBOL)
+        if nifty is None or len(nifty) < 130:
+            raise RuntimeError("Nifty 50 history not available")
+        rs = relative_strength(data['RELIANCE'], nifty)
+        if rs['3M'] is None:
+            raise RuntimeError(f"no 3-month figure: {rs}")
+        return f"RELIANCE vs Nifty 50: {rs}"
+    check("relative strength (Nifty 50)", vs_nifty)
     def full_backtest():   # the whole thing incl. statistics (SciPy-free since 1 Oct fix)
         r = backtest.run_backtest(data, Scorer, dict(Scorer.WEIGHTS), 10)
         if 'error' in r:
@@ -4353,6 +4737,9 @@ def _self_test():
     return 0 if not failed else 1
 
 
+_INSTANCE_LOCK = None
+
+
 def main():
     if '--self-test' in sys.argv:
         sys.exit(_self_test())
@@ -4360,6 +4747,17 @@ def main():
         # Started by Windows Task Scheduler (packaged .exe): email the report without opening the window
         import scheduled_report
         sys.exit(scheduled_report.main())
+    global _INSTANCE_LOCK
+    _INSTANCE_LOCK = single_instance_lock()
+    if _INSTANCE_LOCK is None:
+        logger.info("Second copy started - switching to the one already running")
+        if not focus_running_app():
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(APP_TITLE, "The app is already running.\n\nOnly one copy can run at a time, "
+                                           "so your watchlist and settings aren't overwritten.")
+            root.destroy()
+        return
     try:
         root = tk.Tk()
         app = App(root)

@@ -334,7 +334,7 @@ def main():
         sys.stderr = open(os.devnull, 'w')
     logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                         format='%(asctime)s - [Scheduled] %(message)s', filemode='a')
-    logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+    import market_data   # noqa: F401 - captures yfinance's messages, keeping them out of the log
     force = '--force' in sys.argv
     sent, msg = run_scheduled_report(force=force, max_late_hours=3)
     logger.info(msg)

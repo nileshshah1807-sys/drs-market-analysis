@@ -297,3 +297,34 @@ def run_backtest(data: dict, scorer, weights: dict, horizon: int = 10, progress=
         'skipped': skipped or [],
         'samples': samples,
     }
+
+
+def compare_weights(samples: pd.DataFrame, weights_a: dict, weights_b: dict, horizon: int = 10,
+                    recent_days: int = 126, min_liquidity_cr: float = 0) -> dict:
+    """Compare two weight sets on the most recent `recent_days` trading days (default ~6 months).
+
+    Used by the monthly re-check of weights applied from the Backtest tab: as time passes,
+    this window moves onto data the weights were never fitted to.
+    Returns {'a': {'ic', 'spread'}, 'b': {...}, 'since', 'until', 'n_samples'} or {'error': ...}.
+    """
+    raw, target = f'fwd{horizon}', f'fwd{horizon}_ex'
+    if samples is None or samples.empty:
+        return {'error': 'no price history'}
+    usable = samples.dropna(subset=[raw])
+    if min_liquidity_cr > 0:
+        usable = usable[usable['liquidity_cr'] >= min_liquidity_cr]
+    usable = _add_excess_returns(usable, horizon).dropna(subset=[target])
+    dates = np.sort(usable['date'].unique())
+    if len(dates) < 40:
+        return {'error': 'not enough recent history to compare'}
+    since = dates[max(0, len(dates) - recent_days)]
+    recent = usable[usable['date'] >= since]
+    a, b = _evaluate(recent, weights_a, target, raw), _evaluate(recent, weights_b, target, raw)
+    return {
+        'a': {'ic': a['ic'], 'spread': a['spread']},
+        'b': {'ic': b['ic'], 'spread': b['spread']},
+        'since': pd.Timestamp(since).strftime('%Y-%m-%d'),
+        'until': pd.Timestamp(dates[-1]).strftime('%Y-%m-%d'),
+        'n_samples': len(recent),
+        'horizon': horizon,
+    }
