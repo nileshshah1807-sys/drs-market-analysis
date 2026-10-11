@@ -1,8 +1,9 @@
 """Publish the web version: push to GitHub, and Vercel puts it online by itself.
 deploy_web.bat in the main folder runs this.
 
-Each run: copies the scoring code from the desktop app into web/api/_core, checks the web
-version on this PC (nothing is published if a check fails), then commits and pushes to
+Each run: refreshes the NSE + BSE company list (for the search box), copies the scoring code
+from the desktop app into web/api/_core, checks the web version on this PC (nothing is
+published if a check fails), then commits and pushes to
 GitHub (github.com/nileshshah1807-sys/drs-market-analysis, private). Vercel is connected to
 that repository and deploys every push to `main` in about a minute.
 """
@@ -28,7 +29,11 @@ def main():
     say("DR. NILESH SHAH'S MARKET ANALYSIS - publish the web version (GitHub > Vercel)")
     say("=" * 78)
 
-    say("\n[1/3] Copying the scoring code from the desktop app...")
+    say("\n[1/3] Updating the company list (NSE + BSE) and copying the scoring code...")
+    r = subprocess.run([sys.executable, str(ROOT / 'symbols.py'), 'build'], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', cwd=ROOT)
+    say("      " + (r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip()
+                    else "couldn't download the lists just now - keeping the saved company list"))
     subprocess.run([sys.executable, str(WEB / 'sync_core.py')], check=True)
 
     say("\n[2/3] Checking the web version on this PC (about a minute)...")

@@ -542,6 +542,52 @@ def chart():
 
 
 # ============================================================
+# COMPANY SEARCH - only for what the page's own list doesn't have (a brand-new listing)
+# ============================================================
+
+_search_cache = {}
+
+
+@app.get('/api/search')
+@login_required
+def search_companies():
+    """Companies on NSE/BSE matching `q`, looked up live on Yahoo Finance. The page searches
+    its own list (public/symbols.json) first and asks here only when that finds little.
+    Same entry shape as the list: [name, nse, bse, code, mcap, add]."""
+    q = str(request.args.get('q', '')).strip()[:40]
+    if len(q) < 3:
+        return jsonify({'companies': []})
+    hit = _search_cache.get(q.lower())
+    if hit and time.time() - hit[0] < 600:
+        return jsonify({'companies': hit[1]})
+    try:
+        import yfinance as yf
+        quotes = yf.Search(q, max_results=15, news_count=0).quotes
+    except Exception as e:
+        logger.warning(f"Yahoo search failed: {e}")
+        return jsonify({'companies': []})
+    found = {}
+    for x in quotes:
+        ticker = str(x.get('symbol', '')).upper()
+        if x.get('quoteType') != 'EQUITY' or not ticker.endswith(('.NS', '.BO')):
+            continue
+        base, name = ticker[:-3], (x.get('longname') or x.get('shortname') or '').strip()
+        if not SYMBOL_RE.match(base):
+            continue
+        shown = re.sub(r'-SM$', '', base)        # NSE's SME stocks carry -SM on Yahoo
+        e = found.setdefault((name or shown).lower(), {'name': name or shown, 'nse': '', 'bse': '', 'add_nse': '', 'add_bse': ''})
+        if ticker.endswith('.NS'):
+            e['nse'], e['add_nse'] = shown, base
+        else:
+            e['bse'], e['add_bse'] = shown, base
+    companies = [[e['name'], e['nse'], e['bse'], '', 0, e['add_nse'] or e['add_bse']] for e in found.values()][:8]
+    if len(_search_cache) > 500:
+        _search_cache.clear()
+    _search_cache[q.lower()] = (time.time(), companies)
+    return jsonify({'companies': companies})
+
+
+# ============================================================
 # THIS PC ONLY: serve the page too (Vercel serves public/ itself)
 # ============================================================
 

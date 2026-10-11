@@ -120,6 +120,19 @@ check('price chart data', r.status_code == 200 and 100 < len(d['t']) < 140 and l
 check('bad period refused', c.get('/api/chart?symbol=RELIANCE&period=10y').status_code == 400)
 check('unknown stock', c.get('/api/chart?symbol=ZZNOTREAL1&period=1y').status_code == 404)
 
+# ---- 6b. company search: the list the page searches, and the live look-up for new listings ----
+listed = json.loads((WEB / 'public' / 'symbols.json').read_text(encoding='utf-8'))['companies']
+rel = next((e for e in listed if e[5] == 'RELIANCE'), None)
+check('company list shipped with the page', len(listed) > 5000 and all(len(e) == 6 and e[0] and e[5] for e in listed), f"{len(listed)} companies")
+check('a company has its full name and both symbols', rel is not None and rel[:4] == ['Reliance Industries Limited', 'RELIANCE', 'RELIANCE', '500325'], str(rel))
+check('what gets added is always a usable symbol', all(index.SYMBOL_RE.match(e[5]) for e in listed) and len({e[5] for e in listed}) == len(listed))
+check('NSE SME stocks are added the way prices are listed (-SM)', any(e[5] == e[1] + '-SM' for e in listed))
+check('live search needs sign-in', client().get('/api/search?q=tata').status_code == 401)
+check('live search ignores very short text', c.get('/api/search?q=ta').get_json() == {'companies': []})
+found = c.get('/api/search?q=tata capital').get_json()['companies']
+check('live search (Yahoo) for companies not in the list', isinstance(found, list) and all(len(e) == 6 and index.SYMBOL_RE.match(e[5]) for e in found)
+      and (not found or any('tata' in e[0].lower() for e in found)), str(found[:2]))
+
 # ---- 7. password, sign out ----
 check('password change needs the current one', c.post('/api/password', json={'old': 'nope', 'new': 'new-password-1'}).status_code == 403)
 check('password changed', c.post('/api/password', json={'old': 'secret-pass-1', 'new': 'new-password-1'}).status_code == 200

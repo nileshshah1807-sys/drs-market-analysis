@@ -73,9 +73,12 @@
 
     <section class="card pad controls">
       <form class="add-row" id="add-form">
-        <label class="field">Add a stock
-          <input type="text" id="add-input" placeholder="e.g. RELIANCE" autocomplete="off" maxlength="20">
-        </label>
+        <div class="combo">
+          <label class="field" for="add-input">Add a stock</label>
+          <input type="text" id="add-input" placeholder="Company name or symbol, e.g. Reliance" autocomplete="off" maxlength="40"
+                 role="combobox" aria-expanded="false" aria-controls="add-list" aria-autocomplete="list" spellcheck="false">
+          <ul class="suggest hidden" id="add-list" role="listbox" aria-label="Matching companies"></ul>
+        </div>
         <button class="btn" type="submit">Add</button>
       </form>
       <div class="scan-box">
@@ -180,7 +183,7 @@
           <dt>0 to 29</dt><dd>Strong sell (double down marker)</dd>
         </dl></div>
         <div class="card pad"><h3>How to use</h3><dl>
-          <dt>1</dt><dd>Add stocks (one at a time, or paste many in Watchlist)</dd>
+          <dt>1</dt><dd>Add stocks: type the first letters of the company's name and pick it from the list (it shows the NSE and BSE symbols), or paste many symbols in Watchlist</dd>
           <dt>2</dt><dd>Scan all stocks</dd>
           <dt>3</dt><dd>Tap a stock for its score, stop-loss, targets and patterns</dd>
           <dt>4</dt><dd>Charts: price chart, or the 3D market map of the whole scan</dd>

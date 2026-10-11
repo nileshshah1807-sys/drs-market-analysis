@@ -180,8 +180,9 @@ async function boot() {
   renderWatchlist();
   renderResults();
   renderSummary(true);
+  loadCompanies();
   selectTab(state.watchlist.length ? 'results' : 'watchlist');
-  if (!state.watchlist.length) toast('Welcome', 'Add your stocks: type one above, or paste many in the Watchlist tab.', 'info', 8000);
+  if (!state.watchlist.length) toast('Welcome', "Add your stocks: type the first letters of a company's name above and pick it from the list.", 'info', 8000);
 }
 
 // ============================================================ market light (NSE 09:15-15:30, Mon-Fri, Indian time)
@@ -241,6 +242,148 @@ function renderSummary(animate = false) {
   }
 }
 
+// ============================================================ company list (NSE + BSE) and its search
+
+// Each company: [name, nse, bse, bseCode, marketCap, add] - `add` is what goes into the watchlist.
+const companies = { list: null, loading: null, names: new Map() };
+const keyWords = (text) => text.toLowerCase().replace(/[^a-z0-9& ]+/g, ' ').split(' ').filter(Boolean);
+
+function loadCompanies() {
+  if (!companies.loading) {
+    companies.loading = fetch('symbols.json').then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); }).then((d) => {
+      companies.list = d.companies.map((e) => ({ e, nse: e[1].toLowerCase(), bse: e[2].toLowerCase(), words: keyWords(e[0]) }));
+      d.companies.forEach((e) => [e[5], e[1], e[2]].forEach((k) => { if (k && !companies.names.has(k)) companies.names.set(k, e[0]); }));
+      renderWatchlist();
+    }).catch(() => { companies.loading = null; });
+  }
+  return companies.loading;
+}
+const companyName = (symbol) => companies.names.get(symbol) || '';
+
+/** Best matches first: exact symbol or code, symbol starts with it, name starts with it, each typed
+ *  word starts a word of the name, then anywhere. Among equals, bigger companies first (list order). */
+function searchCompanies(query, limit = 8) {
+  const q = query.trim().toLowerCase(), words = keyWords(query);
+  if (!companies.list || !q || !words.length) return [];
+  const compact = q.replace(/ /g, ''), joined = words.join(' ');
+  const found = [];
+  companies.list.forEach((c, i) => {
+    let rank;
+    if ([c.nse, c.bse, c.e[3], c.e[5].toLowerCase()].includes(compact)) rank = 0;
+    else if (c.nse.startsWith(compact) || c.bse.startsWith(compact)) rank = 1;
+    else if (c.words.join(' ').startsWith(joined)) rank = 2;
+    else if (words.every((t) => c.words.some((w) => w.startsWith(t)))) rank = 3;
+    else if (compact.length >= 3 && (c.nse.includes(compact) || c.bse.includes(compact) || c.words.join('').includes(compact))) rank = 4;
+    else return;
+    found.push([rank, i, c.e]);
+  });
+  found.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  return found.slice(0, limit).map((f) => f[2]);
+}
+
+// ---- the "Add a stock" box: type a name, pick from the list ----
+
+const suggest = { items: [], active: -1, typed: '', timer: null, seq: 0 };
+
+function highlight(name, query) {
+  const words = keyWords(query);
+  return name.split(/(\s+)/).map((part) => {
+    const t = words.find((w) => part.toLowerCase().replace(/[^a-z0-9&]/g, '').startsWith(w));
+    if (!t || !part.trim()) return esc(part);
+    let n = 0, i = 0;                      // mark the letters that were typed (skipping punctuation)
+    while (i < part.length && n < t.length) { if (/[a-z0-9&]/i.test(part[i])) n++; i++; }
+    return `<mark>${esc(part.slice(0, i))}</mark>${esc(part.slice(i))}`;
+  }).join('');
+}
+
+function renderSuggest() {
+  const box = $('#add-list'), input = $('#add-input');
+  const q = input.value.trim();
+  if (q.length < 2) { closeSuggest(); return; }
+  const rows = suggest.items.map((e, i) => {
+    const have = state.watchlist.includes(e[5]);
+    const nse = e[1] ? `<span class="ex"><small>NSE</small><b>${esc(e[1])}</b>${e[5].endsWith('-SM') ? '<i>SME</i>' : ''}</span>` : '<span class="ex none"><small>NSE</small>not listed</span>';
+    const bse = e[2] ? `<span class="ex"><small>BSE</small><b>${esc(e[2])}</b>${e[3] ? `<i>${esc(e[3])}</i>` : ''}</span>` : '<span class="ex none"><small>BSE</small>not listed</span>';
+    return `<li role="option" id="sg-${i}" data-i="${i}" aria-selected="${i === suggest.active}">
+      <div class="s-name">${highlight(e[0], q)}</div>
+      <div class="s-ex">${nse}${bse}${have ? '<span class="tag">In your watchlist</span>' : ''}${e.live ? '<span class="tag new">New listing</span>' : ''}</div></li>`;
+  });
+  const typed = q.toUpperCase().replace(/\.(NS|BO)$/, '');
+  let note = '';
+  if (!companies.list) note = 'Loading the company list...';
+  else if (!rows.length) note = SYMBOL_RE.test(typed) && !q.includes(' ') ? `No company found. Press Enter to add ${esc(typed)} as typed.` : 'No company found. Check the spelling, or type its exchange symbol.';
+  box.innerHTML = rows.join('') + (note ? `<li class="note" role="presentation">${note}</li>` : '');
+  box.classList.remove('hidden');
+  input.setAttribute('aria-expanded', 'true');
+  input.setAttribute('aria-activedescendant', suggest.active >= 0 ? `sg-${suggest.active}` : '');
+  const act = $(`#sg-${suggest.active}`);
+  if (act) act.scrollIntoView({ block: 'nearest' });
+}
+
+function closeSuggest() {
+  $('#add-list').classList.add('hidden');
+  $('#add-input').setAttribute('aria-expanded', 'false');
+  suggest.items = []; suggest.active = -1;
+}
+
+function updateSuggest() {
+  const q = $('#add-input').value.trim();
+  suggest.typed = q;
+  clearTimeout(suggest.timer);
+  suggest.seq++;
+  if (q.length < 2) { closeSuggest(); return; }
+  const run = () => {
+    if (suggest.typed !== q) return;
+    suggest.items = searchCompanies(q);
+    suggest.active = suggest.items.length ? 0 : -1;
+    renderSuggest();
+    liveSearch(q);
+  };
+  if (companies.list) run();
+  else { renderSuggest(); loadCompanies().then(run); }
+}
+
+/** A company too new for the list (just listed): ask the server, which looks it up on Yahoo Finance. */
+function liveSearch(q) {
+  if (q.length < 3 || suggest.items.length >= 3) return;
+  const seq = ++suggest.seq;
+  suggest.timer = setTimeout(async () => {
+    let res;
+    try { res = await api(`/api/search?q=${encodeURIComponent(q)}`); } catch (e) { return; }
+    if (seq !== suggest.seq || suggest.typed !== q) return;
+    const have = new Set(suggest.items.map((e) => e[5]));
+    const extra = (res.companies || []).filter((e) => e[5] && !have.has(e[5])).map((e) => Object.assign(e, { live: true }));
+    if (!extra.length) return;
+    suggest.items = [...suggest.items, ...extra].slice(0, 10);
+    if (suggest.active < 0) suggest.active = 0;
+    renderSuggest();
+  }, 400);
+}
+
+async function chooseCompany(e) {
+  const input = $('#add-input');
+  if (state.watchlist.includes(e[5])) { toast('Already in your watchlist', `${e[5]}: ${e[0]}`, 'info', 3500); }
+  else {
+    if (!companies.names.has(e[5])) companies.names.set(e[5], e[0]);
+    try { await saveWatchlist([...state.watchlist, e[5]].sort()); toast(`Added ${e[5]}`, e[0], 'good', 3500); }
+    catch (err) { toast("Couldn't add", err.message, 'bad'); return; }
+  }
+  input.value = ''; closeSuggest(); input.focus();
+}
+
+async function submitAdd() {
+  const input = $('#add-input');
+  if (suggest.active >= 0 && suggest.items[suggest.active]) { await chooseCompany(suggest.items[suggest.active]); return; }
+  // nothing in the list matched: a symbol typed as it is can still be added (several, with commas)
+  const raw = input.value.trim();
+  const list = parseSymbols(raw);
+  if (!list.length || (!raw.includes(',') && /\s/.test(raw))) {
+    toast('Pick a company from the list', 'Type the first letters of its name, or its NSE/BSE symbol.', 'warn', 4000);
+    return;
+  }
+  try { await addSymbols(list); input.value = ''; closeSuggest(); } catch (err) { toast("Couldn't add", err.message, 'bad'); }
+}
+
 // ============================================================ watchlist
 
 function renderWatchlist() {
@@ -249,7 +392,7 @@ function renderWatchlist() {
     box.innerHTML = '<div class="empty" style="grid-column:1/-1">Your watchlist is empty. Add a stock above, or paste many below.</div>';
     return;
   }
-  box.innerHTML = state.watchlist.map((s) => `<div class="chip"><span>${esc(s)}</span><button type="button" data-del="${esc(s)}" aria-label="Remove ${esc(s)}">&#x2715;</button></div>`).join('');
+  box.innerHTML = state.watchlist.map((s) => `<div class="chip" title="${esc(companyName(s))}"><span>${esc(s)}<small>${esc(companyName(s))}</small></span><button type="button" data-del="${esc(s)}" aria-label="Remove ${esc(s)}">&#x2715;</button></div>`).join('');
 }
 function parseSymbols(text) {
   return [...new Set(String(text).toUpperCase().split(/[\s,;"'[\]]+/).map((s) => s.replace(/\.(NS|BO)$/, '')).filter((s) => SYMBOL_RE.test(s)))];
@@ -444,7 +587,8 @@ function showDetails(symbol) {
 
   $('#p-details').innerHTML = `<div class="detail">
     <h2>${esc(r.symbol)} <span class="pill">${marker(r.rec, 12)} ${esc(SIG_LABEL[r.rec])}</span>
-      <button class="btn small" type="button" id="d-chart">Price chart</button></h2>
+      <button class="btn small" type="button" id="d-chart">Price chart</button>
+      ${companyName(r.symbol) ? `<span class="co">${esc(companyName(r.symbol))}</span>` : ''}</h2>
     ${r.hourly ? `<div class="note info">New listing (${esc(r.days)} trading days of history): analysed on 1-hour candles, so the stop-loss and targets sit closer to the price.</div>` : ''}
     ${illiquid(r) ? `<div class="note warn">Low liquidity: only about Rs ${Number(r.liquidity_cr || 0).toFixed(2)} crore traded per day. Price can gap past the stop-loss and orders may not fill.</div>` : ''}
     <div class="card pad head-card">
@@ -731,11 +875,22 @@ function wire() {
   $$('#tabs button').forEach((b) => b.addEventListener('click', () => selectTab(b.dataset.tab)));
   window.addEventListener('resize', () => { moveTabLine(); const l = $('#ladder'); if (l && l._redraw) l._redraw(); });
 
-  $('#add-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const list = parseSymbols($('#add-input').value);
-    if (!list.length) { toast('Enter an NSE symbol', 'For example RELIANCE, TCS or INFY.', 'warn', 3500); return; }
-    try { await addSymbols(list); $('#add-input').value = ''; } catch (err) { toast("Couldn't add", err.message, 'bad'); }
+  $('#add-form').addEventListener('submit', (e) => { e.preventDefault(); submitAdd(); });
+  const addInput = $('#add-input');
+  addInput.addEventListener('input', updateSuggest);
+  addInput.addEventListener('focus', () => { loadCompanies(); if (addInput.value.trim().length >= 2) updateSuggest(); });
+  addInput.addEventListener('blur', () => setTimeout(closeSuggest, 180));
+  addInput.addEventListener('keydown', (e) => {
+    const n = suggest.items.length;
+    if (e.key === 'ArrowDown' && n) { e.preventDefault(); suggest.active = (suggest.active + 1) % n; renderSuggest(); }
+    else if (e.key === 'ArrowUp' && n) { e.preventDefault(); suggest.active = (suggest.active - 1 + n) % n; renderSuggest(); }
+    else if (e.key === 'Escape') { closeSuggest(); }
+  });
+  $('#add-list').addEventListener('pointerdown', (e) => {
+    const li = e.target.closest('li[data-i]');
+    if (!li) return;
+    e.preventDefault();                       // keep the typing box focused
+    chooseCompany(suggest.items[Number(li.dataset.i)]);
   });
   $('#bulk-btn').addEventListener('click', async () => {
     const list = parseSymbols($('#bulk').value);

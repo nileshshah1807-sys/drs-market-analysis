@@ -103,6 +103,41 @@ async def run():
         check('signed up and in', await p.wait("!document.querySelector('#app').classList.contains('hidden')", 20))
         check('starts in light mode', await p.js("document.documentElement.dataset.theme") == 'light')
 
+        # the search box: type the first letters of a company's name, pick it from the list
+        typing = "(() => { const i=document.querySelector('#add-input'); i.focus(); i.value=%s; i.dispatchEvent(new Event('input',{bubbles:true})); return true; })()"
+        options = "[...document.querySelectorAll('#add-list li[role=option]')].map(li => li.innerText.replace(/\\s+/g, ' '))"
+        await p.js(typing % "'relia'")
+        check('suggestions appear while typing', await p.wait("document.querySelectorAll('#add-list li[role=option]').length >= 3", 20))
+        opts = await p.js(options)
+        check('a suggestion shows the full name and both exchanges', 'Reliance Industries Limited' in opts[0] and 'NSE RELIANCE' in opts[0]
+              and 'BSE RELIANCE' in opts[0] and '500325' in opts[0], opts[0])
+        check('typed letters are highlighted', await p.js("document.querySelector('#add-list mark').textContent") == 'Relia')
+        await p.shot('01b_suggestions')
+        await p.js("document.querySelector('#add-input').dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', bubbles: true})); true")
+        check('arrow keys move through the list', await p.js("document.querySelector('#add-list li[aria-selected=true]').id") == 'sg-1')
+        await p.js("document.querySelector('#add-input').dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowUp', bubbles: true})); true")
+        await p.js("document.querySelector('#add-form').requestSubmit(); true")          # Enter
+        check('Enter adds the highlighted company', await p.wait("document.querySelectorAll('#chips .chip').length === 1", 15)
+              and 'Reliance Industries Limited' in await p.js("document.querySelector('#chips .chip').innerText"))
+        await p.js(typing % "'tata consult'")
+        await p.wait("document.querySelectorAll('#add-list li[role=option]').length >= 1", 10)
+        check('several words find a company', 'Tata Consultancy Services' in (await p.js(options))[0])
+        await p.js("document.querySelector('#add-list li[role=option]').dispatchEvent(new PointerEvent('pointerdown', {bubbles: true})); true")
+        check('clicking a suggestion adds it', await p.wait("[...document.querySelectorAll('#chips .chip')].some(c => c.innerText.startsWith('TCS'))", 15))
+        await p.js(typing % "'creative cast'")
+        await p.wait("document.querySelectorAll('#add-list li[role=option]').length >= 1", 10)
+        opts = await p.js(options)
+        check('a BSE-only company says so', 'Creative Castings' in opts[0] and 'NSE not listed' in opts[0] and 'BSE CREATIVE' in opts[0], opts[0])
+        await p.js(typing % "'eventions'")
+        await p.wait("document.querySelectorAll('#add-list li[role=option]').length >= 1", 10)
+        check('an NSE SME company is marked', 'SME' in (await p.js(options))[0])
+        await p.js(typing % "'relia'")
+        await p.wait("document.querySelectorAll('#add-list li[role=option]').length >= 3", 10)
+        check('a company already added is marked', 'In your watchlist' in (await p.js(options))[0])
+        await p.js(typing % "'zzqqxx'")
+        check('nothing found: says so', await p.wait("(document.querySelector('#add-list .note') || {}).textContent?.startsWith('No company found')", 10))
+        await p.js(typing % "''")
+
         # add stocks
         await p.js("""document.querySelector('#bulk').value='RELIANCE, TCS, INFY HDFCBANK\\nITC SBIN ZZNOTREAL1';
             document.querySelector('#bulk-btn').click(); true""")
@@ -181,6 +216,15 @@ async def run():
         wide = await p.js("document.documentElement.scrollWidth > window.innerWidth + 1")
         check('phone: no sideways scrolling of the page', not wide)
         await p.shot('11_phone_results')
+        await p.js(typing % "'hdfc'")
+        await p.wait("document.querySelectorAll('#add-list li[role=option]').length >= 3", 10)
+        fits = await p.js("(r => r.left >= 0 && r.right <= window.innerWidth + 1)(document.querySelector('#add-list').getBoundingClientRect())")
+        check('phone: the suggestion list fits the screen', fits)
+        await p.js("document.querySelector('#add-input').scrollIntoView({block: 'start'}); true")
+        await asyncio.sleep(0.4)
+        await p.shot('11b_phone_suggestions')
+        await p.js(typing % "''")
+        await p.js("window.scrollTo(0, 0); true")
         await p.js("document.querySelector('#results-box tr[data-sym]').click(); true")
         await asyncio.sleep(1.5)
         await p.shot('12_phone_details')

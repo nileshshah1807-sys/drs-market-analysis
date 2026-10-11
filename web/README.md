@@ -39,6 +39,10 @@ Double-click **`run_web_locally.bat`** (opens <http://localhost:8000>; invite co
   Vercel Pro.
 - **Prices come from Yahoo Finance**, like the desktop app. If Yahoo ever refuses Vercel's
   servers, scans come back as "No data"; trying again later usually works.
+- **Adding a stock:** type the first letters of the company's name and pick it from the list,
+  which shows its NSE and BSE symbols. The list (about 5,500 companies, from the exchanges' own
+  files) is refreshed each time you publish; a company listed since then is still found through
+  a live look-up on Yahoo Finance.
 - A scan runs in batches of 8 stocks (a free Vercel request may run 60 seconds at most).
 - Market open/closed is worked out from Indian time (weekdays 09:15-15:30); NSE holidays aren't
   known to the website.
@@ -51,7 +55,7 @@ Double-click **`run_web_locally.bat`** (opens <http://localhost:8000>; invite co
 |------|---------|
 | `api/index.py` | The server: sign-in, watchlists, scan, charts (Flask) |
 | `api/_core/` | Copies of the desktop app's scoring code - edit the originals, not these |
-| `public/` | The page: `index.html`, `app.css`, `app.js` |
+| `public/` | The page: `index.html`, `app.css`, `app.js`, and `symbols.json` (every NSE and BSE company for the search box - a copy of `symbols_master.json`) |
 | `vercel.json`, `requirements.txt`, `.python-version` | Vercel settings |
 | `deploy.py` | What `deploy_web.bat` runs: sync, checks, commit, push |
 | `dev_server.py` | Runs the site on this PC |
