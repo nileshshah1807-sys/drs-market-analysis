@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Market Analysis</title>
+  <meta name="description" content="Dr. Nilesh Shah's technical scanner for NSE and BSE stocks">
+  <link rel="icon" href="icon.png">
+  <script>
+    // Apply the saved look before the page draws (no flash of the wrong colours)
+    try {
+      var s = JSON.parse(localStorage.getItem('drs-settings') || '{}');
+      document.documentElement.dataset.theme = s.theme || 'light';
+      if (s.animations === false) document.documentElement.classList.add('still');
+    } catch (e) {}
+  </script>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- ============ SIGN IN ============ -->
+<section id="login" class="login hidden">
+  <div class="card">
+    <div class="brand">
+      <img src="logo.png" alt="Dr. Nilesh Shah's Market Analysis logo">
+      <div>
+        <h1>DR. NILESH SHAH'S MARKET ANALYSIS</h1>
+        <p>Technical scanner for NSE and BSE stocks</p>
+      </div>
+    </div>
+    <div class="seg" role="group" aria-label="Sign in or create an account">
+      <button type="button" id="mode-in" aria-pressed="true">Sign in</button>
+      <button type="button" id="mode-new" aria-pressed="false">Create account</button>
+    </div>
+    <form id="login-form" autocomplete="on">
+      <label class="field">User name
+        <input type="text" id="l-name" autocomplete="username" required minlength="3" maxlength="20">
+      </label>
+      <label class="field">Password
+        <input type="password" id="l-pass" autocomplete="current-password" required minlength="8">
+      </label>
+      <label class="field hidden" id="invite-field">Invite code (from the person who shared this app)
+        <input type="text" id="l-invite" autocomplete="off">
+      </label>
+      <div class="err" id="l-err" role="alert"></div>
+      <button class="btn primary" type="submit" id="l-submit">Sign in</button>
+    </form>
+  </div>
+</section>
+
+<!-- ============ THE APP ============ -->
+<div id="app" class="hidden">
+  <header class="top">
+    <div class="wrap">
+      <div class="brand">
+        <img src="logo.png" alt="Logo">
+        <div>
+          <h1>DR. NILESH SHAH'S MARKET ANALYSIS</h1>
+          <p>Technical scanner for NSE and BSE stocks</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span class="market"><span class="dot" id="m-dot"></span><span id="m-text">Market closed</span></span>
+        <button class="btn ghost small" id="theme-btn" type="button">Dark</button>
+        <span class="user-chip" id="who"></span>
+        <button class="btn ghost small" id="logout-btn" type="button">Sign out</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="card summary" id="summary" aria-live="polite"></section>
+
+    <section class="card pad controls">
+      <form class="add-row" id="add-form">
+        <label class="field">Add a stock
+          <input type="text" id="add-input" placeholder="e.g. RELIANCE" autocomplete="off" maxlength="20">
+        </label>
+        <button class="btn" type="submit">Add</button>
+      </form>
+      <div class="scan-box">
+        <button class="btn primary" id="scan-btn" type="button">Scan all stocks</button>
+        <div class="progress">
+          <div class="bar-track"><i id="prog"></i></div>
+          <div class="status" id="status">Ready</div>
+        </div>
+      </div>
+    </section>
+
+    <nav class="tabs" role="tablist" id="tabs">
+      <button role="tab" data-tab="watchlist" aria-selected="false">Watchlist</button>
+      <button role="tab" data-tab="results" aria-selected="true">Scan Results</button>
+      <button role="tab" data-tab="details" aria-selected="false">Stock details</button>
+      <button role="tab" data-tab="charts" aria-selected="false">Charts</button>
+      <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
+      <button role="tab" data-tab="help" aria-selected="false">Help</button>
+      <span class="tab-line" id="tab-line"></span>
+    </nav>
+
+    <section class="panel" id="p-watchlist" role="tabpanel" hidden>
+      <div class="chips" id="chips"></div>
+      <div class="row-actions">
+        <textarea id="bulk" placeholder="Paste many stocks at once: RELIANCE, TCS, INFY ... (commas, spaces or new lines). A desktop watchlist.json works too."></textarea>
+        <button class="btn" id="bulk-btn" type="button">Add these</button>
+        <button class="btn danger" id="clear-btn" type="button">Clear list</button>
+      </div>
+    </section>
+
+    <section class="panel" id="p-results" role="tabpanel">
+      <div class="filters">
+        <label class="field">Find <input type="text" id="f-q" placeholder="Symbol"></label>
+        <label class="field">Show
+          <select id="f-rec">
+            <option value="All">All</option><option>STRONG BUY</option><option>BUY</option><option>HOLD</option><option>SELL</option><option>STRONG SELL</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="f-liq"> <span id="f-liq-text">Hide illiquid</span></label>
+      </div>
+      <div id="results-box"></div>
+    </section>
+
+    <section class="panel flat" id="p-details" role="tabpanel" hidden></section>
+
+    <section class="panel" id="p-charts" role="tabpanel" hidden>
+      <div class="chart-bar">
+        <label class="field">Stock <select id="c-sym"></select></label>
+        <div class="seg" id="c-period" role="group" aria-label="Period">
+          <button type="button" data-p="1mo" aria-pressed="false">1M</button>
+          <button type="button" data-p="3mo" aria-pressed="false">3M</button>
+          <button type="button" data-p="6mo" aria-pressed="true">6M</button>
+          <button type="button" data-p="1y" aria-pressed="false">1Y</button>
+          <button type="button" data-p="2y" aria-pressed="false">2Y</button>
+        </div>
+        <button class="btn primary" id="c-show" type="button">Show chart</button>
+        <button class="btn" id="c-map" type="button">3D market map</button>
+      </div>
+      <div id="chart"><div class="empty">Pick a stock and click Show chart. The 3D market map shows every scanned stock at once.</div></div>
+      <p class="small-note" id="c-note"></p>
+    </section>
+
+    <section class="panel" id="p-settings" role="tabpanel" hidden>
+      <div class="settings">
+        <div class="card pad">
+          <h3>Appearance</h3>
+          <div class="row"><span class="lbl">Colours</span>
+            <div class="seg" id="s-theme" role="group" aria-label="Colours">
+              <button type="button" data-v="light" aria-pressed="true">Light</button>
+              <button type="button" data-v="dark" aria-pressed="false">Dark</button>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px"><span class="lbl">Motion</span>
+            <label class="check"><input type="checkbox" id="s-anim" checked> Animations (counters, bars, charts that draw in, the turning 3D map)</label>
+          </div>
+        </div>
+        <div class="card pad">
+          <h3>Liquidity</h3>
+          <div class="row"><span class="lbl">Flag stocks trading under</span>
+            <input type="number" id="s-liq" min="0" step="0.5" style="width:100px"> <span>Rs crore per day</span>
+          </div>
+          <p class="small-note">Thinly traded stocks can gap past a stop-loss and orders may not fill.</p>
+        </div>
+        <div class="card pad">
+          <h3>Password</h3>
+          <form class="pw-form" id="pw-form">
+            <label class="field">Current password <input type="password" id="pw-old" autocomplete="current-password" required></label>
+            <label class="field">New password <input type="password" id="pw-new" autocomplete="new-password" minlength="8" required></label>
+            <button class="btn" type="submit">Change password</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="p-help" role="tabpanel" hidden>
+      <div class="help">
+        <div class="card pad"><h3>Signals</h3><dl>
+          <dt>75 to 100</dt><dd>Strong buy (double up marker)</dd>
+          <dt>60 to 74</dt><dd>Buy (up marker)</dd>
+          <dt>45 to 59</dt><dd>Hold (bar)</dd>
+          <dt>30 to 44</dt><dd>Sell (down marker)</dd>
+          <dt>0 to 29</dt><dd>Strong sell (double down marker)</dd>
+        </dl></div>
+        <div class="card pad"><h3>How to use</h3><dl>
+          <dt>1</dt><dd>Add stocks (one at a time, or paste many in Watchlist)</dd>
+          <dt>2</dt><dd>Scan all stocks</dd>
+          <dt>3</dt><dd>Tap a stock for its score, stop-loss, targets and patterns</dd>
+          <dt>4</dt><dd>Charts: price chart, or the 3D market map of the whole scan</dd>
+        </dl></div>
+        <div class="card pad"><h3>Columns</h3><dl>
+          <dt>vs Nifty 3M</dt><dd>3-month return minus the Nifty 50's</dd>
+          <dt>Score Chg</dt><dd>Change since your previous scan day ("new" = first scan)</dd>
+          <dt>Traded/day</dt><dd>Average daily traded value, last 20 sessions (Rs crore)</dd>
+          <dt>Candle</dt><dd>"1 Hour" for stocks listed less than a month ago</dd>
+        </dl></div>
+        <div class="card pad"><h3>Stop-loss and targets</h3><dl>
+          <dt>Stop-loss</dt><dd>Just beyond the nearest support (resistance, for a sell)</dd>
+          <dt>Targets</dt><dd>The next resistance levels (supports, for a sell)</dd>
+          <dt>No level</dt><dd>A multiple of the stock's ATR is used instead</dd>
+          <dt>Risk : reward</dt><dd>Distance to target 2 (target 1 for a hold) over distance to the stop</dd>
+        </dl></div>
+      </div>
+      <p class="small-note" style="margin-top:14px">For education and information only - not financial advice. Prices come from Yahoo Finance and can be delayed.</p>
+    </section>
+  </main>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>

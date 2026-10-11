@@ -1,0 +1,5 @@
+.dev_store.json
+dev_server.py
+tests/
+__pycache__/
+*.pyc
