@@ -104,6 +104,12 @@ except ImportError:
 import scoring
 from scoring import safe_float, Scorer, TargetCalc, relative_strength, NIFTY_SYMBOL, RS_PERIODS
 
+try:
+    import symbols          # every NSE + BSE company, for the "Add a stock" search
+    SYMBOLS_OK = True
+except ImportError:
+    SYMBOLS_OK = False
+
 # Fast batch price download + disk cache
 MARKET_DATA_OK = False
 try:
@@ -537,6 +543,8 @@ class App:
         self.center()
         self._setup_market_status()
         self._refresh_holidays()
+        if SYMBOLS_OK:    # the NSE + BSE company list is downloaded again when it's over a week old
+            threading.Thread(target=self._refresh_companies, daemon=True).start()
         self.root.after(30000, self._check_auto_report)
         self.root.after(120000, self._auto_recheck_weights)   # monthly re-check of backtest weights
         logger.info("App started v7.0")
@@ -607,12 +615,17 @@ class App:
 
         wl = tk.Frame(ctrl, bg=T['bg2'])
         wl.pack(side=tk.LEFT, padx=16, pady=10)
-        tk.Label(wl, text="Add a stock", bg=T['bg2'], fg=T['fg2'], font=(ui.FONT, 9)).grid(row=0, column=0, sticky='w', pady=(0, 3))
+        tk.Label(wl, text="Add a stock: type the company's name or its symbol", bg=T['bg2'], fg=T['fg2'],
+                 font=(ui.FONT, 9)).grid(row=0, column=0, sticky='w', pady=(0, 3))
         self.entry = tk.Entry(wl, font=(ui.FONT, 11), bg=T['input'], fg=T['fg'], insertbackground=T['fg'], relief=tk.FLAT,
-                              width=16, highlightbackground=T['line'], highlightcolor=T['accent'], highlightthickness=1)
+                              width=30, highlightbackground=T['line'], highlightcolor=T['accent'], highlightthickness=1)
         self.entry.grid(row=1, column=0, ipady=6, padx=(0, 8))
         self.entry.bind('<Return>', lambda e: self.add_stock())
-        Tooltip(self.entry, "Enter an NSE symbol, e.g. RELIANCE, TCS, INFY")
+        # Matching companies drop down while typing, each with its NSE and BSE symbols
+        self.suggest = ui.SuggestBox(self.entry, T, self._company_rows, self._add_company,
+                                     columns=(('Company', 360), ('NSE symbol', 150), ('BSE symbol (code)', 190)),
+                                     empty_text="No company found. Check the spelling - or, for a stock listed in the last few days,\n"
+                                                "type its exchange symbol and press Enter.") if SYMBOLS_OK else None
         self.btn(wl, "Add", None, self.add_stock).grid(row=1, column=1, padx=3)
         self.btn(wl, "Delete", T['danger'], self.del_stock).grid(row=1, column=2, padx=3)
         self.btn(wl, "Clear", T['danger'], self.clear_list).grid(row=1, column=3, padx=3)
@@ -3246,7 +3259,9 @@ class App:
                 ("Risk : Reward", "Distance to Target 2 (Target 1 for a HOLD), divided by distance to the stop-loss"),
             ]),
             ("HOW TO USE", [
-                ("1.", "Add stocks to watchlist"), ("2.", "Organize with Groups (Ctrl+G)"),
+                ("1.", "Add stocks: type the first letters of the company's name and pick it from the list"),
+                ("", "(the list shows its NSE and BSE symbols; typing a symbol or BSE code works too)"),
+                ("2.", "Organize with Groups (Ctrl+G)"),
                 ("3.", "Click Scan (F5)"), ("4.", "View results & details"),
                 ("5.", "Check Sector Rotation for trends"), ("6.", "Export reports (Ctrl+P)")
             ]),
@@ -3348,6 +3363,13 @@ class App:
                     dot.delete('ring')
                 self._pulsing = None
         again()
+
+    def _refresh_companies(self):
+        try:
+            if symbols.refresh_if_stale():
+                self.gui.schedule(self.refresh_watchlist)      # names of newly listed companies
+        except Exception as e:
+            logger.warning(f"Company list refresh failed: {e}")
 
     def _refresh_holidays(self):
         """Download NSE's holiday list in the background if the saved one is over a week old, so
@@ -3464,7 +3486,7 @@ class App:
 
     def _on_escape(self):
         for w in self.root.winfo_children():
-            if isinstance(w, tk.Toplevel):
+            if isinstance(w, tk.Toplevel) and w.state() == 'normal':     # not the hidden suggestion list
                 w.destroy()
                 return
         if hasattr(self, 'search_var'):
@@ -3475,18 +3497,60 @@ class App:
         if children:
             self.tree.selection_set(children)
 
+    def _company_rows(self, text):
+        """Rows for the list under the "Add a stock" box: company, NSE symbol, BSE symbol (code)."""
+        rows = []
+        for e in symbols.search(text, 8):
+            have = e[symbols.ADD] in self.watchlist
+            nse = (e[symbols.NSE] + ('  (SME)' if e[symbols.ADD].endswith('-SM') else '')) if e[symbols.NSE] else 'not listed'
+            bse = f"{e[symbols.BSE]}  ({e[symbols.CODE]})" if e[symbols.BSE] else 'not listed'
+            rows.append(((e[symbols.NAME] + ('   (in your watchlist)' if have else ''), nse, bse), e, 'dim' if have else ''))
+        return rows
+
+    def _add_company(self, e):
+        self._add_symbol(e[symbols.ADD], e[symbols.NAME])
+
     def add_stock(self):
-        s = self.entry.get().strip().upper()
-        if not s: return
-        s = re.sub(r'[^A-Z0-9&-]', '', s)
+        """Add what is in the typing box. A company highlighted in the list under it is added;
+        so is a symbol or BSE code typed in full. Anything else opens the list to choose from;
+        a symbol the list doesn't know (a stock listed in the last few days) is added as typed."""
+        text = self.entry.get().strip()
+        if not text:
+            return
+        if self.suggest is not None:
+            picked = self.suggest.selected()
+            if picked is None:
+                matches = symbols.search(text, 8)
+                typed = text.upper().replace(' ', '')
+                exact = [e for e in matches if typed in (e[symbols.NSE], e[symbols.BSE], e[symbols.CODE], e[symbols.ADD])]
+                if exact:
+                    picked = exact[0]
+                elif matches:
+                    self.suggest.update()        # show them: Enter again (or a click) adds the highlighted one
+                    return
+            if picked is not None:
+                self.suggest.hide()
+                self._add_company(picked)
+                return
+            if ' ' in text:
+                self.toast("No company found", "Check the spelling, or type the stock's exchange symbol.", kind='warn', ms=4000)
+                return
+        s = re.sub(r'[^A-Z0-9&-]', '', text.upper())
         if not s or len(s) < 2: return
+        self._add_symbol(s)
+
+    def _add_symbol(self, s, name=''):
         if s in self.watchlist:
             messagebox.showinfo("Info", f"{s} already in list!")
             return
         self.watchlist.append(s)
         self.entry.delete(0, tk.END)
+        if self.suggest is not None:
+            self.suggest.hide()
         self.refresh_watchlist()
         self.save_watchlist()
+        if name:
+            self.toast(f"Added {s}", name, kind='good', ms=3000)
     
     def del_stock(self):
         sel = self.wl_list.curselection()
@@ -3529,7 +3593,8 @@ class App:
         for s in stocks:
             grps = [g for g, m in self.watchlist_groups.items() if s in m and g != 'All Stocks']
             tag = f"  [{', '.join(grps)}]" if grps else ""
-            self.wl_list.insert(tk.END, f"{s}{tag}")
+            name = symbols.name_of(s) if SYMBOLS_OK else ''
+            self.wl_list.insert(tk.END, f"{s}{'  ' + name if name else ''}{tag}")   # _wl_symbol() reads up to the first gap
         self.wl_count.configure(text=f"Stocks: {len(stocks)}")
         if hasattr(self, 'group_count_lbl'):
             self.group_count_lbl.configure(text=f"Group: {group} | {len(stocks)} stocks")
@@ -5061,6 +5126,15 @@ def _self_test():
         fig = Figure(figsize=(4, 3)); fig.add_subplot(111).plot([1, 2, 3])
         FigureCanvasTkAgg(fig, master=root).draw(); root.destroy()
         return f"TkAgg on Tk {tk.TkVersion}"
+    def company_search():
+        found = symbols.search('relia', 5)
+        if len(symbols.load()) < 3000 or not found or found[0][symbols.ADD] != 'RELIANCE':
+            raise RuntimeError(f"{len(symbols.load())} companies, 'relia' -> {found[:1]}")
+        e = found[0]
+        return (f"{len(symbols.load())} companies; 'relia' -> {e[symbols.NAME]} (NSE {e[symbols.NSE]}, BSE {e[symbols.BSE]} {e[symbols.CODE]}); "
+                f"'tata cons' -> {[x[symbols.ADD] for x in symbols.search('tata cons', 2)]}")
+    check("company search (NSE + BSE list)", company_search)
+
     check("chart", chart)
 
     def chart_3d():      # the 3D market map and the 3D sector chart

@@ -24,6 +24,7 @@ reports/
 auto_report_state.json
 auto_report.lock
 nse_holidays.json
+symbols_cache.json
 uploads/
 
 # Packaged app (rebuild with build_exe.bat)

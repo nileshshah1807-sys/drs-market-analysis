@@ -23,7 +23,7 @@ Use `python -m pip`, not plain `pip`: if you have more than one Python installed
 
 | Tab | What it does |
 |-----|--------------|
-| Watchlist | Add/remove stocks, groups, sector filter, import (Excel, CSV, TXT, JSON, PDF) |
+| Watchlist | Add stocks by typing the first letters of the **company's name** (a list drops down with each company's NSE and BSE symbols) or its symbol; remove stocks, groups, sector filter, import (Excel, CSV, TXT, JSON, PDF) |
 | Scan Results | Score, signal (shown as a marker: double up = strong buy, up = buy, bar = hold, down = sell, double down = strong sell), **change since the last scan**, **performance vs the Nifty 50**, 52-week range, ATR and daily traded value (F5 to scan). Signal changes slide in at the bottom right after each scan, and the rows that changed glow briefly |
 | Score Breakdown / Stop-Loss & Targets / Pattern Analysis | Double-click a stock for details |
 | Corporate Actions | Live dividends, splits, bonus, buybacks from NSE and BSE |
@@ -124,6 +124,7 @@ scoring code. It is published by pushing to GitHub (Vercel deploys every push): 
 | `dr_shah_analysis.py` | Main app |
 | `ui_theme.py` | Light (Daylight) and dark colours, fonts, 3D buttons, tab bar, slide-in messages, animations |
 | `scoring.py` | Indicators, the 0-100 score and stop-loss/targets - one copy, used by the scan, the backtest and the daily report |
+| `symbols.py`, `symbols_master.json` | Every NSE and BSE company (name, symbol on each exchange) for the "Add a stock" search. From the exchanges' own files; the app refreshes its copy weekly (`python symbols.py build` rebuilds the shipped list) |
 | `market_data.py` | Batch price downloads with a disk cache (`data_cache/`) |
 | `backtest.py` | Backtest engine |
 | `score_history.py` | Score history (`score_history.csv`, one row per stock per day - opens in Excel) |

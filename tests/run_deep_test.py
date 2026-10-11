@@ -36,6 +36,7 @@ def make_sandbox(mode: str) -> Path:
     for f in ROOT.glob('*.py'):
         shutil.copy2(f, sandbox)
     shutil.copy2(ROOT / 'logo_new.png', sandbox)
+    shutil.copy2(ROOT / 'symbols_master.json', sandbox)     # the NSE + BSE company list
     for name in DATA_FILES:
         if (ROOT / name).exists():
             shutil.copy2(ROOT / name, sandbox)

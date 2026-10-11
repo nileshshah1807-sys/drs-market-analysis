@@ -695,6 +695,152 @@ class ScoreRing(tk.Canvas):
 
 
 # ============================================================
+# SUGGESTIONS UNDER A TYPING BOX
+# ============================================================
+
+class SuggestBox:
+    """A list that drops down under an Entry while you type. `search(text)` returns the rows
+    to show: [(values for the columns, item, tag)]. Up/Down move through them, a click (or
+    Enter, which the owner handles through selected()) picks one: on_pick(item). Esc closes."""
+
+    IGNORED = {'Up', 'Down', 'Return', 'KP_Enter', 'Escape', 'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R',
+               'Alt_L', 'Alt_R', 'Caps_Lock', 'Left', 'Right', 'Home', 'End'}
+
+    def __init__(self, entry, T, search, on_pick, columns, empty_text='', min_chars=2, max_rows=8):
+        self.entry, self.T, self.search, self.on_pick = entry, T, search, on_pick
+        self.columns, self.empty_text, self.min_chars, self.max_rows = columns, empty_text, min_chars, max_rows
+        self.win = self.tree = self.note = None
+        self.items, self.shown_for, self._timer = [], None, None
+        entry.bind('<KeyRelease>', self._on_key, add='+')
+        entry.bind('<Down>', lambda e: self._move(1))
+        entry.bind('<Up>', lambda e: self._move(-1))
+        entry.bind('<Escape>', self._on_escape)
+        entry.bind('<FocusOut>', lambda e: entry.after(200, self._hide_unless_focused), add='+')
+        entry.bind('<Destroy>', lambda e: self._destroy(), add='+')
+
+    # ---- the window ----
+    def _alive(self):
+        try:
+            return self.win is not None and self.win.winfo_exists()
+        except tk.TclError:
+            return False
+
+    def _build(self):
+        T = self.T
+        self.win = tk.Toplevel(self.entry.winfo_toplevel())
+        self.win.withdraw()
+        self.win.overrideredirect(True)
+        try:
+            self.win.attributes('-topmost', True)
+        except tk.TclError:
+            pass
+        frame = tk.Frame(self.win, bg=T['accent'], padx=1, pady=1)
+        frame.pack(fill=tk.BOTH, expand=True)
+        self.tree = ttk.Treeview(frame, columns=[c for c, _ in self.columns], show='headings', height=1, selectmode='browse')
+        for name, width in self.columns:
+            self.tree.heading(name, text=name, anchor=tk.W)
+            self.tree.column(name, width=width, anchor=tk.W, stretch=False)
+        self.tree.tag_configure('dim', foreground=T['fg3'])
+        self.tree.bind('<ButtonRelease-1>', self._on_click)
+        self.tree.bind('<Motion>', self._on_hover)
+        self.note = tk.Label(frame, bg=T['card'], fg=T['fg2'], font=(FONT, 10), anchor=tk.W, padx=12, pady=9, justify=tk.LEFT)
+
+    def visible(self):
+        return self._alive() and self.win.state() == 'normal'
+
+    def hide(self):
+        if self._alive():
+            self.win.withdraw()
+
+    def _destroy(self):
+        if self._alive():
+            self.win.destroy()
+        self.win = None
+
+    def _hide_unless_focused(self):
+        try:
+            if self.entry.winfo_exists() and self.entry.focus_get() is not self.entry:
+                self.hide()
+        except (tk.TclError, KeyError):
+            self.hide()
+
+    # ---- contents ----
+    def update(self):
+        """Show the matches for what is typed now."""
+        if self._timer:
+            self.entry.after_cancel(self._timer)
+            self._timer = None
+        text = self.entry.get().strip()
+        if len(text) < self.min_chars:
+            self.shown_for = None
+            self.hide()
+            return
+        rows = self.search(text)
+        if not self._alive():
+            self._build()
+        self.items, self.shown_for = [r[1] for r in rows], text
+        self.tree.delete(*self.tree.get_children())
+        for i, (values, _item, tag) in enumerate(rows):
+            self.tree.insert('', tk.END, iid=str(i), values=values, tags=(tag,) if tag else ())
+        if rows:
+            self.note.pack_forget()
+            self.tree.configure(height=min(len(rows), self.max_rows))
+            self.tree.pack(fill=tk.BOTH, expand=True)
+            self.tree.selection_set('0')
+        else:
+            self.tree.pack_forget()
+            self.note.configure(text=self.empty_text)
+            self.note.pack(fill=tk.X)
+        self.entry.update_idletasks()
+        self.win.geometry(f"+{self.entry.winfo_rootx()}+{self.entry.winfo_rooty() + self.entry.winfo_height() + 3}")
+        self.win.deiconify()
+        self.win.lift()
+
+    def selected(self):
+        """The highlighted item, if the list is showing the matches for what is typed now."""
+        if not self.visible() or self.shown_for != self.entry.get().strip():
+            return None
+        sel = self.tree.selection()
+        return self.items[int(sel[0])] if sel and int(sel[0]) < len(self.items) else None
+
+    # ---- keys and mouse ----
+    def _on_key(self, e):
+        if e.keysym in self.IGNORED:
+            return
+        if self._timer:
+            self.entry.after_cancel(self._timer)
+        self._timer = self.entry.after(70, self.update)
+
+    def _move(self, step):
+        if not self.visible() or not self.items:
+            self.update()
+            return 'break'
+        sel = self.tree.selection()
+        i = (int(sel[0]) + step) % len(self.items) if sel else 0
+        self.tree.selection_set(str(i))
+        self.tree.see(str(i))
+        return 'break'
+
+    def _on_escape(self, _e):
+        if self.visible():
+            self.hide()
+            return 'break'       # the window's own Escape (clear search / close pop-ups) is not wanted then
+        return None
+
+    def _on_hover(self, e):
+        row = self.tree.identify_row(e.y)
+        if row:
+            self.tree.selection_set(row)
+
+    def _on_click(self, e):
+        row = self.tree.identify_row(e.y)
+        if row and int(row) < len(self.items):
+            item = self.items[int(row)]
+            self.hide()
+            self.on_pick(item)
+
+
+# ============================================================
 # WINDOW FADE (switching light / dark)
 # ============================================================
 

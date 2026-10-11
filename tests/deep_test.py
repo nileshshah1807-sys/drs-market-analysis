@@ -822,6 +822,73 @@ def s_new_listing():
         app.watchlist = orig
 
 
+def s_company_search():
+    """Add a stock by typing the first letters of the company's name."""
+    import symbols
+    S = symbols
+    check('company list loaded', len(S.load()) > 5000, f"{len(S.load())} companies")
+    top = S.search('relia', 5)
+    check('search by the first letters of the name', bool(top) and top[0][:4] == ['Reliance Industries Limited', 'RELIANCE', 'RELIANCE', '500325'],
+          str(top[:1]))
+    check('search by several words, a symbol or a BSE code', S.search('tata consult')[0][S.ADD] == 'TCS'
+          and S.search('infy')[0][S.NAME].startswith('Infosys') and S.search('500325')[0][S.ADD] == 'RELIANCE'
+          and S.search('state bank')[0][S.ADD] == 'SBIN')
+    bse_only = S.search('creative castings')
+    check('a BSE-only company is found too', bool(bse_only) and bse_only[0][S.NSE] == '' and bse_only[0][S.BSE] == 'CREATIVE', str(bse_only[:1]))
+    check('NSE SME stocks are added the way their prices are listed', any(e[S.ADD] == e[S.NSE] + '-SM' for e in S.load())
+          and all(m.re.match(r'^[A-Z0-9][A-Z0-9&_.-]{0,19}$', e[S.ADD]) for e in S.load()))
+    check('nothing matches nonsense', S.search('zzqqxx') == [])
+
+    orig = list(app.watchlist)
+    query, target = next((q, S.search(q)[0]) for q in ('nestle', 'asian paints', 'titan comp', 'wipro', 'maruti suz')
+                         if S.search(q)[0][S.ADD] not in app.watchlist)
+    app.entry.delete(0, tk.END)
+    app.entry.insert(0, query)
+    app.suggest.update()
+    root.update()
+    rows = [app.suggest.tree.item(i)['values'] for i in app.suggest.tree.get_children()]
+    check('suggestions drop down with the full name and both symbols', app.suggest.visible() and bool(rows)
+          and rows[0][0] == target[S.NAME] and target[S.NSE] in str(rows[0][1]) and target[S.CODE] in str(rows[0][2]), str(rows[:1]))
+    app.add_stock()                                   # Enter
+    root.update()
+    check('Enter adds the highlighted company', target[S.ADD] in app.watchlist and not app.suggest.visible() and app.entry.get() == '',
+          f"{target[S.ADD]} in watchlist: {target[S.ADD] in app.watchlist}")
+    check('the watchlist shows the company name', any(r.startswith(target[S.ADD] + '  ' + target[S.NAME]) for r in app.wl_list.get(0, tk.END))
+          and app._wl_symbol(next(r for r in app.wl_list.get(0, tk.END) if r.startswith(target[S.ADD] + '  '))) == target[S.ADD])
+    check('the toast names the company', app.last_toast == (f"Added {target[S.ADD]}", target[S.NAME]), str(app.last_toast))
+
+    # part of a name + Enter before the list was looked at: the list opens, nothing is added yet
+    n = len(app.watchlist)
+    app.entry.insert(0, 'hdfc l')
+    app.add_stock()
+    root.update()
+    check('part of a name + Enter opens the list first', len(app.watchlist) == n and app.suggest.visible() and len(app.suggest.items) >= 1)
+    app.suggest._move(1)
+    app.suggest._move(-1)
+    picked = app.suggest.selected()
+    app.suggest._on_escape(None)
+    check('Esc closes the list', not app.suggest.visible())
+    app.suggest.update()
+    app.suggest.on_pick(app.suggest.items[0])         # a click
+    check('a click adds the company', picked is not None and picked[S.ADD] in app.watchlist, str(picked))
+
+    # a symbol the list doesn't know (listed in the last few days) is still added as typed
+    app.entry.delete(0, tk.END)
+    app.entry.insert(0, 'zznewipo')
+    app.add_stock()
+    check('an unknown symbol is added as typed', 'ZZNEWIPO' in app.watchlist)
+    app.entry.insert(0, 'no such company name')
+    n = len(app.watchlist)
+    app.add_stock()
+    check('a name that matches nothing adds nothing', len(app.watchlist) == n and app.last_toast[0] == 'No company found')
+    app.entry.delete(0, tk.END)
+    app.suggest.hide()
+    app.watchlist[:] = orig
+    app.save_watchlist()
+    app.refresh_watchlist()
+    yield None
+
+
 def s_appearance():
     import ui_theme as ui
     from tkinter import ttk
@@ -901,6 +968,7 @@ def s_appearance():
 
 
 STEPS = [('startup', s_startup), ('one copy at a time', s_single_instance), ('watchlist', s_watchlist),
+         ('company search', s_company_search),
          ('import/save lists', s_import_save_lists), ('scan', s_scan), ('score history', s_history_compare),
          ('results table', s_results_table), ('details', s_details_every_stock), ('exports', s_exports),
          ('sector', s_sector), ('charts', s_charts), ('corporate', s_corporate), ('backtest', s_backtest),

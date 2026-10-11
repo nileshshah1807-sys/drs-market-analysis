@@ -14,7 +14,7 @@ hiddenimports = (
     # local modules imported inside try/except or functions
     ['pattern_recognition', 'daily_report', 'corporate_actions',
      'corporate_actions_engine', 'market_data', 'backtest', 'scheduled_report', 'app_paths', 'score_history',
-     'scoring', 'ui_theme', 'mpl_toolkits.mplot3d',
+     'scoring', 'ui_theme', 'symbols', 'mpl_toolkits.mplot3d',
      'tkinter.simpledialog']
     # Windows Credential Manager backend for the email password
     + collect_submodules('keyring.backends')
@@ -24,7 +24,7 @@ a = Analysis(
     ['dr_shah_analysis.py'],
     pathex=[],
     binaries=[],
-    datas=[('logo_new.png', '.')] + copy_metadata('keyring'),
+    datas=[('logo_new.png', '.'), ('symbols_master.json', '.')] + copy_metadata('keyring'),
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

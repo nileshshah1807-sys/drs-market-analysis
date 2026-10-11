@@ -175,6 +175,16 @@ NEW FEATURES
      drag to turn it.
    - Sector tab: a 3D chart of buy, hold and sell stocks in each sector.
 
+18. ADD A STOCK BY THE COMPANY'S NAME
+   In the "Add a stock" box, type the first three or four letters of the
+   company's name. A list drops down showing each matching company's full
+   name with its NSE symbol and its BSE symbol and code. Pick one with the
+   arrow keys and Enter, or click it. Typing a symbol or a BSE code works
+   too. The list has every NSE (main board and SME) and BSE company and is
+   refreshed from the exchanges every week; a stock listed in the last few
+   days can still be added by typing its symbol.
+   The watchlist now shows each company's name beside its symbol.
+
 
 TROUBLESHOOTING
 -----------------
@@ -210,6 +220,8 @@ Required files (must be in same folder):
 - corporate_actions_engine.py  (Live NSE/BSE corporate actions)
 - corporate_actions.py         (Dividend fallback data)
 - pattern_recognition.py       (Pattern detection)
+- symbols.py                   (Company search: NSE + BSE list)
+- symbols_master.json          (The company list shipped with the app)
 - ui_theme.py                  (Light/dark colours, 3D buttons, animations)
 - logo_new.png                 (Logo image)
 
