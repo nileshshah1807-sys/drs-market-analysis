@@ -102,8 +102,8 @@ but no volume for the first hour of each NSE session.
 
 A website version for you and friends (free on Vercel): sign in from a phone or PC, own watchlist per
 person, scan, stock details, price charts and the 3D market map, light/dark. It uses this app's own
-scoring code. To put it online, double-click **`deploy_web.bat`**; to try it on this PC,
-**`run_web_locally.bat`**. Details: [`web/README.md`](web/README.md).
+scoring code. It is published by pushing to GitHub (Vercel deploys every push): double-click
+**`deploy_web.bat`**. To try it on this PC, **`run_web_locally.bat`**. Details: [`web/README.md`](web/README.md).
 
 ## Daily email report
 

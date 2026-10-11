@@ -1,5 +1,5 @@
 @echo off
-title Put the web version online (Vercel)
+title Publish the web version (GitHub - Vercel)
 cd /d "%~dp0web"
 python deploy.py
 echo.

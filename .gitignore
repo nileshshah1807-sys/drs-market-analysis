@@ -32,3 +32,6 @@ dist/
 _internal/
 *.exe
 self_test_result.txt
+
+.vercel
+.env*
