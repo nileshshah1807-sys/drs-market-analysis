@@ -2,6 +2,8 @@
 
     python web/tests/test_ui.py [screenshot folder]
 
+To check the live website instead of a local copy, set DRS_UI_URL (and DRS_UI_INVITE, DRS_UI_USER).
+
 Starts the local server, signs up, adds stocks, scans, opens a stock, the price chart and the
 3D map, switches to dark mode and to a phone-sized screen. Any JavaScript error is a failure.
 Exit code 0 = everything passed.
@@ -24,6 +26,9 @@ WEB = Path(__file__).resolve().parents[1]
 SHOTS = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(tempfile.gettempdir()) / 'drs_web_ui'
 SHOTS.mkdir(parents=True, exist_ok=True)
 PORT, DEBUG_PORT = 8765, 9333
+LIVE = os.environ.get('DRS_UI_URL', '').rstrip('/')
+BASE = LIVE or f"http://127.0.0.1:{PORT}"
+INVITE, USER = os.environ.get('DRS_UI_INVITE', 'dev'), os.environ.get('DRS_UI_USER', 'tester')
 EDGE = next((p for p in (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
                          r"C:\Program Files\Microsoft\Edge\Application\msedge.exe") if Path(p).exists()), None)
 passed, problems, js_errors = [], [], []
@@ -87,14 +92,14 @@ async def run():
         for m in ('Runtime.enable', 'Page.enable'):
             await p.send(m)
         await p.send('Emulation.setDeviceMetricsOverride', width=1400, height=1000, deviceScaleFactor=1, mobile=False)
-        await p.send('Page.navigate', url=f"http://127.0.0.1:{PORT}/")
+        await p.send('Page.navigate', url=f"{BASE}/")
         check('sign-in page shown', await p.wait("!document.querySelector('#login').classList.contains('hidden')", 15))
         await p.shot('01_signin')
 
         # sign up
         await p.js("""document.querySelector('#mode-new').click();
-            document.querySelector('#l-name').value='tester'; document.querySelector('#l-pass').value='tester-pass-1';
-            document.querySelector('#l-invite').value='dev'; document.querySelector('#login-form').requestSubmit(); true""")
+            document.querySelector('#l-name').value=%s; document.querySelector('#l-pass').value='tester-pass-1';
+            document.querySelector('#l-invite').value=%s; document.querySelector('#login-form').requestSubmit(); true""" % (json.dumps(USER), json.dumps(INVITE)))
         check('signed up and in', await p.wait("!document.querySelector('#app').classList.contains('hidden')", 20))
         check('starts in light mode', await p.js("document.documentElement.dataset.theme") == 'light')
 
@@ -193,14 +198,15 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix='drs_ui_'))
     env = dict(os.environ, PORT=str(PORT), DRS_STORE_FILE=str(tmp / 'store.json'), PYTHONIOENCODING='utf-8')
     env.pop('DRS_DEV_USER', None)
-    server = subprocess.Popen([sys.executable, str(WEB / 'dev_server.py')], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    server = None if LIVE else subprocess.Popen([sys.executable, str(WEB / 'dev_server.py')], env=env,
+                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     edge = subprocess.Popen([EDGE, '--headless=new', f'--remote-debugging-port={DEBUG_PORT}', f'--user-data-dir={tmp / "edge"}',
                              '--no-first-run', '--disable-extensions', '--window-size=1400,1000', 'about:blank'],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         for _ in range(60):
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{PORT}/api/health", timeout=1)
+                urllib.request.urlopen(f"{BASE}/api/health", timeout=10)
                 urllib.request.urlopen(f"http://127.0.0.1:{DEBUG_PORT}/json/version", timeout=1)
                 break
             except Exception:
@@ -210,7 +216,8 @@ def main():
         problems.append(f"CRASHED: {type(e).__name__}: {e}")
     finally:
         edge.terminate()
-        server.terminate()
+        if server:
+            server.terminate()
         time.sleep(1)
         shutil.rmtree(tmp, ignore_errors=True)
     check('no JavaScript errors', not js_errors, ' | '.join(js_errors[:5]))
