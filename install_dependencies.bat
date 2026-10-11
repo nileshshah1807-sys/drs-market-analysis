@@ -8,28 +8,25 @@ echo.
 REM Change to script directory
 cd /d "%~dp0"
 
-echo [1/8] Upgrading pip...
+echo [1/7] Upgrading pip...
 python -m pip install --upgrade pip --quiet
 
-echo [2/8] Installing yfinance...
+echo [2/7] Installing yfinance...
 python -m pip install yfinance --quiet
 
-echo [3/8] Installing pandas and numpy...
+echo [3/7] Installing pandas and numpy...
 python -m pip install pandas numpy --quiet
 
-echo [4/8] Installing ta (Technical Analysis)...
+echo [4/7] Installing ta (Technical Analysis)...
 python -m pip install ta --quiet
 
-echo [5/8] Installing scikit-learn (AI/ML)...
-python -m pip install scikit-learn --quiet
-
-echo [6/8] Installing openpyxl, reportlab, pdfplumber...
+echo [5/7] Installing openpyxl, reportlab, pdfplumber...
 python -m pip install openpyxl reportlab pdfplumber --quiet
 
-echo [7/8] Installing schedule, Pillow, matplotlib, requests, keyring...
+echo [6/7] Installing schedule, Pillow, matplotlib, requests, keyring...
 python -m pip install schedule Pillow matplotlib requests keyring --quiet
 
-echo [8/8] Installing pytz (timezone support)...
+echo [7/7] Installing pytz (timezone support)...
 python -m pip install pytz --quiet
 
 echo.
@@ -48,7 +45,6 @@ modules = [
     ('pandas', 'Data processing'),
     ('numpy', 'Numerical computing'),
     ('ta', 'Technical analysis'),
-    ('sklearn', 'Machine learning'),
     ('openpyxl', 'Excel support'),
     ('reportlab', 'PDF generation'),
     ('pdfplumber', 'PDF reading'),
@@ -84,9 +80,10 @@ echo.
 
 if exist dr_shah_analysis.py (echo [OK] dr_shah_analysis.py) else (echo [MISSING] dr_shah_analysis.py)
 if exist daily_report.py (echo [OK] daily_report.py) else (echo [MISSING] daily_report.py)
-if exist ai_engine.py (echo [OK] ai_engine.py) else (echo [MISSING] ai_engine.py)
+if exist scoring.py (echo [OK] scoring.py) else (echo [MISSING] scoring.py)
+if exist ui_theme.py (echo [OK] ui_theme.py) else (echo [MISSING] ui_theme.py)
+if exist market_data.py (echo [OK] market_data.py) else (echo [MISSING] market_data.py)
 if exist pattern_recognition.py (echo [OK] pattern_recognition.py) else (echo [MISSING] pattern_recognition.py)
-if exist live_trading.py (echo [OK] live_trading.py) else (echo [MISSING] live_trading.py)
 if exist logo_new.png (echo [OK] logo_new.png) else (echo [MISSING] logo_new.png)
 
 echo.

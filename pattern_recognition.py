@@ -26,6 +26,10 @@ class PatternDetector:
         if df is None or len(df) < 5:
             return {'chart': [], 'candlestick': [], 'harmonic': [], 'summary': {}}
 
+        try:
+            self.hourly = bool((df.index != df.index.normalize()).any())
+        except AttributeError:   # not a date index
+            self.hourly = False
         chart, ignored = self.resolve_conflicts(self.detect_chart_patterns(df))
         results = {
             'chart': chart,
@@ -56,8 +60,11 @@ class PatternDetector:
         ignored = [p['name'] for p in directional if p['signal'] != best['signal']]
         return kept, ignored
 
-    @staticmethod
-    def _age_text(bars_ago: int) -> str:
+    hourly = False   # set per chart: a new listing's patterns are found on 1-hour candles
+
+    def _age_text(self, bars_ago: int) -> str:
+        if self.hourly:
+            return " (just completed)" if bars_ago == 0 else f" (completed {bars_ago} trading hours ago)"
         return " (completed today)" if bars_ago == 0 else f" (completed {bars_ago} trading days ago)"
     
     def create_pattern_summary(self, results: Dict) -> Dict:

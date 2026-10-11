@@ -84,7 +84,7 @@ def extract_amount(purpose: str) -> float:
         return 0.0
     import re
     patterns = [
-        r'(?:Rs|Re)\.?\s*-?\s*(\d+\.?\d*)',
+        r'\b(?:Rs|Re)\.?\s*-?\s*(\d+\.?\d*)',
         r'INR\s*-?\s*(\d+\.?\d*)',
         r'(\d+\.?\d*)\s*per\s*share',
         r'(\d+\.?\d*)\s*\/-',
@@ -154,6 +154,7 @@ class NSECorporateActions:
         self.session = requests.Session()
         self.session.headers.update(NSE_HEADERS)
         self._cookies_set = False
+        self.unreachable = False   # set when NSE refuses or times out, so callers stop asking
     
     def _ensure_cookies(self):
         """Visit the NSE main page first to pick up cookies.
@@ -209,7 +210,8 @@ class NSECorporateActions:
                 logger.warning(f"NSE API returned {resp.status_code}")
         except Exception as e:
             logger.error(f"NSE fetch error: {e}")
-        
+
+        self.unreachable = True
         return []
     
     def fetch_symbol_actions(self, symbol: str, from_date: str = None, to_date: str = None) -> List[Dict]:
@@ -240,7 +242,8 @@ class NSECorporateActions:
                 return self._parse_nse_response(data)
         except Exception as e:
             logger.error(f"NSE symbol fetch error for {symbol}: {e}")
-        
+
+        self.unreachable = True
         return []
     
     def _parse_nse_response(self, data) -> List[Dict]:
@@ -265,9 +268,10 @@ class NSECorporateActions:
                 record_date = record.get('recDate') or record.get('recordDate') or record.get('BCrdtDt') or ''
                 symbol = record.get('symbol') or record.get('ScripCode') or ''
 
-                # Parse purpose to extract amount if dividend
-                amount = self._extract_amount(purpose)
+                # The amount is the dividend per share. Other actions mention rupees too (a split's
+                # old face value, a rights issue's premium) - those aren't an amount paid out.
                 category = classify_action(purpose)
+                amount = self._extract_amount(purpose) if category == 'dividend' else 0.0
 
                 result = {
                     'symbol': symbol,
@@ -419,9 +423,9 @@ class BSECorporateActions:
                 scrip_code = str(record.get('scrip_code') or record.get('SCRIP_CD') or record.get('ScripCode') or '')
                 short_name = (record.get('short_name') or '').strip()
                 
-                amount = self._extract_amount(purpose)
                 category = classify_action(purpose)
-                
+                amount = self._extract_amount(purpose) if category == 'dividend' else 0.0   # see the NSE parser
+
                 result = {
                     'symbol': short_name or scrip_code,
                     'scrip_code': scrip_code,
@@ -507,6 +511,7 @@ BSE_SCRIP_MAP = {
     'RECLTD': '532955', 'PFC': '532810', 'BANDHANBNK': '541153',
     'IDFCFIRSTB': '539437', 'PNB': '532461', 'BANKBARODA': '532134',
     'CANBK': '532483', 'UNIONBANK': '532477', 'FEDERALBNK': '500469',
+    'ADANIPORTS': '532921', 'ETERNAL': '543320', 'INDIGO': '539448', 'TRENT': '500251',
 }
 
 
@@ -617,17 +622,13 @@ class CorporateActionsEngine:
             for bse_act in bse_actions:
                 bse_sym = bse_act.get('symbol', '').upper()
                 if sym_upper == bse_sym or (scrip_code and bse_act.get('scrip_code') == scrip_code):
-                    is_dup = any(
-                        existing.get('ex_date') == bse_act.get('ex_date') and 
-                        existing.get('purpose', '').lower()[:20] == bse_act.get('purpose', '').lower()[:20]
-                        for existing in symbol_acts
-                    )
-                    if not is_dup:
+                    if not any(self._same_event(existing, bse_act) for existing in symbol_acts):
                         symbol_acts.append(bse_act)
             
             # Nothing in the bulk window - ask NSE for this symbol's wider history (live data
-            # is better than the local database's estimates, so try this first)
-            if not symbol_acts:
+            # is better than the local database's estimates, so try this first). Not when NSE
+            # has already refused or timed out: every stock would wait for the same failure.
+            if not symbol_acts and not self.nse.unreachable:
                 try:
                     individual = self.nse.fetch_symbol_actions(symbol)
                     if individual:
@@ -757,6 +758,25 @@ class CorporateActionsEngine:
         
         return self.symbol_actions
     
+    @staticmethod
+    def _same_event(a: Dict, b: Dict) -> bool:
+        """Is `b` an action already in the list as `a`?
+
+        NSE and BSE both announce a company's actions, in different words ('Dividend - Rs 7 Per
+        Share' / 'Final Dividend - Rs. - 7.0000'), so across the two exchanges the same ex-date
+        and type is the same event - except that a final and a special dividend can share an
+        ex-date, so dividends must also match on the amount."""
+        if a.get('ex_date') != b.get('ex_date'):
+            return False
+        if a.get('source') == b.get('source'):
+            return a.get('purpose', '').lower()[:20] == b.get('purpose', '').lower()[:20]
+        if a.get('category') != b.get('category'):
+            return False
+        if a.get('category') != 'dividend':
+            return True
+        x, y = a.get('amount') or 0, b.get('amount') or 0
+        return x == 0 or y == 0 or abs(x - y) < 0.005
+
     def get_symbol_summary(self, symbol: str) -> Dict:
         """Get summary for a specific symbol."""
         data = self.symbol_actions.get(symbol, {})

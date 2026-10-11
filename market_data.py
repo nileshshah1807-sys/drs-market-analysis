@@ -8,6 +8,7 @@ Fast price history for many stocks at once:
 - NSE symbols automatically fall back to BSE (.BO) for BSE-only listings
 - Keeps a disk cache (data_cache/) so re-scans only download the last few days
 - Detects dividend/split re-adjustments and refetches full history when needed
+- Stocks listed within the last month come with 1-hour candles (load_scan_history)
 
 Usage:
     from market_data import load_history
@@ -131,28 +132,32 @@ def clear_cache():
 # Download helpers
 # ------------------------------------------------------------
 
-def _clean(df) -> pd.DataFrame:
-    """Keep OHLCV columns, drop empty rows, make the index tz-naive dates."""
+def _clean(df, tz=None) -> pd.DataFrame:
+    """Keep OHLCV columns, drop empty rows, make the index tz-naive dates.
+    `tz`: for intraday candles, the exchange's time zone - their times are kept in it
+    (some yfinance versions hand intraday candles back in UTC)."""
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=COLUMNS)
     df = df[[c for c in COLUMNS if c in df.columns]].dropna(subset=['Close'])
     if getattr(df.index, 'tz', None) is not None:
+        if tz:
+            df.index = df.index.tz_convert(tz)
         df.index = df.index.tz_localize(None)
     df = df[~df.index.duplicated(keep='last')].sort_index()
     return df
 
 
-def _extract(data, ticker: str) -> pd.DataFrame:
+def _extract(data, ticker: str, tz=None) -> pd.DataFrame:
     """Pull one ticker's frame out of a yf.download result (layout differs by version/count)."""
     if data is None or len(data) == 0:
         return pd.DataFrame(columns=COLUMNS)
     if isinstance(data.columns, pd.MultiIndex):
         if ticker in data.columns.get_level_values(0):
-            return _clean(data[ticker])
+            return _clean(data[ticker], tz)
         if ticker in data.columns.get_level_values(1):
-            return _clean(data.xs(ticker, axis=1, level=1))
+            return _clean(data.xs(ticker, axis=1, level=1), tz)
         return pd.DataFrame(columns=COLUMNS)
-    return _clean(data)
+    return _clean(data, tz)
 
 
 def _rate_limited_tickers(messages) -> set:
@@ -166,10 +171,10 @@ def _rate_limited_tickers(messages) -> set:
     return limited
 
 
-def _download(tickers, **kwargs) -> dict:
+def _download(tickers, tz=None, **kwargs) -> dict:
     """Batch-download tickers. Returns {ticker: DataFrame} (possibly empty frames).
     Tickers Yahoo rate-limited are retried (after 2 s, then 4 s) instead of being reported
-    as having no data."""
+    as having no data. `tz`: see _clean (intraday candles only)."""
     out = {}
     tickers = list(dict.fromkeys(tickers))
     for i in range(0, len(tickers), BATCH_SIZE):
@@ -183,7 +188,7 @@ def _download(tickers, **kwargs) -> dict:
                 logger.error(f"Batch download failed ({len(pending)} tickers): {e}")
                 data = None
             for t in pending:
-                out[t] = _extract(data, t)
+                out[t] = _extract(data, t, tz)
             limited = [t for t in pending if out[t].empty and t in _rate_limited_tickers(_yahoo_errors.messages)]
             if not limited or attempt == 2:
                 if limited:
@@ -195,9 +200,10 @@ def _download(tickers, **kwargs) -> dict:
     return out
 
 
-def _full_fetch(symbols, suffixes, years, progress=None) -> dict:
+def _full_fetch(symbols, suffixes, years, progress=None, short=None) -> dict:
     """Download full history, trying each suffix in turn for symbols still missing.
-    Returns {symbol: (ticker, df)}."""
+    Returns {symbol: (ticker, df)}. `short`, if given, collects {symbol: df} for symbols
+    that have some history but fewer than MIN_ROWS days."""
     found = {}
     remaining = list(symbols)
     for n, suffix in enumerate(suffixes):
@@ -211,8 +217,12 @@ def _full_fetch(symbols, suffixes, years, progress=None) -> dict:
             df = frames.get(s + suffix)
             if df is not None and len(df) >= MIN_ROWS:
                 found[s] = (s + suffix, df)
+                if short is not None:
+                    short.pop(s, None)
             else:
                 still.append(s)
+                if short is not None and df is not None and len(df):
+                    short.setdefault(s, df)
         remaining = still
     return found
 
@@ -222,10 +232,12 @@ def _full_fetch(symbols, suffixes, years, progress=None) -> dict:
 # ------------------------------------------------------------
 
 def load_history(symbols, years: int = 5, exchange: str = 'NSE', progress=None,
-                 force_refresh: bool = False) -> dict:
+                 force_refresh: bool = False, short=None) -> dict:
     """Return {symbol: DataFrame(Open, High, Low, Close, Volume)} for all symbols with data.
 
-    Symbols without data (delisted / invalid) are simply missing from the result.
+    Symbols without data (delisted / invalid) are simply missing from the result, and so are
+    stocks with fewer than MIN_ROWS days of history; `short` (a dict), if given, is filled
+    with those: {symbol: DataFrame}.
     """
     suffixes = EXCHANGE_SUFFIXES.get(exchange, [''])
     symbols = [s.strip().upper() for s in symbols if s and s.strip()]
@@ -282,10 +294,90 @@ def load_history(symbols, years: int = 5, exchange: str = 'NSE', progress=None,
 
         # 3. Full download for new symbols (and re-adjusted ones)
         if need_full:
-            for s, (ticker, df) in _full_fetch(need_full, suffixes, years, progress).items():
+            for s, (ticker, df) in _full_fetch(need_full, suffixes, years, progress, short).items():
                 result[s] = df
                 _write_cache(ticker, df, years)
 
+    return result
+
+
+# ------------------------------------------------------------
+# New listings: 1-hour candles
+# ------------------------------------------------------------
+# A stock listed within the last month has too few daily candles for the indicators (a
+# 20-day average needs 20 days), so it is analysed on 1-hour candles instead: NSE and BSE
+# have 7 a day, which is enough from the third trading day.
+
+NEW_LISTING_MONTHS = 1               # less daily history than this => 1-hour candles
+HOURLY_EXCHANGES = ('NSE', 'BSE')    # both open at 09:15, so the hours run 09:15-10:15, 10:15-11:15, ...
+HOURLY_TZ = 'Asia/Kolkata'
+# Footnote for reports, where stocks analysed on 1-hour candles get a * after the symbol
+HOURLY_NOTE = ("* New listing (under a month old): analysed on 1-hour candles instead of daily ones, "
+               "so its stop-loss and targets are closer to the price.")
+_CANDLE = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
+
+
+def is_hourly(df) -> bool:
+    """True if the frame holds 1-hour candles (a new listing) rather than daily ones."""
+    return df is not None and len(df) > 0 and bool((df.index != df.index.normalize()).any())
+
+
+def daily_bars(df, daily=None):
+    """One candle per day, for figures that are per day whatever the candle size (the day's
+    price change, value traded per day, returns vs the Nifty). Daily history is returned as is.
+
+    1-hour candles are combined into days. `daily`, the stock's own (short) daily history,
+    then supplies the exchange's official closing prices and full volumes for the days Yahoo
+    has them - the last trade of the day is not quite the official close."""
+    if not is_hourly(df):
+        return df
+    days = df.groupby(df.index.normalize()).agg(_CANDLE)
+    if daily is not None and len(daily):
+        days = daily.reindex(days.index).combine_first(days)
+    return days
+
+
+def _hourly(df15) -> pd.DataFrame:
+    """Combine 15-minute candles into 1-hour candles. Yahoo's own 1-hour candles have the
+    same prices, but on NSE they report no volume for the first hour of the day."""
+    if df15 is None or df15.empty:
+        return pd.DataFrame(columns=COLUMNS)
+    return df15.resample('60min', offset='15min').agg(_CANDLE).dropna(subset=['Close'])
+
+
+def load_scan_history(symbols, years: int = 5, exchange: str = 'NSE', progress=None, days=None) -> dict:
+    """load_history(), with new listings added: a stock with less than a month of daily
+    history comes back with 1-hour candles instead of daily ones (is_hourly() tells which).
+    `days` (a dict), if given, is filled with those stocks' daily candles: {symbol: DataFrame}.
+
+    A stock listed only a day or two ago is returned as well, with fewer than MIN_ROWS candles.
+    """
+    short = {}
+    result = load_history(symbols, years, exchange, progress, short=short)
+    if exchange not in HOURLY_EXCHANGES:
+        return result
+    cutoff = pd.Timestamp(datetime.now()) - pd.DateOffset(months=NEW_LISTING_MONTHS)
+    daily = {s: df for s, df in {**short, **result}.items() if df.index[0] > cutoff}
+    todo = list(daily)
+    for suffix in EXCHANGE_SUFFIXES[exchange]:
+        if not todo:
+            break
+        if progress:
+            progress(f"Downloading 1-hour candles for {len(todo)} new listing(s)...")
+        with _lock:
+            # Yahoo keeps 15-minute candles for 60 days - more than a new listing has
+            frames = _download([s + suffix for s in todo], tz=HOURLY_TZ, period='60d', interval='15m')
+        still = []
+        for s in todo:
+            df = _hourly(frames.get(s + suffix))
+            if df.empty:
+                still.append(s)       # nothing under this suffix - try the other exchange
+            elif df.index[0] > cutoff:
+                result[s] = df
+                if days is not None:
+                    days[s] = daily_bars(df, daily[s])
+            # else Yahoo has candles older than a month: not a new listing, leave it as it was
+        todo = still
     return result
 
 

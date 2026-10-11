@@ -65,19 +65,14 @@ except ImportError:
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+# Look and motion: the Daylight design, its dark mode, animations (ui_theme.py)
+import ui_theme as ui
+
 # Pattern Recognition
 PATTERN_OK = False
 try:
     from pattern_recognition import PatternDetector, PatternFormatter
     PATTERN_OK = True
-except ImportError:
-    pass
-
-# AI/ML Engine
-AI_OK = False
-try:
-    from ai_engine import AIEngine
-    AI_OK = True
 except ImportError:
     pass
 
@@ -104,6 +99,10 @@ try:
     CORP_ENGINE_OK = True
 except ImportError:
     pass
+
+# Indicators, the 0-100 score and stop-loss/targets (shared with the backtest and the daily report)
+import scoring
+from scoring import safe_float, Scorer, TargetCalc, relative_strength, NIFTY_SYMBOL, RS_PERIODS
 
 # Fast batch price download + disk cache
 MARKET_DATA_OK = False
@@ -150,13 +149,16 @@ try:
     matplotlib.use('TkAgg')
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    import matplotlib.colors
+    import matplotlib.ticker
     import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - the 3D market map and sector chart
     MATPLOTLIB_OK = True
 except ImportError:
     MATPLOTLIB_OK = False
 
 # Logging
-from app_paths import FROZEN, DATA_DIR, RESOURCE_DIR
+from app_paths import FROZEN, DATA_DIR, RESOURCE_DIR, pdf_logo
 log_file = str(DATA_DIR / 'dr_shah_analysis.log')
 logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s', filemode='a')
 logger = logging.getLogger(__name__)
@@ -190,32 +192,12 @@ SECTOR_MAP = {
     'Chemicals': ['PIDILITIND', 'ASIANPAINT', 'BERGEPAINT', 'SRF', 'DEEPAKNTR', 'ATUL', 'NAVINFLUOR'],
 }
 
-THEME = {
-    'bg': '#0b0f1a', 'bg2': '#0f1629', 'bg3': '#151d33',
-    'card': '#131b2e', 'card2': '#1a2540', 'input': '#0d1525',
-    'fg': '#e8ecf4', 'fg2': '#94a3b8', 'fg3': '#64748b',
-    'accent': '#3b82f6', 'accent2': '#60a5fa', 'accent3': '#818cf8',
-    'success': '#10b981', 'success2': '#34d399',
-    'warning': '#f59e0b', 'warning2': '#fbbf24',
-    'danger': '#ef4444', 'danger2': '#f87171',
-    'buy': '#059669', 'sell': '#dc2626', 'hold': '#d97706',
-    'border': '#1e293b', 'glow': '#3b82f6', 'gold': '#fbbf24',
-    'purple': '#a78bfa', 'cyan': '#22d3ee', 'pink': '#f472b6',
-    'orange': '#fb923c', 'lime': '#a3e635',
-}
+THEME = ui.palette('light')   # the active colours; App switches it to dark mode if that's chosen in Settings
 
 
 # ============================================================
 # UTILITY FUNCTIONS
 # ============================================================
-
-def safe_float(v, d=0.0):
-    try:
-        if v is None: return d
-        val = float(v)
-        return d if (pd.isna(val) or np.isnan(val) or np.isinf(val)) else val
-    except: return d
-
 
 class DataCache:
     def __init__(self, hours=4):
@@ -275,16 +257,8 @@ class ThreadSafeGUI:
 class Analyzer:
     def __init__(self):
         self.cache = DataCache(4)
+        self.listing_days = {}   # new listings in the last fetch_many: symbol -> their daily candles
         self.pattern_detector = PatternDetector() if PATTERN_OK else None
-        self._ai_engine = None
-
-    @property
-    def ai_engine(self):
-        """Created on first use only: building it trains ML models (~2.6 s), which used to
-        slow every app start although scans don't use its output."""
-        if self._ai_engine is None and AI_OK:
-            self._ai_engine = AIEngine()
-        return self._ai_engine
 
     def fetch(self, symbol, period="2y"):
         key = f"{symbol}_{period}"
@@ -293,9 +267,11 @@ class Analyzer:
             return cached
 
         if MARKET_DATA_OK:
-            df = market_data.load_history([symbol], years=HISTORY_YEARS).get(symbol.upper())
-            df = market_data.slice_period(df, period) if df is not None else None
+            df = market_data.load_scan_history([symbol], years=HISTORY_YEARS).get(symbol.upper())
+            # 20 candles of history in all - not 20 inside the period: a month with holidays has
+            # as few as 17 trading days, and its chart used to come back as "No data"
             if df is not None and len(df) >= 20:
+                df = market_data.slice_period(df, period)
                 self.cache.set(key, df)
                 return df
             return pd.DataFrame()
@@ -312,7 +288,9 @@ class Analyzer:
         return pd.DataFrame()
 
     def fetch_many(self, symbols, period="2y", progress=None):
-        """Fetch many symbols at once (one batch download + disk cache). Returns {symbol: df}."""
+        """Fetch many symbols at once (one batch download + disk cache). Returns {symbol: df}.
+        Stocks listed within the last month come back with 1-hour candles instead of daily
+        ones; their daily candles are kept in self.listing_days (see analyze)."""
         if not MARKET_DATA_OK:
             out = {}
             for s in symbols:
@@ -320,7 +298,9 @@ class Analyzer:
                 if df is not None and not df.empty:
                     out[s] = df
             return out
-        data = market_data.load_history(symbols, years=HISTORY_YEARS, progress=progress)
+        days = {}
+        data = market_data.load_scan_history(symbols, years=HISTORY_YEARS, progress=progress, days=days)
+        self.listing_days = {s: days[s.upper()] for s in symbols if s.upper() in days}
         out = {}
         for s in symbols:
             df = data.get(s.upper())
@@ -329,314 +309,66 @@ class Analyzer:
                 if len(df) >= 20:
                     out[s] = df
                     self.cache.set(f"{s}_{period}", df)
+                elif market_data.is_hourly(df):
+                    out[s] = df   # listed a day or two ago: too few candles yet (the scan says so)
         return out
 
-    def analyze(self, df, with_ai=False):
-        if df is None or df.empty:
-            raise ValueError("No data")
-        
-        price = safe_float(df['Close'].iloc[-1])
-        prev = safe_float(df['Close'].iloc[-2]) if len(df) > 1 else price
+    def analyze(self, df, days=None):
+        """`days`: a new listing's daily candles, when `df` holds its 1-hour candles (worked
+        out from `df` if not given)."""
+        data = scoring.indicators(df, days)
 
-        # Liquidity: average daily traded value over the last 20 sessions, in Rs crore
-        try: liquidity_cr = safe_float((df['Close'] * df['Volume']).tail(20).mean() / 1e7)
-        except: liquidity_cr = 0.0
-
-        # RSI
-        try: rsi = safe_float(ta.momentum.RSIIndicator(df['Close'], 14).rsi().iloc[-1], 50)
-        except: rsi = 50.0
-        
-        # MACD (None when there isn't enough history - ~35 days - so it scores neutral instead of bearish)
-        try:
-            m = ta.trend.MACD(df['Close'])
-            macd = {'macd': safe_float(m.macd().iloc[-1], None), 'signal': safe_float(m.macd_signal().iloc[-1], None),
-                    'hist': safe_float(m.macd_diff().iloc[-1], None)}
-        except: macd = {'macd': None, 'signal': None, 'hist': None}
-
-        # Moving Averages - None when the stock is too new for that average (it's then skipped
-        # by the scorer; treating it as equal to the price used to count as a bearish signal)
-        try:
-            ma = {
-                'sma20': safe_float(ta.trend.SMAIndicator(df['Close'], 20).sma_indicator().iloc[-1], None),
-                'sma50': safe_float(ta.trend.SMAIndicator(df['Close'], 50).sma_indicator().iloc[-1], None) if len(df) >= 50 else None,
-                'sma200': safe_float(ta.trend.SMAIndicator(df['Close'], 200).sma_indicator().iloc[-1], None) if len(df) >= 200 else None,
-                'ema12': safe_float(ta.trend.EMAIndicator(df['Close'], 12).ema_indicator().iloc[-1], None),
-                'ema26': safe_float(ta.trend.EMAIndicator(df['Close'], 26).ema_indicator().iloc[-1], None)
-            }
-        except: ma = {'sma20': None, 'sma50': None, 'sma200': None, 'ema12': None, 'ema26': None}
-        
-        # Bollinger
-        try:
-            bb = ta.volatility.BollingerBands(df['Close'])
-            boll = {'upper': safe_float(bb.bollinger_hband().iloc[-1]), 'lower': safe_float(bb.bollinger_lband().iloc[-1])}
-        except: boll = {'upper': price * 1.02, 'lower': price * 0.98}
-        
-        # Stochastic
-        try:
-            s = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'])
-            stoch = {'k': safe_float(s.stoch().iloc[-1], 50), 'd': safe_float(s.stoch_signal().iloc[-1], 50)}
-        except: stoch = {'k': 50, 'd': 50}
-        
-        # ADX
-        try: adx = safe_float(ta.trend.ADXIndicator(df['High'], df['Low'], df['Close']).adx().iloc[-1], 25)
-        except: adx = 25.0
-        
-        # OBV
-        try:
-            obv_s = ta.volume.OnBalanceVolumeIndicator(df['Close'], df['Volume']).on_balance_volume()
-            obv_curr = safe_float(obv_s.iloc[-1])
-            obv_prev = safe_float(obv_s.iloc[-5]) if len(obv_s) >= 5 else obv_curr
-            obv_trend = ((obv_curr - obv_prev) / abs(obv_prev) * 100) if obv_prev != 0 else 0
-        except: obv_trend = 0.0
-        
-        # Williams %R
-        try: wr = safe_float(ta.momentum.WilliamsRIndicator(df['High'], df['Low'], df['Close']).williams_r().iloc[-1], -50)
-        except: wr = -50.0
-        
-        # CCI
-        try: cci = safe_float(ta.trend.CCIIndicator(df['High'], df['Low'], df['Close']).cci().iloc[-1], 0)
-        except: cci = 0.0
-        
-        # ATR
-        try: atr = safe_float(ta.volatility.AverageTrueRange(df['High'], df['Low'], df['Close'], 14).average_true_range().iloc[-1])
-        except: atr = price * 0.02
-        if atr == 0: atr = price * 0.02
-        
-        # SuperTrend (PROPER implementation)
-        try:
-            period = 10
-            multiplier = 3.0
-            high = df['High'].values
-            low = df['Low'].values
-            close = df['Close'].values
-            
-            tr1 = high - low
-            tr2 = abs(high - np.roll(close, 1))
-            tr3 = abs(low - np.roll(close, 1))
-            tr = np.maximum(tr1, np.maximum(tr2, tr3))
-            tr[0] = tr1[0]
-            
-            atr_st = pd.Series(tr).ewm(span=period, adjust=False).mean().values
-            hl2 = (high + low) / 2
-            basic_ub = hl2 + (multiplier * atr_st)
-            basic_lb = hl2 - (multiplier * atr_st)
-            
-            final_ub = np.zeros_like(close)
-            final_lb = np.zeros_like(close)
-            supertrend = np.zeros_like(close)
-            direction = np.zeros_like(close)
-            
-            final_ub[0] = basic_ub[0]
-            final_lb[0] = basic_lb[0]
-            supertrend[0] = close[0]
-            direction[0] = 1
-            
-            for i in range(1, len(close)):
-                final_ub[i] = basic_ub[i] if (basic_ub[i] < final_ub[i-1] or close[i-1] > final_ub[i-1]) else final_ub[i-1]
-                final_lb[i] = basic_lb[i] if (basic_lb[i] > final_lb[i-1] or close[i-1] < final_lb[i-1]) else final_lb[i-1]
-                
-                if direction[i-1] == 1:
-                    if close[i] < final_lb[i]:
-                        direction[i] = -1
-                        supertrend[i] = final_ub[i]
-                    else:
-                        direction[i] = 1
-                        supertrend[i] = final_lb[i]
-                else:
-                    if close[i] > final_ub[i]:
-                        direction[i] = 1
-                        supertrend[i] = final_lb[i]
-                    else:
-                        direction[i] = -1
-                        supertrend[i] = final_ub[i]
-            
-            st_sig = 'BUY' if direction[-1] == 1 else 'SELL'
-            st_dir = 'BULLISH' if direction[-1] == 1 else 'BEARISH'
-            st_val = round(safe_float(supertrend[-1]), 2)
-        except Exception as e:
-            logger.warning(f"SuperTrend error: {e}")
-            st_val, st_sig, st_dir = price, 'HOLD', 'NEUTRAL'
-        
-        # VWAP
-        try:
-            tp = (df['High'] + df['Low'] + df['Close']) / 3
-            vwap = safe_float((tp * df['Volume']).rolling(20).sum().iloc[-1] / df['Volume'].rolling(20).sum().iloc[-1])
-            if vwap == 0: vwap = price
-            vwap_sig = 'BULLISH' if price > vwap * 1.02 else 'BEARISH' if price < vwap * 0.98 else 'NEUTRAL'
-        except:
-            vwap, vwap_sig = price, 'NEUTRAL'
-        
         # Pattern Detection
         patterns = {}
         if self.pattern_detector:
             try: patterns = self.pattern_detector.detect_all_patterns(df)
-            except: patterns = {'chart': [], 'candlestick': [], 'harmonic': [], 'summary': {}}
+            except Exception as e:
+                logger.warning(f"Pattern detection error: {e}")
+                patterns = {'chart': [], 'candlestick': [], 'harmonic': [], 'summary': {}}
         
-        # AI Analysis
-        # Skipped in scans by default: it retrains ML models per stock (~0.5s each) and its
-        # output isn't used by the score or shown anywhere.
-        ai_results = {}
-        if with_ai and self.ai_engine:
-            try: ai_results = self.ai_engine.full_analysis(df)
-            except: ai_results = {}
-        
-        return {
-            'price': price, 'prev': prev, 'liquidity_cr': liquidity_cr, 'rsi': rsi, 'macd': macd, 'ma': ma,
-            'boll': boll, 'stoch': stoch, 'adx': adx, 'obv_trend': obv_trend,
-            'wr': wr, 'cci': cci, 'atr': atr,
-            'supertrend': {'val': st_val, 'sig': st_sig, 'dir': st_dir},
-            'vwap': {'val': vwap, 'sig': vwap_sig},
-            'patterns': patterns, 'ai': ai_results
-        }
+        data['patterns'] = patterns
+        return data
 
 
-# ============================================================
-# SCORER
-# ============================================================
-
-class Scorer:
-    WEIGHTS = {'rsi': 12, 'macd': 12, 'ma': 15, 'boll': 8, 'stoch': 8, 'adx': 8, 'vol': 8, 'mom': 8, 'st': 11, 'vwap': 10}
-    DEFAULT_WEIGHTS = dict(WEIGHTS)
-    
-    @classmethod
-    def score(cls, data):
-        scores = {
-            'rsi': cls._rsi(data['rsi']),
-            'macd': cls._macd(data['macd']),
-            'ma': cls._ma(data['price'], data['ma']),
-            'boll': cls._boll(data['price'], data['boll']),
-            'stoch': cls._stoch(data['stoch']),
-            'adx': cls._adx(data['adx']),
-            'vol': cls._vol(data['obv_trend']),
-            'mom': cls._mom(data['wr'], data['cci']),
-            'st': cls._st(data['supertrend']),
-            'vwap': cls._vwap(data['vwap'])
-        }
-        total = sum(scores[k] * cls.WEIGHTS[k] / 100 for k in scores)
-        rec = 'STRONG BUY' if total >= 75 else 'BUY' if total >= 60 else 'HOLD' if total >= 45 else 'SELL' if total >= 30 else 'STRONG SELL'
-        return {'total': round(total, 1), 'breakdown': scores, 'rec': rec}
-    
-    @staticmethod
-    def _rsi(v):
-        v = safe_float(v, 50)
-        return 90 if v < 20 else 75 if v < 30 else 60 if v < 40 else 50 if v < 50 else 45 if v < 60 else 35 if v < 70 else 20 if v < 80 else 10
-    
-    @staticmethod
-    def _macd(m):
-        if m.get('hist') is None or m.get('macd') is None or m.get('signal') is None:
-            return 50   # not enough history for MACD - neutral
-        s = 50 + (25 if safe_float(m['hist']) > 0 else -25) + (15 if safe_float(m['macd']) > safe_float(m['signal']) else -15)
-        return max(0, min(100, s))
-
-    @staticmethod
-    def _ma(price, ma):
-        s = 50
-        for v in ma.values():
-            if v is None:
-                continue   # stock too new for this average - skip rather than count as bearish
-            s += 10 if price > safe_float(v) else -10
-        s50, s200 = ma.get('sma50'), ma.get('sma200')
-        if s50 is not None and s200 is not None and s50 > 0 and s200 > 0:
-            s += 10 if s50 > s200 else -10
-        return max(0, min(100, s))
-    
-    @staticmethod
-    def _boll(price, b):
-        u, l = safe_float(b['upper']), safe_float(b['lower'])
-        if u == l: return 50
-        pos = (price - l) / (u - l)
-        return 80 if pos < 0.1 else 65 if pos < 0.3 else 50 if pos < 0.5 else 40 if pos < 0.7 else 30 if pos < 0.9 else 15
-    
-    @staticmethod
-    def _stoch(s):
-        k, d = safe_float(s['k'], 50), safe_float(s['d'], 50)
-        sc = 50 + (30 if k < 20 else 15 if k < 30 else -30 if k > 80 else -15 if k > 70 else 0)
-        return max(0, min(100, sc + (10 if k > d else -10)))
-    
-    @staticmethod
-    def _adx(v):
-        v = safe_float(v, 25)
-        return 80 if v > 50 else 70 if v > 40 else 60 if v > 30 else 50 if v > 20 else 30
-    
-    @staticmethod
-    def _vol(v):
-        v = safe_float(v)
-        return 80 if v > 10 else 65 if v > 5 else 55 if v > 0 else 45 if v > -5 else 35 if v > -10 else 20
-    
-    @staticmethod
-    def _mom(wr, cci):
-        s = 50
-        wr = safe_float(wr, -50)
-        s += 20 if wr < -80 else (-20 if wr > -20 else 0)
-        cci = safe_float(cci, 0)
-        s += 15 if cci < -100 else (-15 if cci > 100 else 0)
-        return max(0, min(100, s))
-    
-    @staticmethod
-    def _st(st):
-        sig, d = st.get('sig', 'HOLD'), st.get('dir', 'NEUTRAL')
-        if sig == 'BUY' and d == 'BULLISH': return 85
-        elif sig == 'BUY': return 65
-        elif sig == 'SELL' and d == 'BEARISH': return 15
-        elif sig == 'SELL': return 35
-        return 50
-    
-    @staticmethod
-    def _vwap(v):
-        sig = v.get('sig', 'NEUTRAL')
-        return 70 if sig == 'BULLISH' else 30 if sig == 'BEARISH' else 50
+# Relative strength vs the Nifty 50 lives in scoring.py (shared with the web version)
 
 
-class TargetCalc:
-    @staticmethod
-    def calc(data, rec):
-        price = data['price']
-        atr = data['atr']
-        if price <= 0: return {}
-        
-        r = {'price': round(price, 2), 'atr': round(atr, 2)}
-        
-        if rec in ['STRONG BUY', 'BUY']:
-            sl = price - atr * 1.5
-            r.update({'sl': round(sl, 2), 't1': round(price + atr * 1.5, 2), 't2': round(price + atr * 2.5, 2), 't3': round(price + atr * 4, 2),
-                     'risk': round(price - sl, 2), 'reward': round(atr * 2.5, 2), 'pos': 'LONG'})
-        elif rec in ['SELL', 'STRONG SELL']:
-            sl = price + atr * 1.5
-            r.update({'sl': round(sl, 2), 't1': round(price - atr * 1.5, 2), 't2': round(price - atr * 2.5, 2), 't3': round(price - atr * 4, 2),
-                     'risk': round(sl - price, 2), 'reward': round(atr * 2.5, 2), 'pos': 'SHORT'})
-        else:
-            sl = price - atr * 1.5
-            r.update({'sl': round(sl, 2), 't1': round(price + atr * 1.5, 2), 't2': round(price + atr * 2.5, 2), 't3': round(price + atr * 4, 2),
-                     'risk': round(price - sl, 2), 'reward': round(atr * 1.5, 2), 'pos': 'HOLD'})
-        
-        r['rr'] = round(r['reward'] / r['risk'], 2) if r.get('risk', 0) > 0 else 0
-        return r
+ROTATION_DAYS = 7     # a sector's score is compared with its stocks' scans from about this many days earlier
+ROTATION_FLAT = 1.0   # points: a smaller move in a sector's average score counts as no change
 
 
-# ============================================================
-# RELATIVE STRENGTH vs NIFTY 50
-# ============================================================
+def sector_rotation(avg, change, benchmark):
+    """Where a sector stands, from its strength AND its direction:
 
-NIFTY_SYMBOL = '^NSEI'
-RS_PERIODS = {'1M': 21, '3M': 63, '6M': 126}     # trading days
+        LEADING    stronger than the watchlist's average and not falling
+        WEAKENING  stronger than average, but its score is falling
+        IMPROVING  weaker than average, but its score is rising
+        LAGGING    weaker than average and not rising
+
+    `change`: move in the sector's average score since the earlier scan, None if there is none
+    (direction unknown: strength alone then decides between LEADING and LAGGING)."""
+    strong = avg >= benchmark
+    if change is None:
+        return "LEADING" if strong else "LAGGING"
+    if strong:
+        return "WEAKENING" if change < -ROTATION_FLAT else "LEADING"
+    return "IMPROVING" if change > ROTATION_FLAT else "LAGGING"
 
 
-def relative_strength(df, index_df, periods=RS_PERIODS):
-    """Stock return minus Nifty 50 return over each period, in percentage points
-    (+5.0 = the stock beat the Nifty by 5%). None where there isn't enough history."""
-    out = {label: None for label in periods}
-    if index_df is None or len(index_df) == 0 or df is None or len(df) < 2:
-        return out
-    index_close = index_df['Close']
-    for label, n in periods.items():
-        if len(df) <= n:
-            continue
-        start, end = df.index[-1 - n], df.index[-1]
-        s0, s1 = safe_float(df['Close'].iloc[-1 - n]), safe_float(df['Close'].iloc[-1])
-        i0, i1 = safe_float(index_close.asof(start)), safe_float(index_close.asof(end))
-        if s0 > 0 and i0 > 0 and i1 > 0:
-            out[label] = round((s1 / s0 - i1 / i0) * 100, 2)
-    return out
+def market_status(now, holidays=None):
+    """(is it open, text for the light) for the NSE cash market at `now` - this PC's clock, taken
+    to be Indian time. Open 09:15-15:30 on weekdays that aren't NSE holidays.
+    `holidays`: set of 'YYYY-MM-DD' (None if the list isn't known - weekends only are then closed)."""
+    if now.weekday() >= 5:
+        return False, "Market closed"
+    if holidays and now.strftime('%Y-%m-%d') in holidays:
+        return False, "Market closed: NSE holiday"
+    minutes = now.hour * 60 + now.minute
+    if 9 * 60 + 15 <= minutes <= 15 * 60 + 30:
+        return True, "Market open"
+    return False, "Market closed"
+
+
 
 
 # ============================================================
@@ -654,9 +386,17 @@ def load_app_settings():
     return {}
 
 
+def write_json(path, data, **kw):
+    """Write a JSON file completely or not at all. Written in place, a crash or power cut
+    mid-write leaves the file cut short - and a watchlist that can't be read loads as empty."""
+    tmp = str(path) + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, **kw)
+    os.replace(tmp, path)
+
+
 def save_app_settings(settings):
-    with open(APP_SETTINGS_FILE, 'w') as f:
-        json.dump(settings, f, indent=2)
+    write_json(APP_SETTINGS_FILE, settings, indent=2)
 
 
 def save_weights(weights, meta=None):
@@ -729,8 +469,8 @@ class Tooltip:
         self.widget = widget
         self.text = text
         self.tw = None
-        widget.bind("<Enter>", self.show)
-        widget.bind("<Leave>", self.hide)
+        widget.bind("<Enter>", self.show, add='+')
+        widget.bind("<Leave>", self.hide, add='+')
     
     def show(self, e=None):
         x = self.widget.winfo_rootx() + 20
@@ -738,8 +478,8 @@ class Tooltip:
         self.tw = tk.Toplevel(self.widget)
         self.tw.wm_overrideredirect(True)
         self.tw.wm_geometry(f"+{x}+{y}")
-        tk.Label(self.tw, text=self.text, bg="#1e293b", fg="#e2e8f0",
-                font=("Segoe UI", 9), padx=10, pady=5, relief=tk.SOLID, bd=1).pack()
+        tk.Label(self.tw, text=self.text, bg=THEME['fg'], fg=THEME['bg2'], justify=tk.LEFT,
+                 font=(ui.FONT, 9), padx=10, pady=6).pack()
     
     def hide(self, e=None):
         if self.tw:
@@ -782,12 +522,21 @@ class App:
         self.load_watchlist()
         self.load_watchlist_groups()
         self._load_weights()
-        self.min_liquidity_cr = self._load_app_settings().get('min_liquidity_cr', DEFAULT_MIN_LIQUIDITY_CR)
+        settings = self._load_app_settings()
+        self.min_liquidity_cr = settings.get('min_liquidity_cr', DEFAULT_MIN_LIQUIDITY_CR)
+        # Look: Daylight (light) or its dark mode, and animations - Settings > Appearance
+        THEME.clear()
+        THEME.update(ui.palette(settings.get('appearance', 'light')))
+        ui.init_fonts(root)
+        ui.Motion.enabled = bool(settings.get('animations', True)) and ui.windows_allows_animation()
+        ui.style_ttk(root, THEME)
+        self.markers = ui.marker_images(THEME)
         self.build_ui()
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
         self.refresh_watchlist()
         self.center()
         self._setup_market_status()
+        self._refresh_holidays()
         self.root.after(30000, self._check_auto_report)
         self.root.after(120000, self._auto_recheck_weights)   # monthly re-check of backtest weights
         logger.info("App started v7.0")
@@ -797,158 +546,114 @@ class App:
         w, h = self.root.winfo_width(), self.root.winfo_height()
         self.root.geometry(f"{w}x{h}+{(self.root.winfo_screenwidth()-w)//2}+{(self.root.winfo_screenheight()-h)//2}")
     
-    def btn(self, parent, text, color, cmd, **kw):
-        b = tk.Button(parent, text=text, bg=color, fg='white', font=('Segoe UI', 10, 'bold'),
-                     relief=tk.FLAT, padx=14, pady=6, command=cmd, cursor='hand2', **kw)
-        lighter = self.lighten(color, 0.15)
-        b.bind("<Enter>", lambda e: b.configure(bg=lighter))
-        b.bind("<Leave>", lambda e: b.configure(bg=color))
-        return b
-    
-    def lighten(self, color, factor=0.15):
-        try:
-            r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
-            r = max(0, min(255, int(r + (255 if factor > 0 else 0) * factor)))
-            g = max(0, min(255, int(g + (255 if factor > 0 else 0) * factor)))
-            b = max(0, min(255, int(b + (255 if factor > 0 else 0) * factor)))
-            return f'#{r:02x}{g:02x}{b:02x}'
-        except: return color
-    
+    def btn(self, parent, text, color, cmd, kind=None, **kw):
+        """A raised button (ui.RoundButton). `color` is the colour the app used to pass: the
+        accent colour makes a primary button, a danger colour a danger button, anything else a
+        quiet secondary one - so the window isn't a rainbow of buttons."""
+        T = THEME
+        if kind is None:
+            kind = 'primary' if color == T['accent'] else 'danger' if color in (T['danger'], T['danger2']) else 'secondary'
+        return ui.RoundButton(parent, text, command=cmd, kind=kind, theme=T)
+
     def build_ui(self):
         T = THEME
-        
-        # HEADER - Premium dark theme with gradient effect
-        header = tk.Frame(self.root, bg=T['bg2'], height=80)
+        self.root.configure(bg=T['bg'])
+
+        # HEADER: logo and name, market light, file actions
+        header = tk.Frame(self.root, bg=T['bg2'], height=72)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
-        
-        # Accent line at top
-        accent_line = tk.Frame(self.root, bg=T['accent'], height=3)
-        accent_line.pack(fill=tk.X)
-        accent_line.lift()
-        
-        # Logo
+        tk.Frame(self.root, bg=T['line'], height=1).pack(fill=tk.X)
+
         logo_frame = tk.Frame(header, bg=T['bg2'])
-        logo_frame.pack(side=tk.LEFT, padx=20)
-        
+        logo_frame.pack(side=tk.LEFT, padx=(20, 12))
         try:
             if LOGO_PATH.exists() and PIL_OK:
                 img = Image.open(str(LOGO_PATH))
-                img = img.resize((55, 55), Image.Resampling.LANCZOS)
+                img.thumbnail((100, 50), Image.Resampling.LANCZOS)   # keeps its shape (it used to be squashed square)
                 self.logo_img = ImageTk.PhotoImage(img)
-                logo_lbl = tk.Label(logo_frame, image=self.logo_img, bg=T['bg2'])
-                logo_lbl.pack(side=tk.LEFT, padx=(0, 12))
-        except: pass
-        
+                tk.Label(logo_frame, image=self.logo_img, bg=T['bg2']).pack()
+        except Exception:
+            pass
+
         title_frame = tk.Frame(header, bg=T['bg2'])
         title_frame.pack(side=tk.LEFT)
-        
-        tk.Label(title_frame, text="DR. NILESH SHAH'S MARKET ANALYSIS", bg=T['bg2'], fg=T['gold'],
-                font=('Segoe UI', 22, 'bold')).pack(anchor=tk.W)
-        tk.Label(title_frame, text="Professional Technical Scanner  |  2-Year Daily Analysis  |  v7.0", bg=T['bg2'], fg=T['fg3'],
-                font=('Segoe UI', 10)).pack(anchor=tk.W)
-        
-        # Market status indicator (right side)
-        market_frame = tk.Frame(header, bg=T['bg2'])
-        market_frame.pack(side=tk.RIGHT, padx=20)
-        
-        self.market_dot = tk.Canvas(market_frame, width=12, height=12, bg=T['bg2'], highlightthickness=0)
-        self.market_dot.pack(side=tk.LEFT, padx=(0, 5))
-        self.market_dot.create_oval(2, 2, 10, 10, fill=T['danger'], outline='')
-        self.market_status_lbl = tk.Label(market_frame, text="MARKET CLOSED", bg=T['bg2'], fg=T['fg3'],
-                font=('Segoe UI', 9, 'bold'))
-        self.market_status_lbl.pack(side=tk.LEFT)
-        
-        # Buttons row
+        tk.Label(title_frame, text="DR. NILESH SHAH'S MARKET ANALYSIS", bg=T['bg2'], fg=T['fg'],
+                 font=(ui.DISPLAY, 18, 'bold')).pack(anchor=tk.W)
+        tk.Label(title_frame, text="Technical scanner for NSE and BSE stocks", bg=T['bg2'], fg=T['fg3'],
+                 font=(ui.FONT, 10)).pack(anchor=tk.W)
+
         btn_row = tk.Frame(header, bg=T['bg2'])
-        btn_row.pack(side=tk.RIGHT, padx=10)
-        
-        self.btn(btn_row, "Import", T['accent3'], self.import_list).pack(side=tk.RIGHT, padx=3)
-        self.btn(btn_row, "Save", T['success'], self.save_list).pack(side=tk.RIGHT, padx=3)
-        self.btn(btn_row, "Excel", '#059669', self.export_results).pack(side=tk.RIGHT, padx=3)
-        self.btn(btn_row, "PDF", '#7c3aed', self.export_pdf).pack(side=tk.RIGHT, padx=3)
-        self.btn(btn_row, "Report", T['gold'], self.generate_daily_report).pack(side=tk.RIGHT, padx=3)
-        self.btn(btn_row, "Email", T['danger'], self.send_email_report).pack(side=tk.RIGHT, padx=3)
-        
-        # DASHBOARD
-        self.dash_frame = tk.Frame(self.root, bg=T['bg'])
-        self.dash_frame.pack(fill=tk.X, padx=15, pady=10)
-        
-        self.dash_cards = {}
-        cards = [
-            ('total', 'TOTAL', '0', T['accent'], T['accent']),
-            ('sb', 'STRONG BUY', '0', '#059669', '#065f46'),
-            ('buy', 'BUY', '0', T['success'], '#064e3b'),
-            ('hold', 'HOLD', '0', T['warning'], '#78350f'),
-            ('sell', 'SELL', '0', T['danger2'], '#7f1d1d'),
-            ('ss', 'STRONG SELL', '0', T['danger'], '#450a0a'),
-            ('avg', 'AVG SCORE', '0', T['gold'], '#713f12'),
-        ]
-        
-        for key, label, val, color, border_color in cards:
-            card = tk.Frame(self.dash_frame, bg=T['card'], highlightbackground=border_color, highlightthickness=1, padx=18, pady=10)
-            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=3)
-            tk.Label(card, text=label, bg=T['card'], fg=T['fg3'], font=('Segoe UI', 8, 'bold')).pack()
-            val_lbl = tk.Label(card, text=val, bg=T['card'], fg=color, font=('Segoe UI', 26, 'bold'))
-            val_lbl.pack()
-            self.dash_cards[key] = val_lbl
-        
-        # CONTROLS
-        ctrl = tk.Frame(self.root, bg=T['bg2'], highlightbackground=T['border'], highlightthickness=1)
-        ctrl.pack(fill=tk.X, padx=15, pady=(0, 10))
-        
-        # Watchlist
-        wl = tk.LabelFrame(ctrl, text=" Watchlist ", bg=T['bg2'], fg=T['accent'], font=('Segoe UI', 10, 'bold'), bd=0)
-        wl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
-        
-        entry_row = tk.Frame(wl, bg=T['bg2'])
-        entry_row.pack(fill=tk.X, padx=8, pady=4)
-        
-        tk.Label(entry_row, text="Symbol:", bg=T['bg2'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.LEFT)
-        self.entry = tk.Entry(entry_row, font=('Segoe UI', 12, 'bold'), bg=T['input'], fg=T['fg'],
-                            insertbackground=T['fg'], relief=tk.FLAT, width=14, highlightbackground=T['border'], highlightthickness=1)
-        self.entry.pack(side=tk.LEFT, padx=8)
+        btn_row.pack(side=tk.RIGHT, padx=(8, 20))
+        for text, cmd in (("Import", self.import_list), ("Save", self.save_list), ("Excel", self.export_results),
+                          ("PDF", self.export_pdf), ("Report", self.generate_daily_report), ("Email", self.send_email_report)):
+            self.btn(btn_row, text, None, cmd, kind='ghost').pack(side=tk.RIGHT, padx=3)
+
+        market_frame = tk.Frame(header, bg=T['bg2'])
+        market_frame.pack(side=tk.RIGHT, padx=18)
+        self.market_dot = tk.Canvas(market_frame, width=18, height=18, bg=T['bg2'], highlightthickness=0)
+        self.market_dot.pack(side=tk.LEFT, padx=(0, 4))
+        self.market_dot.create_oval(5, 5, 13, 13, fill=T['fg3'], outline='', tags='dot')
+        self.market_status_lbl = tk.Label(market_frame, text="Market closed", bg=T['bg2'], fg=T['fg2'], font=(ui.FONT, 10))
+        self.market_status_lbl.pack(side=tk.LEFT)
+
+        # SCAN SUMMARY: one raised card (numbers count up and the bar grows after a scan)
+        self.summary = ui.SummaryCard(self.root, T)
+        self.summary.pack(fill=tk.X, padx=16, pady=(12, 2))
+
+        # CONTROLS: add stocks, scan
+        ctrl = tk.Frame(self.root, bg=T['bg2'], highlightbackground=T['line'], highlightthickness=1)
+        ctrl.pack(fill=tk.X, padx=16, pady=(8, 10))
+
+        wl = tk.Frame(ctrl, bg=T['bg2'])
+        wl.pack(side=tk.LEFT, padx=16, pady=10)
+        tk.Label(wl, text="Add a stock", bg=T['bg2'], fg=T['fg2'], font=(ui.FONT, 9)).grid(row=0, column=0, sticky='w', pady=(0, 3))
+        self.entry = tk.Entry(wl, font=(ui.FONT, 11), bg=T['input'], fg=T['fg'], insertbackground=T['fg'], relief=tk.FLAT,
+                              width=16, highlightbackground=T['line'], highlightcolor=T['accent'], highlightthickness=1)
+        self.entry.grid(row=1, column=0, ipady=6, padx=(0, 8))
         self.entry.bind('<Return>', lambda e: self.add_stock())
-        Tooltip(self.entry, "Enter NSE symbol (e.g., RELIANCE, TCS, INFY)")
-        
-        btn_row = tk.Frame(wl, bg=T['bg2'])
-        btn_row.pack(fill=tk.X, padx=8, pady=4)
-        
-        self.btn(btn_row, "Add", T['success'], self.add_stock).pack(side=tk.LEFT, padx=3)
-        self.btn(btn_row, "Delete", T['danger'], self.del_stock).pack(side=tk.LEFT, padx=3)
-        self.btn(btn_row, "Clear", T['warning'], self.clear_list).pack(side=tk.LEFT, padx=3)
-        
-        tk.Label(btn_row, text=" Sector:", bg=T['bg2'], fg=T['fg3'], font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(15, 5))
+        Tooltip(self.entry, "Enter an NSE symbol, e.g. RELIANCE, TCS, INFY")
+        self.btn(wl, "Add", None, self.add_stock).grid(row=1, column=1, padx=3)
+        self.btn(wl, "Delete", T['danger'], self.del_stock).grid(row=1, column=2, padx=3)
+        self.btn(wl, "Clear", T['danger'], self.clear_list).grid(row=1, column=3, padx=3)
+        tk.Label(wl, text="Sector", bg=T['bg2'], fg=T['fg2'], font=(ui.FONT, 9)).grid(row=0, column=4, sticky='w', padx=(20, 0), pady=(0, 3))
         self.sector_var = tk.StringVar(value="All")
-        sector_cb = ttk.Combobox(btn_row, textvariable=self.sector_var, values=["All"] + list(SECTOR_MAP.keys()), state='readonly', width=12)
-        sector_cb.pack(side=tk.LEFT)
+        sector_cb = ttk.Combobox(wl, textvariable=self.sector_var, values=["All"] + list(SECTOR_MAP.keys()), state='readonly', width=13)
+        sector_cb.grid(row=1, column=4, padx=(20, 0), ipady=2)
         sector_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_watchlist())
-        Tooltip(sector_cb, "Filter watchlist by sector")
-        
-        # Scan
-        scan = tk.LabelFrame(ctrl, text=" Scan ", bg=T['bg2'], fg=T['danger'], font=('Segoe UI', 10, 'bold'), bd=0)
-        scan.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
-        
-        scan_row = tk.Frame(scan, bg=T['bg2'])
-        scan_row.pack(fill=tk.X, padx=8, pady=8)
-        
-        self.scan_btn = self.btn(scan_row, "SCAN ALL STOCKS", T['danger'], self.start_scan)
-        self.scan_btn.pack(side=tk.LEFT, padx=8)
+        Tooltip(sector_cb, "Filter the watchlist by sector")
+
+        scan = tk.Frame(ctrl, bg=T['bg2'])
+        scan.pack(side=tk.RIGHT, padx=16, pady=10)
+        self.scan_btn = self.btn(scan, "Scan all stocks", None, self.start_scan, kind='primary')
+        self.scan_btn.pack(side=tk.LEFT, padx=(0, 16))
         Tooltip(self.scan_btn, "Scan all stocks (F5)")
-        
-        self.progress = ttk.Progressbar(scan_row, mode='determinate', length=150)
-        self.progress.pack(side=tk.LEFT, padx=8)
-        
-        self.status_lbl = tk.Label(scan_row, text="Ready", bg=T['bg2'], fg=T['fg3'], font=('Segoe UI', 9))
-        self.status_lbl.pack(side=tk.LEFT, padx=8)
-        
-        # NOTEBOOK
+        prog = tk.Frame(scan, bg=T['bg2'])
+        prog.pack(side=tk.LEFT)
+        self.progress = ttk.Progressbar(prog, mode='determinate', length=240, style='Accent.Horizontal.TProgressbar')
+        self.progress.pack(anchor=tk.W, pady=(4, 6))
+        self.status_lbl = tk.Label(prog, text="Ready", bg=T['bg2'], fg=T['fg2'], font=(ui.FONT, 9), anchor='w', width=48)
+        self.status_lbl.pack(anchor=tk.W)
+
+        # STATUS BAR (packed before the tabs, at the bottom, so a tall table can't push it off the window)
+        status = tk.Frame(self.root, bg=T['bg2'], height=28, highlightbackground=T['line'], highlightthickness=1)
+        status.pack(side=tk.BOTTOM, fill=tk.X)
+        status.pack_propagate(False)
+        self.last_scan_lbl = tk.Label(status, text="Last scan: never", bg=T['bg2'], fg=T['fg3'], font=(ui.FONT, 9))
+        self.last_scan_lbl.pack(side=tk.LEFT, padx=16)
+        self.cache_lbl = tk.Label(status, text="Cache: 0", bg=T['bg2'], fg=T['fg3'], font=(ui.FONT, 9))
+        self.cache_lbl.pack(side=tk.LEFT, padx=16)
+        tk.Label(status, text="F5 scan   Ctrl+I import   Del delete   F1 help", bg=T['bg2'], fg=T['fg3'],
+                 font=(ui.FONT, 9)).pack(side=tk.RIGHT, padx=16)
+
+        # TABS: the notebook's own tabs are hidden; ui.TabBar draws them with a sliding underline
         nb_frame = tk.Frame(self.root, bg=T['bg'])
-        nb_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 5))
-        
-        self.nb = ttk.Notebook(nb_frame)
+        nb_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        tab_holder = tk.Frame(nb_frame, bg=T['bg2'])
+        tab_holder.pack(fill=tk.X)
+        self.nb = ttk.Notebook(nb_frame, style='Tabless.TNotebook')
         self.nb.pack(fill=tk.BOTH, expand=True)
-        
+
         self.build_watchlist_tab()
         self.build_results_tab()
         self.build_breakdown_tab()
@@ -960,17 +665,10 @@ class App:
         self.build_backtest_tab()
         self.build_settings_tab()
         self.build_help_tab()
-        
-        # STATUS BAR
-        status = tk.Frame(self.root, bg=T['bg3'], height=30)
-        status.pack(fill=tk.X)
-        status.pack_propagate(False)
-        
-        tk.Label(status, text=f"Last Scan: Never", bg=T['bg3'], fg=T['fg3'], font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=15)
-        self.last_scan_lbl = status.winfo_children()[-1]
-        tk.Label(status, text=f"Cache: {self.analyzer.cache.count()}", bg=T['bg3'], fg=T['fg3'], font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=15)
-        tk.Label(status, text="F5=Scan | Ctrl+I=Import | Del=Delete", bg=T['bg3'], fg=T['fg3'], font=('Segoe UI', 9)).pack(side=tk.RIGHT, padx=15)
-        
+        self.tabbar = ui.TabBar(tab_holder, self.nb, T)
+        self.tabbar.pack(fill=tk.X)
+
+
         # Shortcuts
         self.root.bind('<F5>', lambda e: self.start_scan())
         self.root.bind('<Control-i>', lambda e: self.import_list())
@@ -985,18 +683,21 @@ class App:
         self.root.bind('<Control-a>', lambda e: self._select_all_results())
         self.root.bind('<Control-l>', lambda e: self.view_log())
         self.root.bind('<F1>', lambda e: self.nb.select(self.help_tab))
-    
+
+        ui.skin(self.root, T)
+        ui.set_titlebar(self.root, T['mode'] == 'dark')
+
     def build_watchlist_tab(self):
         T = THEME
         tab = tk.Frame(self.nb, bg=T['bg'])
         self.nb.add(tab, text="  Watchlist  ")
         
         # Groups bar
-        groups_bar = tk.Frame(tab, bg=T['bg2'], height=38)
+        groups_bar = tk.Frame(tab, bg=T['bg2'], height=50)
         groups_bar.pack(fill=tk.X)
         groups_bar.pack_propagate(False)
         
-        tk.Label(groups_bar, text="GROUP:", bg=T['bg2'], fg=T['fg3'], font=('Segoe UI', 9, 'bold')).pack(side=tk.LEFT, padx=10)
+        tk.Label(groups_bar, text="Group", bg=T['bg2'], fg=T['fg2'], font=(ui.FONT, 10)).pack(side=tk.LEFT, padx=(14, 6))
         self.group_var = tk.StringVar(value='All Stocks')
         self.group_cb = ttk.Combobox(groups_bar, textvariable=self.group_var, 
                                      values=list(self.watchlist_groups.keys()), state='readonly', width=15)
@@ -1005,20 +706,18 @@ class App:
         self.btn(groups_bar, "New Group", T['accent'], self._create_group).pack(side=tk.LEFT, padx=4)
         self.btn(groups_bar, "Add to Group", T['success'], self._add_to_group).pack(side=tk.LEFT, padx=4)
         self.btn(groups_bar, "Remove", T['warning'], self._remove_from_group).pack(side=tk.LEFT, padx=4)
-        self.group_count_lbl = tk.Label(groups_bar, text="", bg=T['bg2'], fg=T['fg3'], font=('Segoe UI', 9))
+        self.group_count_lbl = tk.Label(groups_bar, text="", bg=T['bg2'], fg=T['fg3'], font=(ui.FONT, 9))
         self.group_count_lbl.pack(side=tk.RIGHT, padx=10)
         
         # Main list
         list_frame = tk.Frame(tab, bg=T['bg'])
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        sb = tk.Scrollbar(list_frame)
+        sb = ttk.Scrollbar(list_frame)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.wl_list = tk.Listbox(list_frame, bg=T['input'], fg=T['accent2'], font=('Consolas', 14),
-                                 selectbackground=T['accent'], selectforeground='white', relief=tk.FLAT, yscrollcommand=sb.set,
-                                 highlightbackground=T['border'], highlightthickness=1)
+        self.wl_list = tk.Listbox(list_frame, font=(ui.FONT, 12), yscrollcommand=sb.set)
         self.wl_list.pack(fill=tk.BOTH, expand=True)
         sb.config(command=self.wl_list.yview)
-        self.wl_count = tk.Label(tab, text="Stocks: 0", bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 10))
+        self.wl_count = tk.Label(tab, text="Stocks: 0", bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 10))
         self.wl_count.pack(pady=5)
 
     def build_results_tab(self):
@@ -1027,55 +726,66 @@ class App:
         self.nb.add(tab, text="  Scan Results  ")
         
         cols = ('Symbol', 'Price', 'Change%', 'vs Nifty 3M', 'RSI', 'SuperTrend', 'VWAP', 'Score', 'Score Chg',
-                'Recommendation', '52W High', '52W Low', 'ATR', 'Traded/day (Cr)')
-        col_widths = {'Symbol': 105, 'Price': 85, 'Change%': 75, 'vs Nifty 3M': 95, 'RSI': 55, 'SuperTrend': 85,
-                      'VWAP': 80, 'Score': 60, 'Score Chg': 75, 'Recommendation': 115, '52W High': 85,
-                      '52W Low': 85, 'ATR': 65, 'Traded/day (Cr)': 110}
+                'Recommendation', '52W High', '52W Low', 'ATR', 'Traded/day (Cr)', 'Candle')
+        col_widths = {'Symbol': 110, 'Price': 90, 'Change%': 80, 'vs Nifty 3M': 95, 'RSI': 60, 'SuperTrend': 90,
+                      'VWAP': 85, 'Score': 65, 'Score Chg': 80, 'Recommendation': 120, '52W High': 90,
+                      '52W Low': 90, 'ATR': 70, 'Traded/day (Cr)': 115, 'Candle': 70}
+        text_cols = ('Symbol', 'SuperTrend', 'VWAP', 'Recommendation', 'Candle')   # left-aligned; numbers right-aligned
         
         # Search bar above results
         search_frame = tk.Frame(tab, bg=T['bg'])
-        search_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        search_frame.pack(fill=tk.X, padx=2, pady=(12, 0))
         
-        tk.Label(search_frame, text="Search:", bg=T['bg'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=5)
+        tk.Label(search_frame, text="Find", bg=T['bg'], fg=T['fg2'], font=(ui.FONT, 10)).pack(side=tk.LEFT, padx=(4, 6))
         self.search_var = tk.StringVar()
         self.search_var.trace_add('write', lambda *args: self.filter_results())  # trace('w') was removed in Tk 9
         self.search_entry = tk.Entry(search_frame, textvariable=self.search_var, bg=T['input'], fg=T['fg'],
-                                     font=('Segoe UI', 10), width=30, relief=tk.FLAT,
-                                     highlightbackground=T['border'], highlightthickness=1)
-        self.search_entry.pack(side=tk.LEFT, padx=5)
+                                     insertbackground=T['fg'], font=(ui.FONT, 10), width=26, relief=tk.FLAT,
+                                     highlightbackground=T['line'], highlightcolor=T['accent'], highlightthickness=1)
+        self.search_entry.pack(side=tk.LEFT, padx=(0, 6), ipady=5)
         Tooltip(self.search_entry, "Type to filter results by symbol")
         
-        self.btn(search_frame, "Clear", T['bg3'], lambda: self.search_var.set("")).pack(side=tk.LEFT, padx=5)
+        self.btn(search_frame, "Clear", None, lambda: self.search_var.set("")).pack(side=tk.LEFT, padx=4)
         
-        tk.Label(search_frame, text="Filter:", bg=T['bg'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=(20, 5))
+        tk.Label(search_frame, text="Show", bg=T['bg'], fg=T['fg2'], font=(ui.FONT, 10)).pack(side=tk.LEFT, padx=(22, 6))
         self.result_filter_var = tk.StringVar(value="All")
         filter_cb = ttk.Combobox(search_frame, textvariable=self.result_filter_var,
                                 values=["All", "STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"],
                                 state='readonly', width=15)
-        filter_cb.pack(side=tk.LEFT, padx=5)
+        filter_cb.pack(side=tk.LEFT, padx=4, ipady=2)
         filter_cb.bind("<<ComboboxSelected>>", lambda e: self.filter_results())
 
         self.hide_illiquid_var = tk.BooleanVar(value=False)
         self.hide_illiquid_cb = tk.Checkbutton(search_frame, variable=self.hide_illiquid_var, command=self.filter_results,
                                                text=f"Hide illiquid (< Rs {self.min_liquidity_cr:g} Cr/day)",
-                                               bg=T['bg'], fg=T['fg'], selectcolor=T['bg3'], activebackground=T['bg'],
-                                               font=('Segoe UI', 10))
-        self.hide_illiquid_cb.pack(side=tk.LEFT, padx=(20, 5))
+                                               bg=T['bg'], fg=T['fg'], selectcolor=T['input'], activebackground=T['bg'],
+                                               activeforeground=T['fg'], font=(ui.FONT, 10))
+        self.hide_illiquid_cb.pack(side=tk.LEFT, padx=(22, 5))
         Tooltip(self.hide_illiquid_cb, "Illiquid stocks: stop-loss and targets are unreliable because\n"
                                        "prices can gap and orders may not fill. Threshold is set in Settings.")
         
-        frame = tk.Frame(tab, bg=T['bg'])
-        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        frame = tk.Frame(tab, bg=T['line'], padx=1, pady=1)     # 1px border round the table
+        frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=10)
+        inner = tk.Frame(frame, bg=T['card'])
+        inner.pack(fill=tk.BOTH, expand=True)
         
-        sy = tk.Scrollbar(frame)
+        sy = ttk.Scrollbar(inner, orient=tk.VERTICAL)
         sy.pack(side=tk.RIGHT, fill=tk.Y)
-        sx = tk.Scrollbar(frame, orient=tk.HORIZONTAL)
+        sx = ttk.Scrollbar(inner, orient=tk.HORIZONTAL)
         sx.pack(side=tk.BOTTOM, fill=tk.X)
         
-        self.tree = ttk.Treeview(frame, columns=cols, show='headings', yscrollcommand=sy.set, xscrollcommand=sx.set)
+        self.tree = ttk.Treeview(inner, columns=cols, show='tree headings', yscrollcommand=sy.set, xscrollcommand=sx.set)
+        self.tree.heading('#0', text='')
+        self.tree.column('#0', width=34, minwidth=34, stretch=False, anchor=tk.CENTER)   # the signal marker
         for c in cols:
-            self.tree.heading(c, text=c, anchor=tk.CENTER, command=lambda c=c: self.sort_tree(c))
-            self.tree.column(c, width=col_widths.get(c, 100), anchor=tk.CENTER)
+            anchor = tk.W if c in text_cols else tk.E
+            self.tree.heading(c, text=c, anchor=anchor, command=lambda c=c: self.sort_tree(c))
+            self.tree.column(c, width=col_widths.get(c, 100), anchor=anchor)
+        self.tree.tag_configure('plain', background=T['card'])
+        self.tree.tag_configure('zebra', background=T['zebra'])
+        self.tree.tag_configure('tb', background=T['tint_b'])
+        self.tree.tag_configure('ts', background=T['tint_s'])
+        self.tree.tag_configure('error', background=T['err_bg'], foreground=T['err_fg'])
         
         self.tree.pack(fill=tk.BOTH, expand=True)
         sy.config(command=self.tree.yview)
@@ -1093,7 +803,8 @@ class App:
         frame = tk.Frame(canvas, bg=T['bg'])
         
         frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=frame, anchor="nw")
+        win = canvas.create_window((0, 0), window=frame, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
         canvas.configure(yscrollcommand=sb.set)
         
         sb.pack(side="right", fill="y")
@@ -1126,18 +837,18 @@ class App:
     
     def build_breakdown_tab(self):
         self.bd_frame = self.build_scrollable_tab("Score Breakdown")
-        tk.Label(self.bd_frame, text="Double-click a stock to view breakdown",
-                bg=THEME['bg'], fg=THEME['accent'], font=('Segoe UI', 14, 'bold')).pack(pady=50)
+        tk.Label(self.bd_frame, text="Double-click a stock in Scan Results to view breakdown",
+                bg=THEME['bg'], fg=THEME['fg2'], font=(ui.FONT, 12)).pack(pady=60)
     
     def build_targets_tab(self):
         self.tg_frame = self.build_scrollable_tab("Stop-Loss & Targets")
-        tk.Label(self.tg_frame, text="Double-click a stock to view targets",
-                bg=THEME['bg'], fg=THEME['accent'], font=('Segoe UI', 14, 'bold')).pack(pady=50)
+        tk.Label(self.tg_frame, text="Double-click a stock in Scan Results to view targets",
+                bg=THEME['bg'], fg=THEME['fg2'], font=(ui.FONT, 12)).pack(pady=60)
     
     def build_patterns_tab(self):
         self.pt_frame = self.build_scrollable_tab("Pattern Analysis")
-        tk.Label(self.pt_frame, text="Double-click a stock to view detected patterns",
-                bg=THEME['bg'], fg=THEME['accent'], font=('Segoe UI', 14, 'bold')).pack(pady=50)
+        tk.Label(self.pt_frame, text="Double-click a stock in Scan Results to view detected patterns",
+                bg=THEME['bg'], fg=THEME['fg2'], font=(ui.FONT, 12)).pack(pady=60)
     
 
     def build_corporate_tab(self):
@@ -1151,12 +862,12 @@ class App:
         header.pack(fill=tk.X)
         header.pack_propagate(False)
 
-        tk.Label(header, text="Corporate Actions Scanner (NSE + BSE Live Data)",
-                bg=T['bg2'], fg=T['gold'], font=('Segoe UI', 14, 'bold')).pack(side=tk.LEFT, padx=15)
+        tk.Label(header, text="Corporate actions (live from NSE and BSE)",
+                 bg=T['bg2'], fg=T['fg'], font=(ui.DISPLAY, 14, 'bold')).pack(side=tk.LEFT, padx=16)
 
         self.btn(header, "Export CSV", T['success'], self.export_corporate_csv).pack(side=tk.RIGHT, padx=5)
-        self.btn(header, "View Details", T['accent'], self.show_corporate_popup).pack(side=tk.RIGHT, padx=5)
-        self.btn(header, "SCAN ALL", T['danger'], self.load_corporate_actions).pack(side=tk.RIGHT, padx=5)
+        self.btn(header, "View Details", None, self.show_corporate_popup).pack(side=tk.RIGHT, padx=5)
+        self.btn(header, "SCAN ALL", T['accent'], self.load_corporate_actions).pack(side=tk.RIGHT, padx=5)
 
         # Stats bar
         stats_bar = tk.Frame(tab, bg=T['bg3'], height=35)
@@ -1166,15 +877,15 @@ class App:
         self.corp_stats_labels = {}
         for key, label, color in [('total', 'Total', T['accent']), ('upcoming', 'Upcoming', T['success']),
                                    ('dividends', 'Dividends', T['gold']), ('splits', 'Splits', T['warning']),
-                                   ('bonus', 'Bonus', '#10b981')]:
+                                   ('bonus', 'Bonus', T['fg'])]:
             frame = tk.Frame(stats_bar, bg=T['bg3'])
             frame.pack(side=tk.LEFT, padx=15)
-            tk.Label(frame, text=label, bg=T['bg3'], fg=T['fg3'], font=('Segoe UI', 8)).pack(side=tk.LEFT)
-            lbl = tk.Label(frame, text="0", bg=T['bg3'], fg=color, font=('Segoe UI', 11, 'bold'))
+            tk.Label(frame, text=label, bg=T['bg3'], fg=T['fg3'], font=(ui.FONT, 8)).pack(side=tk.LEFT)
+            lbl = tk.Label(frame, text="0", bg=T['bg3'], fg=color, font=(ui.FONT, 11, 'bold'))
             lbl.pack(side=tk.LEFT, padx=5)
             self.corp_stats_labels[key] = lbl
 
-        self.corp_source_lbl = tk.Label(stats_bar, text="Source: -", bg=T['bg3'], fg=T['fg3'], font=('Segoe UI', 8))
+        self.corp_source_lbl = tk.Label(stats_bar, text="Source: -", bg=T['bg3'], fg=T['fg3'], font=(ui.FONT, 8))
         self.corp_source_lbl.pack(side=tk.RIGHT, padx=15)
 
         # Main content - PanedWindow
@@ -1182,11 +893,10 @@ class App:
         content.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # LEFT - Stock list
-        left = tk.LabelFrame(content, text=" Watchlist ", bg=T['bg'], fg=T['accent'], font=('Segoe UI', 10, 'bold'))
+        left = tk.LabelFrame(content, text=" Watchlist ", bg=T['bg'], fg=T['accent'], font=(ui.FONT, 10, 'bold'))
         content.add(left, width=220)
 
-        self.corp_listbox = tk.Listbox(left, bg=T['input'], fg=T['accent2'], font=('Consolas', 11),
-                                       selectbackground=T['accent'], selectforeground='white', width=22)
+        self.corp_listbox = tk.Listbox(left, font=(ui.FONT, 11), width=22)
         self.corp_listbox.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
         self.corp_listbox.bind('<Double-1>', lambda e: self.show_corporate_popup())
 
@@ -1198,11 +908,11 @@ class App:
         filter_bar = tk.Frame(right, bg=T['bg2'])
         filter_bar.pack(fill=tk.X, pady=(0, 3))
 
-        tk.Label(filter_bar, text="Show:", bg=T['bg2'], fg=T['fg'], font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=5)
+        tk.Label(filter_bar, text="Show:", bg=T['bg2'], fg=T['fg'], font=(ui.FONT, 9)).pack(side=tk.LEFT, padx=5)
         self.corp_filter_var = tk.StringVar(value="All")
         for val in ["All", "Upcoming", "Past", "Dividends", "Splits", "Bonus", "Rights", "Buyback"]:
             tk.Radiobutton(filter_bar, text=val, variable=self.corp_filter_var, value=val,
-                          bg=T['bg2'], fg=T['fg'], selectcolor=T['bg3'], font=('Segoe UI', 8),
+                          bg=T['bg2'], fg=T['fg'], selectcolor=T['bg3'], font=(ui.FONT, 8),
                           command=self._filter_corporate_actions).pack(side=tk.LEFT, padx=2)
 
         # Actions Treeview
@@ -1210,9 +920,9 @@ class App:
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
         cols = ('Symbol', 'Company', 'Type', 'Action', 'Amount', 'Ex-Date', 'Record Date', 'Days', 'Status', 'Source')
-        sy = tk.Scrollbar(tree_frame)
+        sy = ttk.Scrollbar(tree_frame)
         sy.pack(side=tk.RIGHT, fill=tk.Y)
-        sx = tk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
+        sx = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
         sx.pack(side=tk.BOTTOM, fill=tk.X)
 
         self.corp_tree = ttk.Treeview(tree_frame, columns=cols, show='headings',
@@ -1230,14 +940,14 @@ class App:
         self.corp_tree.bind('<Double-1>', lambda e: self.show_corporate_popup())
 
         # Tag colors
-        self.corp_tree.tag_configure('upcoming', background='#064e3b', foreground='#6ee7b7')
-        self.corp_tree.tag_configure('today', background='#7f1d1d', foreground='#fca5a5')
-        self.corp_tree.tag_configure('past', background='#1f2937', foreground='#6b7280')
+        self.corp_tree.tag_configure('upcoming', background=T['tint_b'], foreground=T['fg'])
+        self.corp_tree.tag_configure('today', background=T['warn_bg'], foreground=T['warn_fg'])
+        self.corp_tree.tag_configure('past', background=T['card'], foreground=T['fg3'])
 
         # Status bar
         self.corp_status = tk.Label(tab, text="Click 'SCAN ALL' to fetch live corporate actions from NSE & BSE",
-                                   bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 10))
-        self.corp_status.pack(pady=5)
+                                   bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 10))
+        self.corp_status.pack(side=tk.BOTTOM, pady=5, before=content)    # stays visible however tall the table is
 
         # Internal state
         self.corp_engine = None
@@ -1249,6 +959,9 @@ class App:
         if not self.watchlist:
             messagebox.showwarning("Warning", "Watchlist is empty!")
             return
+        if getattr(self, '_corp_busy', False):
+            return   # already scanning - a second scan alongside would list every action twice
+        self._corp_busy = True
 
         # Clear existing
         for item in self.corp_tree.get_children():
@@ -1364,6 +1077,8 @@ class App:
                 self.root.after(0, lambda err=e: self.corp_status.configure(text=f"Error: {err}"))
                 import traceback
                 traceback.print_exc()
+            finally:
+                self._corp_busy = False
 
         threading.Thread(target=scan, daemon=True).start()
 
@@ -1481,6 +1196,7 @@ class App:
         popup.title(f"Corporate Actions - {symbol}")
         popup.geometry("900x650")
         popup.configure(bg=T['bg'])
+        ui.set_titlebar(popup, T['mode'] == 'dark')
 
         # Header
         hdr = tk.Frame(popup, bg=T['bg2'], height=55)
@@ -1489,17 +1205,17 @@ class App:
 
         company_name = data.get('company', data.get('name', symbol))
         tk.Label(hdr, text=f"{symbol}  -  {company_name}",
-                bg=T['bg2'], fg=T['gold'], font=('Segoe UI', 16, 'bold')).pack(side=tk.LEFT, padx=15)
+                bg=T['bg2'], fg=T['gold'], font=(ui.FONT, 16, 'bold')).pack(side=tk.LEFT, padx=15)
 
         # Content - scrollable text
         content = tk.Frame(popup, bg=T['bg'])
         content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        text_scroll = tk.Scrollbar(content)
+        text_scroll = ttk.Scrollbar(content)
         text_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        text = tk.Text(content, bg=T['input'], fg=T['fg'], font=('Consolas', 11),
-                       wrap=tk.WORD, yscrollcommand=text_scroll.set, padx=10, pady=10)
+        text = tk.Text(content, bg=T['card'], fg=T['fg'], font=(ui.MONO, 11), relief=tk.FLAT,
+                       highlightthickness=1, highlightbackground=T['line'], wrap=tk.WORD, yscrollcommand=text_scroll.set, padx=10, pady=10)
         text.pack(fill=tk.BOTH, expand=True)
         text_scroll.config(command=text.yview)
 
@@ -1801,45 +1517,57 @@ class App:
 
 
     def build_charts_tab(self):
-        """Build Charts tab."""
+        """Build Charts tab: one stock's price chart, or the 3D market map of the whole scan."""
         T = THEME
         tab = tk.Frame(self.nb, bg=T['bg'])
         self.nb.add(tab, text="  Charts  ")
-        
-        header = tk.Frame(tab, bg=T['bg2'], height=50)
+        self.charts_tab = tab
+
+        header = tk.Frame(tab, bg=T['bg2'], height=54)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
-        
-        tk.Label(header, text="Stock Charts", bg=T['bg2'], fg=T['gold'],
-                font=('Segoe UI', 14, 'bold')).pack(side=tk.LEFT, padx=15)
-        
+        tk.Frame(tab, bg=T['line'], height=1).pack(fill=tk.X)
+
+        tk.Label(header, text="Stock charts", bg=T['bg2'], fg=T['fg'],
+                 font=(ui.DISPLAY, 14, 'bold')).pack(side=tk.LEFT, padx=16)
+
+        map_btn = self.btn(header, "3D market map", None, self.show_market_map)
+        map_btn.pack(side=tk.RIGHT, padx=(6, 16))
+        Tooltip(map_btn, "Every scanned stock in 3D: score, RSI and strength against the Nifty")
+        self.btn(header, "Show chart", T['accent'], self.show_stock_chart).pack(side=tk.RIGHT, padx=6)
+
         self.chart_period_var = tk.StringVar(value="6mo")
+        periods = tk.Frame(header, bg=T['bg2'])
+        periods.pack(side=tk.RIGHT, padx=12)
+        tk.Label(periods, text="Period", bg=T['bg2'], fg=T['fg2'], font=(ui.FONT, 10)).pack(side=tk.LEFT, padx=(0, 6))
         for label, val in [("1M", "1mo"), ("3M", "3mo"), ("6M", "6mo"), ("1Y", "1y"), ("2Y", "2y")]:
-            tk.Radiobutton(header, text=label, variable=self.chart_period_var, value=val,
-                          bg=T['bg2'], fg=T['fg'], selectcolor=T['bg3'],
-                          font=('Segoe UI', 9)).pack(side=tk.RIGHT, padx=3)
-        
-        tk.Label(header, text="Period:", bg=T['bg2'], fg=T['fg'],
-                font=('Segoe UI', 10)).pack(side=tk.RIGHT, padx=5)
-        
-        self.btn(header, "Show Chart", T['accent'], self.show_stock_chart).pack(side=tk.RIGHT, padx=10)
-        
+            tk.Radiobutton(periods, text=label, variable=self.chart_period_var, value=val, indicatoron=0,
+                           bg=T['bg3'], fg=T['fg'], selectcolor=T['sel_bg'], activebackground=T['line'],
+                           activeforeground=T['fg'], relief=tk.FLAT, bd=0, padx=10, pady=4, cursor='hand2',
+                           font=(ui.FONT, 9, 'bold'), offrelief=tk.FLAT).pack(side=tk.LEFT, padx=1)
+
         self.chart_frame = tk.Frame(tab, bg=T['bg'])
-        self.chart_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
+        self.chart_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        self._chart_state = None
+
         if not MATPLOTLIB_OK:
             tk.Label(self.chart_frame, text="Install matplotlib for charts:\npip install matplotlib",
-                    bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 14)).pack(pady=50)
+                     bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 14)).pack(pady=50)
         else:
-            tk.Label(self.chart_frame, text="Select a stock and click 'Show Chart'",
-                    bg=T['bg'], fg=T['accent'], font=('Segoe UI', 14, 'bold')).pack(pady=50)
-    
+            tk.Label(self.chart_frame, text="Pick a stock in Scan Results or the Watchlist, then click Show chart.\n"
+                                            "The 3D market map shows every scanned stock at once.",
+                     bg=T['bg'], fg=T['fg2'], font=(ui.FONT, 12), justify=tk.CENTER).pack(pady=60)
+
+    def _clear_chart(self):
+        for widget in self.chart_frame.winfo_children():
+            widget.destroy()
+
     def show_stock_chart(self):
         """Show stock chart."""
         if not MATPLOTLIB_OK:
             messagebox.showerror("Error", "Install matplotlib: pip install matplotlib")
             return
-        
+
         sel = self.tree.selection()
         if not sel:
             wl_sel = self.wl_list.curselection()
@@ -1852,12 +1580,10 @@ class App:
             symbol = str(self.tree.item(sel[0])['values'][0])
 
         period = self.chart_period_var.get()
-
-        for widget in self.chart_frame.winfo_children():
-            widget.destroy()
+        self._clear_chart()
 
         loading = tk.Label(self.chart_frame, text=f"Loading {symbol}...",
-                bg=THEME['bg'], fg=THEME['fg'], font=('Segoe UI', 12))
+                           bg=THEME['bg'], fg=THEME['fg2'], font=(ui.FONT, 12))
         loading.pack(pady=20)
         self.root.update()
 
@@ -1870,7 +1596,8 @@ class App:
                 self.gui.schedule(fail, str(e))
 
         def fail(msg):
-            loading.configure(text=msg, fg=THEME['danger'])
+            if loading.winfo_exists():
+                loading.configure(text=msg, fg=THEME['danger2'])
             messagebox.showerror("Error", msg)
 
         def render(df):
@@ -1878,71 +1605,274 @@ class App:
                 if df is None or df.empty:
                     fail(f"No data for {symbol}")
                     return
-
-                loading.destroy()
-                fig = Figure(figsize=(14, 8), dpi=100, facecolor='#0a0e1a')
-                
-                ax1 = fig.add_subplot(211)
-                ax1.set_facecolor('#162033')
-                ax1.plot(df.index, df['Close'], color='#00d4ff', linewidth=1.5, label='Close')
-                
-                if len(df) >= 20:
-                    ax1.plot(df.index, df['Close'].rolling(20).mean(), color='#fbbf24', linewidth=1, label='SMA 20')
-                if len(df) >= 50:
-                    ax1.plot(df.index, df['Close'].rolling(50).mean(), color='#ff6b6b', linewidth=1, label='SMA 50')
-                
-                ax1.set_title(f'{symbol} ({period})', color='#fbbf24', fontsize=14)
-                ax1.legend(fontsize=8)
-                ax1.grid(True, alpha=0.3)
-                ax1.tick_params(colors='#8892b0')
-                
-                ax2 = fig.add_subplot(212, sharex=ax1)
-                ax2.set_facecolor('#162033')
-                colors_v = ['#00b894' if df['Close'].iloc[i] >= df['Open'].iloc[i] else '#ff6b6b' for i in range(len(df))]
-                ax2.bar(df.index, df['Volume'], color=colors_v, alpha=0.7)
-                ax2.set_ylabel('Volume', color='#8892b0')
-                ax2.grid(True, alpha=0.3)
-                ax2.tick_params(colors='#8892b0')
-                
-                fig.tight_layout()
-                
-                canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
-                canvas.draw()
-                canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+                if loading.winfo_exists():
+                    loading.destroy()
+                self._render_stock_chart(symbol, period, df)
             except Exception as e:
                 fail(str(e))
 
         threading.Thread(target=fetch, daemon=True).start()
-    
+
+    def _render_stock_chart(self, symbol, period, df, animate=True):
+        """Price with its 20- and 50-day averages over volume. The lines draw themselves in."""
+        T = THEME
+        self._clear_chart()
+        self._chart_state = ('stock', symbol, period, df)
+        fig = Figure(figsize=(14, 8), dpi=100, facecolor=T['card'], layout='constrained')
+        gs = fig.add_gridspec(2, 1, height_ratios=(3, 1.3))
+
+        ax1 = fig.add_subplot(gs[0])
+        self._style_axes(ax1)
+        # A new listing comes with 1-hour candles (its whole history, whatever the period).
+        # They are drawn one after another, without gaps for the nights and weekends.
+        hourly = MARKET_DATA_OK and market_data.is_hourly(df)
+        x = np.arange(len(df)) if hourly else df.index
+        close = df['Close']
+        series = [(close, ax1.plot(x, close, color=T['series0'], linewidth=2, label='Close')[0])]
+        if len(df) >= 20:
+            sma = close.rolling(20).mean()
+            series.append((sma, ax1.plot(x, sma, color=T['series1'], linewidth=1.2, label='SMA 20')[0]))
+        if len(df) >= 50:
+            sma = close.rolling(50).mean()
+            series.append((sma, ax1.plot(x, sma, color=T['series2'], linewidth=1.2, label='SMA 50')[0]))
+        floor = float(close.min()) * 0.98
+        area = [ax1.fill_between(x, close, floor, color=T['series0'], alpha=0.12, linewidth=0)]
+
+        ax1.set_title(f'{symbol} (new listing - 1-hour candles)' if hourly else f'{symbol} ({period})',
+                      color=T['fg'], fontsize=13, loc='left', fontweight='bold')
+        ax1.legend(fontsize=8, frameon=False, labelcolor=T['chart_fg'], loc='upper left')
+        ax1.set_ylim(floor, float(close.max()) * 1.02)
+
+        ax1.tick_params(labelbottom=False)
+        ax2 = fig.add_subplot(gs[1], sharex=ax1)
+        self._style_axes(ax2)
+        ax2.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(
+            lambda v, _: f"{v / 1e7:.1f} Cr" if v >= 1e7 else f"{v / 1e5:.0f} L" if v >= 1e5 else f"{v:,.0f}"))
+        up = (df['Close'] >= df['Open']).tolist()
+        ax2.bar(x, df['Volume'], color=[T['buy'] if u else T['sell'] for u in up], alpha=0.95)
+        ax2.set_ylabel('Volume', color=T['chart_fg'])
+        if hourly:   # label each day at its first candle
+            starts = [i for i in range(len(df)) if i == 0 or df.index[i].date() != df.index[i - 1].date()]
+            ax2.set_xticks(starts)
+            ax2.set_xticklabels([df.index[i].strftime('%d %b') for i in starts])
+
+        canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
+        canvas.draw()
+        widget = canvas.get_tk_widget()
+        widget.configure(highlightthickness=1, highlightbackground=T['line'])
+        widget.pack(fill=tk.BOTH, expand=True)
+
+        if not animate or not ui.Motion.enabled or len(df) < 3:
+            return
+        ax1.set_xlim(ax1.get_xlim())
+
+        def step(v):
+            n = max(2, int(len(df) * v))
+            for data, line in series:
+                line.set_data(x[:n], data.iloc[:n])
+            area[0].remove()
+            area[0] = ax1.fill_between(x[:n], close.iloc[:n], floor, color=T['series0'], alpha=0.12, linewidth=0)
+            canvas.draw()
+        ui.tween(widget, 900, step, frame=30)
+
+    def show_market_map(self):
+        """3D market map: every scanned stock as a point - score up, RSI across, strength
+        against the Nifty 50 (3 months) into the screen. It turns slowly until you click it;
+        drag to turn it yourself."""
+        if not MATPLOTLIB_OK:
+            messagebox.showerror("Error", "Install matplotlib: pip install matplotlib")
+            return
+        results = [r for r in getattr(self, '_all_results', self.results) if r.get('score') is not None]
+        if not results:
+            messagebox.showinfo("Info", "Scan stocks first (F5) - the map shows the scan results.")
+            return
+        T = THEME
+        self._clear_chart()
+        self._chart_state = ('map',)
+        self.nb.select(self.charts_tab)
+
+        fig = Figure(figsize=(13, 7.6), dpi=100, facecolor=T['card'])
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_facecolor(T['card'])
+        pane = matplotlib.colors.to_rgba(T['bg3'], 0.6)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.set_pane_color(pane)
+            axis.label.set_color(T['chart_fg'])
+            try:
+                axis._axinfo['grid'].update(color=T['chart_grid'], linewidth=0.6)
+                axis.line.set_color(T['line'])
+            except Exception:
+                pass
+        ax.tick_params(colors=T['chart_fg'], labelsize=8)
+
+        def rs3(r):
+            v = (r.get('rs') or {}).get('3M')
+            return v if v is not None else 0.0
+        markers = {'STRONG BUY': '^', 'BUY': '^', 'HOLD': 's', 'SELL': 'v', 'STRONG SELL': 'v'}
+        for rec, label in (('STRONG BUY', 'Strong buy'), ('BUY', 'Buy'), ('HOLD', 'Hold'), ('SELL', 'Sell'), ('STRONG SELL', 'Strong sell')):
+            pts = [r for r in results if r['rec'] == rec]
+            if not pts:
+                continue
+            xs, ys, zs = [r['rsi'] for r in pts], [rs3(r) for r in pts], [r['score'] for r in pts]
+            c = ui.signal_color(T, rec)
+            for x, y, z in zip(xs, ys, zs):      # a thin stem down to the floor helps judge height
+                ax.plot([x, x], [y, y], [0, z], color=c, linewidth=0.9, alpha=0.55)
+            ax.scatter(xs, ys, zs, color=c, marker=markers[rec], s=80 if 'STRONG' in rec else 50,
+                       edgecolors=T['card'], linewidths=0.8, depthshade=True, label=f"{label} ({len(pts)})")
+        ranked = sorted(results, key=lambda r: r['score'])
+        for r in ranked[-4:] + ranked[:2]:      # the best and the weakest, named
+            ax.text(r['rsi'], rs3(r), r['score'] + 3, r['symbol'], fontsize=8, color=T['fg'], ha='center')
+        ax.set_xlabel('RSI', labelpad=8)
+        ax.set_ylabel('vs Nifty 50, 3 months (%)', labelpad=8)
+        ax.set_zlabel('Score', labelpad=6)
+        ax.set_xlim(0, 100)
+        ax.set_zlim(0, 100)
+        ax.set_box_aspect((1.5, 1.1, 0.9), zoom=1.15)
+        fig.legend(loc='upper left', bbox_to_anchor=(0.012, 0.9), frameon=False, labelcolor=T['chart_fg'], fontsize=9)
+        fig.text(0.015, 0.95, f"3D market map: {len(results)} stocks", color=T['fg'], fontsize=13, fontweight='bold', va='center')
+        fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+
+        canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
+        widget = canvas.get_tk_widget()
+        widget.configure(highlightthickness=1, highlightbackground=T['line'])
+        widget.pack(fill=tk.BOTH, expand=True)
+        tk.Label(self.chart_frame, text="Higher = better score. Right = higher RSI. Further back = beating the Nifty 50 over 3 months. "
+                                        "The map turns by itself - click it to stop, drag to turn it.",
+                 bg=T['bg'], fg=T['fg2'], font=(ui.FONT, 9)).pack(anchor=tk.W, pady=(6, 0))
+
+        state = {'elev': 8, 'azim': -70, 'stop': False}
+        ax.view_init(elev=state['elev'], azim=state['azim'])
+        canvas.draw()
+        canvas.mpl_connect('button_press_event', lambda e: state.update(stop=True))
+
+        def fly_in(v):      # the camera rises over the map once...
+            state['elev'] = 8 + 16 * v
+            ax.view_init(elev=state['elev'], azim=state['azim'])
+            canvas.draw()
+        ui.tween(widget, 1200, fly_in, done=lambda: self._spin_map(canvas, ax, state), ease=ui.ease_in_out, frame=30)
+
+    def _spin_map(self, canvas, ax, state):
+        """...then turns slowly while the Charts tab is open, until the map is clicked."""
+        widget = canvas.get_tk_widget()
+        try:
+            if state['stop'] or not widget.winfo_exists() or not ui.Motion.enabled:
+                return
+            if self.nb.select() == str(self.charts_tab):
+                state['azim'] += 0.8
+                ax.view_init(elev=state['elev'], azim=state['azim'])
+                canvas.draw()       # draw now, then wait: the next turn is queued only after this frame is done
+            widget.after(60, lambda: self._spin_map(canvas, ax, state))
+        except tk.TclError:
+            pass
+
     def build_sector_tab(self):
         """Build Sector Analysis tab."""
         T = THEME
         tab = tk.Frame(self.nb, bg=T['bg'])
         self.nb.add(tab, text="  Sector  ")
-        
-        header = tk.Frame(tab, bg=T['bg2'], height=50)
+
+        header = tk.Frame(tab, bg=T['bg2'], height=54)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
-        
-        tk.Label(header, text="Sector Analysis", bg=T['bg2'], fg=T['gold'],
-                font=('Segoe UI', 14, 'bold')).pack(side=tk.LEFT, padx=15)
-        self.btn(header, "Analyze", T['accent'], self.analyze_sectors).pack(side=tk.RIGHT, padx=10)
-        
-        cols = ('Sector', 'Stocks', 'Avg Score', 'Buy', 'Hold', 'Sell', 'Best', 'Rotation', 'Rank')
-        self.sector_tree = ttk.Treeview(tab, columns=cols, show='headings', height=15)
-        
-        widths = {'Sector': 170, 'Stocks': 60, 'Avg Score': 80, 'Buy': 50, 'Hold': 50,
+        tk.Frame(tab, bg=T['line'], height=1).pack(fill=tk.X)
+
+        tk.Label(header, text="Sector analysis", bg=T['bg2'], fg=T['fg'],
+                 font=(ui.DISPLAY, 14, 'bold')).pack(side=tk.LEFT, padx=16)
+        self.btn(header, "Analyze", T['accent'], self.analyze_sectors).pack(side=tk.RIGHT, padx=16)
+
+        cols = ('Sector', 'Stocks', 'Avg Score', 'Chg', 'Buy', 'Hold', 'Sell', 'Best', 'Rotation', 'Rank')
+        body = tk.Frame(tab, bg=T['bg'])
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        left = tk.Frame(body, bg=T['bg'])
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.sector_3d_frame = tk.Frame(body, bg=T['bg'], width=560)
+        self.sector_3d_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+        self.sector_3d_frame.pack_propagate(False)
+        self.sector_tree = ttk.Treeview(left, columns=cols, show='headings', height=12)
+
+        widths = {'Sector': 170, 'Stocks': 60, 'Avg Score': 80, 'Chg': 70, 'Buy': 50, 'Hold': 50,
                   'Sell': 50, 'Best': 90, 'Rotation': 110, 'Rank': 50}
         for col in cols:
             self.sector_tree.heading(col, text=col, anchor=tk.CENTER)
             self.sector_tree.column(col, width=widths.get(col, 90), anchor=tk.CENTER)
-        
-        self.sector_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        self.sector_status = tk.Label(tab, text="Click 'Analyze' after scanning stocks",
-                                     bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 10))
-        self.sector_status.pack(pady=5)
-    
+
+        self.sector_status = tk.Label(left, text="Click 'Analyze' after scanning stocks", bg=T['bg'], fg=T['fg3'],
+                                      font=(ui.FONT, 10), wraplength=760, justify=tk.LEFT)
+        self.sector_status.pack(side=tk.BOTTOM, anchor=tk.W, pady=(8, 0))
+        self.sector_tree.pack(fill=tk.BOTH, expand=True)
+        tk.Label(self.sector_3d_frame, text="After Analyze, a 3D chart here shows how many stocks in each\n"
+                                            "sector are buy, hold and sell.", bg=T['bg'], fg=T['fg3'],
+                 font=(ui.FONT, 10), justify=tk.LEFT).pack(anchor=tk.W, pady=40, padx=8)
+        self._sector_last = None
+
+    def _draw_sector_3d(self, sector_scores):
+        """3D bars: for each sector, how many of its stocks are buy, hold and sell. The bars
+        grow up from the floor and the camera swings round once."""
+        if not MATPLOTLIB_OK or not sector_scores:
+            return
+        T = THEME
+        for w in self.sector_3d_frame.winfo_children():
+            w.destroy()
+        rows = sector_scores[:10]
+        counts = []
+        for i, (sector, avg, stocks) in enumerate(rows):
+            buy = sum(1 for s in stocks if s['rec'] in ('STRONG BUY', 'BUY'))
+            hold = sum(1 for s in stocks if s['rec'] == 'HOLD')
+            sell = sum(1 for s in stocks if s['rec'] in ('SELL', 'STRONG SELL'))
+            counts += [(i, 0, buy, T['buy']), (i, 1, hold, T['hold']), (i, 2, sell, T['sell'])]
+        top = max([c for _, _, c, _ in counts] + [1])
+
+        fig = Figure(figsize=(5.6, 5), dpi=100, facecolor=T['card'])
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_facecolor(T['card'])
+        pane = matplotlib.colors.to_rgba(T['bg3'], 0.6)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.set_pane_color(pane)
+            try:
+                axis._axinfo['grid'].update(color=T['chart_grid'], linewidth=0.6)
+                axis.line.set_color(T['line'])
+            except Exception:
+                pass
+        ax.tick_params(colors=T['chart_fg'], labelsize=7)
+        ax.set_xticks([i + 0.3 for i in range(len(rows))])
+        ax.set_xticklabels([f"#{i + 1}" for i in range(len(rows))])     # the table's Rank column
+        ax.set_yticks([0.3, 1.3, 2.3])
+        ax.set_yticklabels(['Buy', 'Hold', 'Sell'])
+        ax.set_zlabel('Stocks', color=T['chart_fg'], fontsize=8)
+        ax.set_xlim(-0.4, len(rows))
+        ax.set_ylim(-0.4, 3)
+        ax.set_zlim(0, top * 1.1)
+        ax.zaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+        ax.set_xlabel('Sector rank', color=T['chart_fg'], fontsize=8)
+        ax.set_box_aspect((1.6, 1, 0.8), zoom=1.1)
+        fig.text(0.03, 0.96, "Stocks per sector: buy, hold, sell", color=T['fg'], fontsize=11, fontweight='bold', va='center')
+        fig.text(0.03, 0.915, "Bars follow the table's Rank column (#1 = strongest)", color=T['chart_fg'], fontsize=8, va='center')
+        fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        bars = []
+
+        def draw_bars(v):
+            for b in bars:
+                b.remove()
+            bars.clear()
+            for x, y, c, col in counts:
+                if c:
+                    bars.append(ax.bar3d(x, y, 0, 0.6, 0.6, max(c * v, 0.001), color=col, shade=True,
+                                         edgecolor=T['card'], linewidth=0.3))
+
+        canvas = FigureCanvasTkAgg(fig, master=self.sector_3d_frame)
+        widget = canvas.get_tk_widget()
+        widget.configure(highlightthickness=1, highlightbackground=T['line'])
+        widget.pack(fill=tk.BOTH, expand=True)
+        ax.view_init(elev=24, azim=-80)
+        draw_bars(0 if ui.Motion.enabled else 1)
+        canvas.draw()
+
+        def step(v):
+            draw_bars(v)
+            ax.view_init(elev=24, azim=-80 + 22 * v)
+            canvas.draw()
+        ui.tween(widget, 1300, step, ease=ui.ease_in_out, frame=30)
+
     def analyze_sectors(self):
         """Analyze sectors with rotation signals."""
         if not self.results:
@@ -1961,12 +1891,26 @@ class App:
                     sectors = market_data.get_sectors([r['symbol'] for r in results])
                 except Exception as e:
                     logger.error(f"Sector lookup failed: {e}")
-            self.gui.schedule(self._show_sectors, results, sectors)
+            # Each stock's score from about a week ago (or, while the score history is shorter
+            # than that, from its previous scan day) - to see which sectors are rising or falling
+            earlier = {}
+            if HISTORY_OK:
+                try:
+                    symbols = [r['symbol'] for r in results]
+                    week_ago = (datetime.now() - timedelta(days=ROTATION_DAYS - 1)).strftime('%Y-%m-%d')
+                    earlier = score_history.previous(symbols, before_day=week_ago)
+                    for symbol, row in score_history.previous(symbols).items():
+                        earlier.setdefault(symbol, row)
+                except Exception as e:
+                    logger.error(f"Score history read failed: {e}")
+            self.gui.schedule(self._show_sectors, results, sectors, earlier)
         threading.Thread(target=work, daemon=True).start()
-    
-    def _show_sectors(self, results, yahoo_sectors):
+
+    def _show_sectors(self, results, yahoo_sectors, earlier=None):
         """Fill the Sector tab. Sector = Yahoo Finance's sector; if Yahoo has none, the built-in
-        list; otherwise 'Other'. (The built-in list alone only knew ~90 large caps.)"""
+        list; otherwise 'Other'. (The built-in list alone only knew ~90 large caps.)
+        `earlier`: {symbol: score-history row} to measure each sector's change against."""
+        earlier = earlier or {}
         self._sector_busy = False
         for item in self.sector_tree.get_children():
             self.sector_tree.delete(item)
@@ -1985,33 +1929,43 @@ class App:
         sector_scores.sort(key=lambda x: x[1], reverse=True)
         
         spread = sector_scores[0][1] - sector_scores[-1][1] if len(sector_scores) >= 2 else 0
-        
+        benchmark = sum(r['score'] for r in results) / len(results)   # the whole watchlist's average
+        since = set()
+
         for rank, (sector, avg, stocks) in enumerate(sector_scores):
             n = len(stocks)
             buy = sum(1 for s in stocks if s['rec'] in ['STRONG BUY', 'BUY'])
             hold = sum(1 for s in stocks if s['rec'] == 'HOLD')
             sell = sum(1 for s in stocks if s['rec'] in ['SELL', 'STRONG SELL'])
             srt = sorted(stocks, key=lambda x: x['score'], reverse=True)
-            
-            if avg >= 65:
-                rotation = "LEADING"
-            elif avg >= 50:
-                rotation = "IMPROVING"
-            elif avg >= 40:
-                rotation = "WEAKENING"
-            else:
-                rotation = "LAGGING"
-            
+
+            # Change: the same stocks' scores now against their earlier scan
+            moves = []
+            for s in stocks:
+                row = earlier.get(s['symbol'])
+                if row and safe_float(row.get('score'), None) is not None:
+                    moves.append(s['score'] - safe_float(row['score']))
+                    since.add(row['date'])
+            change = sum(moves) / len(moves) if moves else None
+
             self.sector_tree.insert('', tk.END, values=(
-                sector, n, f"{avg:.1f}", buy, hold, sell,
+                sector, n, f"{avg:.1f}", "n/a" if change is None else f"{change:+.1f}", buy, hold, sell,
                 srt[0]['symbol'] if srt else 'N/A',
-                rotation, f"#{rank+1}"
+                sector_rotation(avg, change, benchmark), f"#{rank+1}"
             ))
-        
+
+        self._sector_last = (results, yahoo_sectors, earlier)
+        self._draw_sector_3d(sector_scores)
         if sector_scores:
+            if since:
+                when = min(since) if len(since) == 1 else f"{min(since)} to {max(since)}"
+                compared = f"Chg = change in average score since the scan of {when}"
+            else:
+                compared = "Chg needs a scan from an earlier day - until then, rotation shows strength only"
             self.sector_status.configure(
                 text=f"Strongest: {sector_scores[0][0]} ({sector_scores[0][1]:.1f}) | "
-                     f"Weakest: {sector_scores[-1][0]} ({sector_scores[-1][1]:.1f}) | Spread: {spread:.1f} pts")
+                     f"Weakest: {sector_scores[-1][0]} ({sector_scores[-1][1]:.1f}) | Spread: {spread:.1f} pts | "
+                     f"Watchlist average: {benchmark:.1f} | {compared}")
         else:
             self.sector_status.configure(text="No sector information found for the scanned stocks.")
     
@@ -2024,8 +1978,8 @@ class App:
         header = tk.Frame(tab, bg=T['bg2'], height=50)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
-        tk.Label(header, text="Strategy Backtest", bg=T['bg2'], fg=T['gold'],
-                 font=('Segoe UI', 14, 'bold')).pack(side=tk.LEFT, padx=15)
+        tk.Label(header, text="Strategy backtest", bg=T['bg2'], fg=T['fg'],
+                 font=(ui.DISPLAY, 14, 'bold')).pack(side=tk.LEFT, padx=16)
 
         self.bt_apply_btn = self.btn(header, "Apply Suggested Weights", T['success'], self.apply_suggested_weights)
         self.bt_apply_btn.pack(side=tk.RIGHT, padx=10)
@@ -2036,30 +1990,30 @@ class App:
         self.bt_horizon_var = tk.StringVar(value="10 days")
         ttk.Combobox(header, textvariable=self.bt_horizon_var, values=["5 days", "10 days", "20 days"],
                      state='readonly', width=8).pack(side=tk.RIGHT, padx=5)
-        tk.Label(header, text="Hold for:", bg=T['bg2'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.RIGHT)
+        tk.Label(header, text="Hold for:", bg=T['bg2'], fg=T['fg'], font=(ui.FONT, 10)).pack(side=tk.RIGHT)
         self.bt_history_var = tk.StringVar(value="5 years")
         ttk.Combobox(header, textvariable=self.bt_history_var, values=["2 years", "3 years", "5 years"],
                      state='readonly', width=8).pack(side=tk.RIGHT, padx=(5, 15))
-        tk.Label(header, text="History:", bg=T['bg2'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.RIGHT)
+        tk.Label(header, text="History:", bg=T['bg2'], fg=T['fg'], font=(ui.FONT, 10)).pack(side=tk.RIGHT)
         self.bt_liquid_var = tk.BooleanVar(value=False)
         self.bt_liquid_cb = tk.Checkbutton(header, variable=self.bt_liquid_var,
                                            text=f"Liquid stocks only (>= Rs {self.min_liquidity_cr:g} Cr/day)",
                                            bg=T['bg2'], fg=T['fg'], selectcolor=T['bg3'], activebackground=T['bg2'],
-                                           font=('Segoe UI', 9))
+                                           font=(ui.FONT, 9))
         self.bt_liquid_cb.pack(side=tk.RIGHT, padx=10)
 
         weights_row = tk.Frame(tab, bg=T['bg'])
         weights_row.pack(fill=tk.X, padx=10, pady=(8, 0))
         self.btn(weights_row, "Re-check Weights", T['bg3'], self.recheck_weights).pack(side=tk.RIGHT, padx=5)
-        self.bt_weights_lbl = tk.Label(weights_row, text="", bg=T['bg'], fg=T['fg'], font=('Segoe UI', 10, 'bold'),
+        self.bt_weights_lbl = tk.Label(weights_row, text="", bg=T['bg'], fg=T['fg'], font=(ui.FONT, 10, 'bold'),
                                        wraplength=1150, justify=tk.LEFT)
         self.bt_weights_lbl.pack(side=tk.LEFT, anchor=tk.W, padx=5)
 
         self.bt_status = tk.Label(tab, text="Tests the scoring system on your watchlist's past prices: for every past day it "
                                             "scores each stock exactly like a scan would, then checks what the price did next.",
-                                  bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 10), wraplength=1300, justify=tk.LEFT)
+                                  bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 10), wraplength=1300, justify=tk.LEFT)
         self.bt_status.pack(anchor=tk.W, padx=15, pady=(8, 2))
-        self.bt_summary = tk.Label(tab, text="", bg=T['bg'], fg=T['fg'], font=('Segoe UI', 11, 'bold'),
+        self.bt_summary = tk.Label(tab, text="", bg=T['bg'], fg=T['fg'], font=(ui.FONT, 11, 'bold'),
                                    wraplength=1300, justify=tk.LEFT)
         self.bt_summary.pack(anchor=tk.W, padx=15, pady=(2, 6))
 
@@ -2068,7 +2022,7 @@ class App:
 
         # Left: performance by recommendation
         left = tk.LabelFrame(tables, text=" What happened after each signal (newer 40% of history) ", bg=T['bg'],
-                             fg=T['accent'], font=('Segoe UI', 10, 'bold'))
+                             fg=T['accent'], font=(ui.FONT, 10, 'bold'))
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
         cols = ('Weights', 'Signal', 'Times', 'Avg Return', 'Win Rate', 'vs Avg')
         self.bt_bucket_tree = ttk.Treeview(left, columns=cols, show='headings', height=11)
@@ -2076,12 +2030,12 @@ class App:
             self.bt_bucket_tree.heading(c, text=c, anchor=tk.CENTER)
             self.bt_bucket_tree.column(c, width=w, anchor=tk.CENTER)
         self.bt_bucket_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.bt_bucket_tree.tag_configure('good', foreground='#34d399')
-        self.bt_bucket_tree.tag_configure('bad', foreground='#f87171')
+        self.bt_bucket_tree.tag_configure('good', foreground=T['success'])
+        self.bt_bucket_tree.tag_configure('bad', foreground=T['danger2'])
 
         # Right: each indicator's predictive power
         right = tk.LabelFrame(tables, text=" Which indicators actually help ", bg=T['bg'],
-                              fg=T['accent'], font=('Segoe UI', 10, 'bold'))
+                              fg=T['accent'], font=(ui.FONT, 10, 'bold'))
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
         cols = ('Indicator', 'Current Wt', 'Power (older)', 'Power (newer)', 'Suggested Wt', 'Verdict')
         self.bt_ind_tree = ttk.Treeview(right, columns=cols, show='headings', height=11)
@@ -2089,15 +2043,15 @@ class App:
             self.bt_ind_tree.heading(c, text=c, anchor=tk.CENTER)
             self.bt_ind_tree.column(c, width=w, anchor=tk.CENTER)
         self.bt_ind_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.bt_ind_tree.tag_configure('good', foreground='#34d399')
-        self.bt_ind_tree.tag_configure('bad', foreground='#f87171')
+        self.bt_ind_tree.tag_configure('good', foreground=T['success'])
+        self.bt_ind_tree.tag_configure('bad', foreground=T['danger2'])
 
         tk.Label(tab, text="Power = rank correlation between the indicator's score and the next-period return "
                            "(above 0 = higher score was followed by better returns; 0.03+ is meaningful for daily stock data).  "
                            "Suggested weights are learned on the OLDER 60% of history and judged on the NEWER 40%, "
                            "so the comparison is honest. Past results don't guarantee future returns; daily signals overlap, "
                            "and delisted stocks aren't included.",
-                 bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 8), wraplength=1300, justify=tk.LEFT).pack(anchor=tk.W, padx=15, pady=6)
+                 bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 8), wraplength=1300, justify=tk.LEFT).pack(side=tk.BOTTOM, anchor=tk.W, padx=15, pady=6, before=tables)
 
         self._bt_result = None
         self._bt_cache = None   # (key, samples, skipped) - reused when only the holding period changes
@@ -2255,7 +2209,8 @@ class App:
         sb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
         content = tk.Frame(canvas, bg=T['bg'])
         content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=content, anchor="nw")
+        win = canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
@@ -2265,12 +2220,37 @@ class App:
         header = tk.Frame(content, bg=T['bg2'], height=50)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
-        tk.Label(header, text="Settings & Configuration", bg=T['bg2'], fg=T['gold'],
-                font=('Segoe UI', 14, 'bold')).pack(side=tk.LEFT, padx=15)
+        tk.Label(header, text="Settings", bg=T['bg2'], fg=T['fg'],
+                 font=(ui.DISPLAY, 14, 'bold')).pack(side=tk.LEFT, padx=16)
         
+        # ===== APPEARANCE =====
+        look = tk.LabelFrame(content, text=" Appearance ", bg=T['bg'], fg=T['accent'], font=(ui.FONT, 11, 'bold'))
+        look.pack(fill=tk.X, padx=20, pady=(14, 10))
+        mode_row = tk.Frame(look, bg=T['bg'])
+        mode_row.pack(fill=tk.X, padx=10, pady=(8, 4))
+        tk.Label(mode_row, text="Colours", bg=T['bg'], fg=T['fg'], font=(ui.FONT, 10), width=18, anchor=tk.W).pack(side=tk.LEFT)
+        self.light_btn = self.btn(mode_row, "Light", None, lambda: self.apply_appearance('light'),
+                                  kind='primary' if T['mode'] == 'light' else 'secondary')
+        self.light_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.dark_btn = self.btn(mode_row, "Dark", None, lambda: self.apply_appearance('dark'),
+                                 kind='primary' if T['mode'] == 'dark' else 'secondary')
+        self.dark_btn.pack(side=tk.LEFT, padx=4)
+        tk.Label(mode_row, text="Light is the Daylight design; Dark is easier on the eyes at night.",
+                 bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 9)).pack(side=tk.LEFT, padx=12)
+        self.animations_var = tk.BooleanVar(value=ui.Motion.enabled)
+        anim_row = tk.Frame(look, bg=T['bg'])
+        anim_row.pack(fill=tk.X, padx=10, pady=(4, 10))
+        tk.Label(anim_row, text="Motion", bg=T['bg'], fg=T['fg'], font=(ui.FONT, 10), width=18, anchor=tk.W).pack(side=tk.LEFT)
+        tk.Checkbutton(anim_row, text="Animations (buttons, counters, charts that draw in, the turning 3D map)",
+                       variable=self.animations_var, command=self.toggle_animations,
+                       bg=T['bg'], fg=T['fg'], font=(ui.FONT, 10)).pack(side=tk.LEFT)
+        if not ui.windows_allows_animation():
+            tk.Label(look, text="Windows' own 'Animation effects' setting is off, so the app stays still too.",
+                     bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 9)).pack(anchor=tk.W, padx=10, pady=(0, 8))
+
         # ===== EMAIL CONFIGURATION =====
         email_frame = tk.LabelFrame(content, text=" Email Report Configuration ", 
-                                    bg=T['bg'], fg=T['accent'], font=('Segoe UI', 11, 'bold'))
+                                    bg=T['bg'], fg=T['accent'], font=(ui.FONT, 11, 'bold'))
         email_frame.pack(fill=tk.X, padx=20, pady=10)
         
         self.email_vars = {}
@@ -2287,14 +2267,14 @@ class App:
             row.pack(fill=tk.X, padx=10, pady=3)
             
             tk.Label(row, text=label, bg=T['bg'], fg=T['fg'],
-                    font=('Segoe UI', 10), width=18, anchor=tk.W).pack(side=tk.LEFT)
+                    font=(ui.FONT, 10), width=18, anchor=tk.W).pack(side=tk.LEFT)
             
             var = tk.StringVar(value=default)
             self.email_vars[key] = var
             
             show = '*' if 'password' in key.lower() else ''
             entry = tk.Entry(row, textvariable=var, bg=T['input'], fg=T['fg'],
-                           font=('Segoe UI', 10), width=40, show=show,
+                           font=(ui.FONT, 10), width=40, show=show,
                            relief=tk.FLAT, highlightbackground=T['border'], highlightthickness=1)
             entry.pack(side=tk.LEFT, padx=5)
             
@@ -2302,7 +2282,7 @@ class App:
             if key == 'sender_password':
                 self.pw_entry = entry
                 self.pw_visible = False
-                self.btn(row, "👁", T['bg3'], self.toggle_password_visibility).pack(side=tk.LEFT, padx=2)
+                self.btn(row, "Show", T['bg3'], self.toggle_password_visibility).pack(side=tk.LEFT, padx=2)
         
         # Load existing config into fields
         self._load_email_config_to_fields()
@@ -2310,8 +2290,8 @@ class App:
         email_btn_frame = tk.Frame(email_frame, bg=T['bg'])
         email_btn_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        self.btn(email_btn_frame, "Save Email Config", T['success'], self.save_email_config).pack(side=tk.LEFT, padx=5)
-        self.btn(email_btn_frame, "Test Email", T['accent'], self.test_email).pack(side=tk.LEFT, padx=5)
+        self.btn(email_btn_frame, "Save Email Config", T['accent'], self.save_email_config).pack(side=tk.LEFT, padx=5)
+        self.btn(email_btn_frame, "Test Email", None, self.test_email).pack(side=tk.LEFT, padx=5)
         self.btn(email_btn_frame, "Send Report Now", T['warning'], self.send_email_report).pack(side=tk.LEFT, padx=5)
         self.btn(email_btn_frame, "Clear Config", T['danger'], self.clear_email_config).pack(side=tk.LEFT, padx=5)
         
@@ -2319,20 +2299,20 @@ class App:
         help_frame = tk.Frame(email_frame, bg=T['bg'])
         help_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        tk.Label(help_frame, text="📧 Gmail Setup Guide:", bg=T['bg'], fg=T['gold'], font=('Segoe UI', 9, 'bold')).pack(anchor=tk.W)
-        tk.Label(help_frame, text="1. Enable 2-Factor Authentication on your Google Account", bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9)).pack(anchor=tk.W, padx=10)
-        tk.Label(help_frame, text="2. Go to: https://myaccount.google.com/apppasswords", bg=T['bg'], fg=T['accent'], font=('Segoe UI', 9)).pack(anchor=tk.W, padx=10)
-        tk.Label(help_frame, text="3. Generate App Password for 'Mail' → Use that 16-char password above", bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9)).pack(anchor=tk.W, padx=10)
-        tk.Label(help_frame, text="4. Port 587 = STARTTLS (recommended) | Port 465 = SSL", bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9)).pack(anchor=tk.W, padx=10)
+        tk.Label(help_frame, text="Gmail setup guide:", bg=T['bg'], fg=T['gold'], font=(ui.FONT, 9, 'bold')).pack(anchor=tk.W)
+        tk.Label(help_frame, text="1. Enable 2-Factor Authentication on your Google Account", bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 9)).pack(anchor=tk.W, padx=10)
+        tk.Label(help_frame, text="2. Go to: https://myaccount.google.com/apppasswords", bg=T['bg'], fg=T['accent'], font=(ui.FONT, 9)).pack(anchor=tk.W, padx=10)
+        tk.Label(help_frame, text="3. Generate App Password for 'Mail' → Use that 16-char password above", bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 9)).pack(anchor=tk.W, padx=10)
+        tk.Label(help_frame, text="4. Port 587 = STARTTLS (recommended) | Port 465 = SSL", bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 9)).pack(anchor=tk.W, padx=10)
         
         # Email status indicator
-        self.email_status_lbl = tk.Label(email_frame, text="", bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9))
+        self.email_status_lbl = tk.Label(email_frame, text="", bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 9))
         self.email_status_lbl.pack(anchor=tk.W, padx=10, pady=5)
         self._update_email_status()
         
         # ===== AUTO REPORT SCHEDULING =====
         schedule_frame = tk.LabelFrame(content, text=" Auto Report Scheduling ", 
-                                       bg=T['bg'], fg=T['accent'], font=('Segoe UI', 11, 'bold'))
+                                       bg=T['bg'], fg=T['accent'], font=(ui.FONT, 11, 'bold'))
         schedule_frame.pack(fill=tk.X, padx=20, pady=10)
         
         sched = self._load_schedule_config()
@@ -2340,31 +2320,31 @@ class App:
         tk.Checkbutton(schedule_frame, text="Enable Auto-Report Email", 
                       variable=self.auto_report_var,
                       bg=T['bg'], fg=T['fg'], selectcolor=T['bg3'],
-                      font=('Segoe UI', 10)).pack(anchor=tk.W, padx=10, pady=5)
+                      font=(ui.FONT, 10)).pack(anchor=tk.W, padx=10, pady=5)
         
         sched_row = tk.Frame(schedule_frame, bg=T['bg'])
         sched_row.pack(fill=tk.X, padx=10, pady=5)
         
         tk.Label(sched_row, text="Send Time:", bg=T['bg'], fg=T['fg'],
-                font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=5)
+                font=(ui.FONT, 10)).pack(side=tk.LEFT, padx=5)
         
         self.report_hour_var = tk.StringVar(value=str(sched['hour']))
         ttk.Combobox(sched_row, textvariable=self.report_hour_var,
                     values=[str(h) for h in range(24)], state='readonly', width=5).pack(side=tk.LEFT)
-        tk.Label(sched_row, text=":", bg=T['bg'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.LEFT)
+        tk.Label(sched_row, text=":", bg=T['bg'], fg=T['fg'], font=(ui.FONT, 10)).pack(side=tk.LEFT)
         
         self.report_min_var = tk.StringVar(value=f"{sched['minute']:02d}")
         ttk.Combobox(sched_row, textvariable=self.report_min_var,
                     values=[f"{m:02d}" for m in range(0, 60, 5)], state='readonly', width=5).pack(side=tk.LEFT)
         
         tk.Label(sched_row, text="(24-hour format)", bg=T['bg'], fg=T['fg3'],
-                font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=10)
+                font=(ui.FONT, 9)).pack(side=tk.LEFT, padx=10)
         
         type_row = tk.Frame(schedule_frame, bg=T['bg'])
         type_row.pack(fill=tk.X, padx=10, pady=5)
         
         tk.Label(type_row, text="Report Type:", bg=T['bg'], fg=T['fg'],
-                font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=5)
+                font=(ui.FONT, 10)).pack(side=tk.LEFT, padx=5)
         
         self.report_type_var = tk.StringVar(value=sched['report_type'])
         ttk.Combobox(type_row, textvariable=self.report_type_var,
@@ -2372,39 +2352,39 @@ class App:
         
         sched_btns = tk.Frame(schedule_frame, bg=T['bg'])
         sched_btns.pack(fill=tk.X, padx=10, pady=(10, 2))
-        self.btn(sched_btns, "Save Schedule", T['success'], self.save_schedule).pack(side=tk.LEFT, padx=(0, 5))
-        self.btn(sched_btns, "Install Windows Task", T['accent'], self.install_windows_task).pack(side=tk.LEFT, padx=5)
+        self.btn(sched_btns, "Save Schedule", T['accent'], self.save_schedule).pack(side=tk.LEFT, padx=(0, 5))
+        self.btn(sched_btns, "Install Windows Task", None, self.install_windows_task).pack(side=tk.LEFT, padx=5)
         self.btn(sched_btns, "Remove Windows Task", T['danger'], self.remove_windows_task).pack(side=tk.LEFT, padx=5)
 
         self.task_status_lbl = tk.Label(schedule_frame, text="Windows task: checking...", bg=T['bg'], fg=T['fg3'],
-                                        font=('Segoe UI', 9))
+                                        font=(ui.FONT, 9))
         self.task_status_lbl.pack(anchor=tk.W, padx=10, pady=(2, 2))
         tk.Label(schedule_frame, text="The Windows task emails the report on NSE trading days even when this app is closed "
                                       "(weekends & NSE holidays are skipped; sent at most once a day).",
-                 bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 8)).pack(anchor=tk.W, padx=10, pady=(0, 10))
+                 bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 8)).pack(anchor=tk.W, padx=10, pady=(0, 10))
         self.root.after(1500, self._update_task_status)
         
         # ===== LIQUIDITY =====
         liq_frame = tk.LabelFrame(content, text=" Liquidity Filter ",
-                                  bg=T['bg'], fg=T['accent'], font=('Segoe UI', 11, 'bold'))
+                                  bg=T['bg'], fg=T['accent'], font=(ui.FONT, 11, 'bold'))
         liq_frame.pack(fill=tk.X, padx=20, pady=10)
         liq_row = tk.Frame(liq_frame, bg=T['bg'])
         liq_row.pack(fill=tk.X, padx=10, pady=8)
         tk.Label(liq_row, text="Flag stocks trading less than Rs", bg=T['bg'], fg=T['fg'],
-                 font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=(5, 5))
+                 font=(ui.FONT, 10)).pack(side=tk.LEFT, padx=(5, 5))
         self.min_liquidity_var = tk.StringVar(value=f"{self.min_liquidity_cr:g}")
         tk.Spinbox(liq_row, from_=0, to=1000, increment=0.5, textvariable=self.min_liquidity_var, width=7,
-                   bg=T['input'], fg=T['fg'], font=('Segoe UI', 10)).pack(side=tk.LEFT)
+                   bg=T['input'], fg=T['fg'], font=(ui.FONT, 10)).pack(side=tk.LEFT)
         tk.Label(liq_row, text="crore per day (average traded value, last 20 days)", bg=T['bg'], fg=T['fg'],
-                 font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=5)
-        self.btn(liq_row, "Save", T['success'], self.save_liquidity_setting).pack(side=tk.LEFT, padx=10)
+                 font=(ui.FONT, 10)).pack(side=tk.LEFT, padx=5)
+        self.btn(liq_row, "Save", T['accent'], self.save_liquidity_setting).pack(side=tk.LEFT, padx=10)
         tk.Label(liq_frame, text="Thinly traded stocks can gap past a stop-loss and orders may not fill, so their "
                                  "targets are shown with a warning and they can be hidden in Scan Results.",
-                 bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 8)).pack(anchor=tk.W, padx=15, pady=(0, 8))
+                 bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 8)).pack(anchor=tk.W, padx=15, pady=(0, 8))
 
         # ===== SCORING WEIGHTS =====
         weights_frame = tk.LabelFrame(content, text=" Scoring Weights (must total 100%) ", 
-                                      bg=T['bg'], fg=T['accent'], font=('Segoe UI', 11, 'bold'))
+                                      bg=T['bg'], fg=T['accent'], font=(ui.FONT, 11, 'bold'))
         weights_frame.pack(fill=tk.X, padx=20, pady=10)
         
         self.weight_vars = {}
@@ -2421,29 +2401,28 @@ class App:
             col_num = (i % 2) * 3
 
             tk.Label(weights_grid, text=f"{name}:", bg=T['bg'], fg=T['fg'],
-                    font=('Segoe UI', 10), width=14, anchor=tk.W).grid(row=row_num, column=col_num, padx=5, pady=4, sticky='w')
+                    font=(ui.FONT, 10), width=14, anchor=tk.W).grid(row=row_num, column=col_num, padx=5, pady=4, sticky='w')
 
             var = tk.IntVar(value=Scorer.WEIGHTS.get(key, default))   # saved weights, if any
             self.weight_vars[key] = var
 
             tk.Spinbox(weights_grid, from_=0, to=100, textvariable=var, width=5,
-                      bg=T['input'], fg=T['fg'], font=('Segoe UI', 10)).grid(row=row_num, column=col_num+1, padx=5, pady=4)
+                      bg=T['input'], fg=T['fg'], font=(ui.FONT, 10)).grid(row=row_num, column=col_num+1, padx=5, pady=4)
 
         weight_btns = tk.Frame(weights_frame, bg=T['bg'])
         weight_btns.pack(fill=tk.X, padx=10, pady=10)
-        self.btn(weight_btns, "Apply Weights", T['success'], self.apply_weights).pack(side=tk.LEFT, padx=(0, 5))
+        self.btn(weight_btns, "Apply Weights", T['accent'], self.apply_weights).pack(side=tk.LEFT, padx=(0, 5))
         self.btn(weight_btns, "Reset Defaults", T['bg3'], self.reset_weights).pack(side=tk.LEFT, padx=5)
         tk.Label(weight_btns, text="Tip: the Backtest tab can suggest weights based on your stocks' history",
-                 bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=10)
+                 bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 9)).pack(side=tk.LEFT, padx=10)
         
         # ===== MODULE STATUS =====
         status_frame = tk.LabelFrame(content, text=" Module Status ", 
-                                    bg=T['bg'], fg=T['accent'], font=('Segoe UI', 11, 'bold'))
+                                    bg=T['bg'], fg=T['accent'], font=(ui.FONT, 11, 'bold'))
         status_frame.pack(fill=tk.X, padx=20, pady=10)
         
         modules = [
             ("Pattern Recognition", PATTERN_OK),
-            ("AI/ML Engine", AI_OK),
             ("Daily Reports", REPORT_OK),
             ("Corporate Actions", True),
             ("Corp Actions Engine (NSE/BSE)", CORP_ENGINE_OK),
@@ -2457,7 +2436,7 @@ class App:
             color = T['success'] if status else T['danger']
             text = "ACTIVE" if status else "NOT INSTALLED"
             tk.Label(status_frame, text=f"{name}: {text}", bg=T['bg'], fg=color,
-                    font=('Segoe UI', 10)).pack(anchor=tk.W, padx=20, pady=3)
+                    font=(ui.FONT, 10)).pack(anchor=tk.W, padx=20, pady=3)
     
     def save_email_config(self):
         """Save email configuration."""
@@ -2852,6 +2831,134 @@ class App:
     def _load_app_settings():
         return load_app_settings()
 
+    def _save_app_setting(self, **values):
+        settings = self._load_app_settings()
+        settings.update(values)
+        try:
+            with open(APP_SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            logger.error(f"Could not save settings: {e}")
+
+    # ---------- appearance: light / dark, animations ----------
+
+    def toggle_animations(self):
+        on = bool(self.animations_var.get())
+        self._save_app_setting(animations=on)
+        ui.Motion.enabled = on and ui.windows_allows_animation()
+        if on:
+            self._update_market_light()
+
+    def apply_appearance(self, mode):
+        """Switch between the light (Daylight) and dark looks. The window fades out, is rebuilt
+        in the new colours with everything still in it, and fades back in."""
+        if mode == THEME['mode']:
+            return
+        if self.scanning or self.bt_run_btn.cget('text') == "RUNNING...":
+            self.toast("Change the look after the scan", "A scan or backtest is running - switch when it's done.", kind='warn')
+            return
+        self._save_app_setting(appearance=mode)
+
+        def swap():
+            state = self._capture_ui_state()
+            THEME.clear()
+            THEME.update(ui.palette(mode))
+            ui.style_ttk(self.root, THEME)
+            self.markers = ui.marker_images(THEME)
+            ui.Toast._open.clear()
+            for w in self.root.winfo_children():
+                if not isinstance(w, tk.Toplevel):      # open pop-up windows stay open
+                    w.destroy()
+            self._scroll_canvases = []
+            self._pulsing = None
+            self.build_ui()
+            self._restore_ui_state(state)
+            ui.fade_window(self.root, 0.4, 1.0, 260)
+            self.toast("Dark mode on" if mode == 'dark' else "Light mode on", "Change it any time in Settings > Appearance.", ms=3500)
+
+        if ui.Motion.enabled:
+            ui.fade_window(self.root, 1.0, 0.4, 160, done=swap)
+        else:
+            swap()
+
+    def _capture_ui_state(self):
+        """What the window shows, so a rebuild (light/dark switch) can put it all back."""
+        old = dict(THEME)
+        def label(w):
+            return (w.cget('text'), w.cget('fg')) if w is not None and w.winfo_exists() else None
+        def rows(tree):
+            return [(tree.item(i, 'values'), tree.item(i, 'tags')) for i in tree.get_children()]
+        return {
+            'theme': old, 'tab': self.nb.index('current'),
+            'sector': self.sector_var.get(), 'group': self.group_var.get(),
+            'search': self.search_var.get(), 'filter': self.result_filter_var.get(),
+            'hide_illiquid': self.hide_illiquid_var.get(),
+            'bt': (self.bt_liquid_var.get(), self.bt_history_var.get(), self.bt_horizon_var.get(),
+                   self._bt_result, self._bt_cache, self.bt_apply_btn.cget('state')),
+            'chart_period': self.chart_period_var.get(), 'chart': self._chart_state,
+            'labels': {name: label(getattr(self, name, None)) for name in
+                       ('status_lbl', 'last_scan_lbl', 'cache_lbl', 'corp_status', 'corp_source_lbl', 'bt_status', 'bt_summary')},
+            'corp_stats': {k: label(v) for k, v in self.corp_stats_labels.items()},
+            'corp_rows': rows(self.corp_tree), 'corp_list': list(self.corp_listbox.get(0, tk.END)),
+            'corp_filter': self.corp_filter_var.get(), 'progress': self.progress['value'],
+            'sector_last': self._sector_last,
+        }
+
+    def _restore_ui_state(self, st):
+        old = {v.lower(): k for k, v in st['theme'].items() if isinstance(v, str) and v.startswith('#')}
+        def recolour(c):     # a colour from the old theme -> the same role in the new one
+            key = old.get(str(c).lower())
+            return THEME.get(key, c) if key else c
+        for name, val in st['labels'].items():
+            w = getattr(self, name, None)
+            if val and w is not None:
+                w.configure(text=val[0], fg=recolour(val[1]))
+        for k, val in st['corp_stats'].items():
+            if val and k in self.corp_stats_labels:
+                self.corp_stats_labels[k].configure(text=val[0], fg=recolour(val[1]))
+        for values, tags in st['corp_rows']:
+            self.corp_tree.insert('', tk.END, values=values, tags=tags)
+        for item in st['corp_list']:
+            self.corp_listbox.insert(tk.END, item)
+        self.corp_filter_var.set(st['corp_filter'])
+        self.progress['value'] = st['progress']
+
+        self.sector_var.set(st['sector'])
+        self.group_var.set(st['group'])
+        self.refresh_watchlist()
+        self.hide_illiquid_var.set(st['hide_illiquid'])
+        self.result_filter_var.set(st['filter'])
+        self.search_var.set(st['search'])         # its trace refills the results table
+        self.filter_results()
+        if self.results:
+            self.update_dash(animate=False)
+
+        liquid, history, horizon, result, cache, apply_state = st['bt']
+        self.bt_liquid_var.set(liquid)
+        self.bt_history_var.set(history)
+        self.bt_horizon_var.set(horizon)
+        self._bt_cache = cache
+        if result:
+            self._show_backtest(result)
+            self.bt_apply_btn.configure(state=apply_state)
+        if st['sector_last']:
+            self._show_sectors(*st['sector_last'])
+
+        sym = getattr(self, '_detail_symbol', None)
+        r = next((x for x in self.results if x['symbol'] == sym), None) if sym else None
+        if r:
+            self.update_breakdown(r)
+            self.update_targets(r)
+            self.update_patterns(r)
+        self.chart_period_var.set(st['chart_period'])
+        chart = st['chart']
+        if chart and chart[0] == 'stock':
+            self._render_stock_chart(*chart[1:], animate=False)
+        elif chart and chart[0] == 'map':
+            self.show_market_map()
+        self._update_market_light()
+        self.nb.select(st['tab'])
+
     # ---------- weights from the backtest: status + monthly re-check ----------
 
     WEIGHTS_RECHECK_DAYS = 30
@@ -3005,15 +3112,7 @@ class App:
     @staticmethod
     def _load_weights():
         """Load saved scoring weights (ignored unless they're complete and total 100)."""
-        try:
-            if WEIGHTS_FILE.exists():
-                with open(WEIGHTS_FILE, 'r') as f:
-                    data = json.load(f)
-                weights = {k: int(data[k]) for k in Scorer.DEFAULT_WEIGHTS}
-                if sum(weights.values()) == 100 and min(weights.values()) >= 0:
-                    Scorer.WEIGHTS.update(weights)
-        except Exception as e:
-            logger.error(f"Could not load weights: {e}")
+        scoring.load_weights()
 
     def toggle_password_visibility(self):
         """Toggle password field visibility."""
@@ -3107,14 +3206,15 @@ class App:
         header = tk.Frame(tab, bg=T['bg2'], height=50)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
-        tk.Label(header, text="Help & Documentation", bg=T['bg2'], fg=T['gold'],
-                font=('Segoe UI', 14, 'bold')).pack(side=tk.LEFT, padx=15)
+        tk.Label(header, text="Help", bg=T['bg2'], fg=T['fg'],
+                 font=(ui.DISPLAY, 14, 'bold')).pack(side=tk.LEFT, padx=16)
         
         canvas = tk.Canvas(tab, bg=T['bg'], highlightthickness=0)
         sb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
         content = tk.Frame(canvas, bg=T['bg'])
         content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=content, anchor="nw")
+        win = canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
@@ -3138,6 +3238,13 @@ class App:
                 ("75-100", "STRONG BUY"), ("60-74", "BUY"), ("45-59", "HOLD"),
                 ("30-44", "SELL"), ("0-29", "STRONG SELL")
             ]),
+            ("STOP-LOSS & TARGETS", [
+                ("Stop-loss", "Just beyond the nearest support (the nearest resistance, for a SELL)"),
+                ("Targets 1-3", "The next resistance levels above the price (supports below, for a SELL)"),
+                ("Levels", "Swing highs and lows of the last year; turns close together count as one level"),
+                ("No level", "Where a stock has no level within reach, a multiple of its ATR is used instead"),
+                ("Risk : Reward", "Distance to Target 2 (Target 1 for a HOLD), divided by distance to the stop-loss"),
+            ]),
             ("HOW TO USE", [
                 ("1.", "Add stocks to watchlist"), ("2.", "Organize with Groups (Ctrl+G)"),
                 ("3.", "Click Scan (F5)"), ("4.", "View results & details"),
@@ -3157,51 +3264,103 @@ class App:
                 ("Score history", "Chart under Score Breakdown; all scans are in score_history.csv"),
                 ("Re-check Weights", "Backtest tab: compares your weights with the defaults (automatic monthly)"),
             ]),
+            ("NEW LISTINGS", [
+                ("Candle: 1 Hour", "Stock listed less than a month ago - every indicator uses 1-hour candles"),
+                ("Candle: Daily", "All other stocks - indicators use daily candles"),
+                ("From day 3", "A new listing gets a score once it has 20 hourly candles (3 trading days)"),
+                ("Targets", "From hourly price swings, so stop-loss and targets sit closer to the price"),
+                ("vs Nifty", "N/A until the stock has traded for the full period"),
+            ]),
             ("LIQUIDITY", [
                 ("Traded/day (Cr)", "Average daily traded value over the last 20 sessions, in Rs crore"),
                 ("LOW", "Below the Settings threshold - stop-loss/targets less reliable"),
                 ("Hide illiquid", "Scan Results checkbox to hide LOW stocks"),
             ]),
+            ("APPEARANCE & 3D", [
+                ("Light / Dark", "Settings > Appearance switches between the light Daylight look and dark mode"),
+                ("Animations", "Settings > Appearance turns the motion on or off (Windows' own setting is respected too)"),
+                ("3D market map", "Charts tab: every scanned stock by score, RSI and strength vs the Nifty - drag to turn it"),
+                ("3D sectors", "Sector tab: buy, hold and sell stocks in each sector, after Analyze"),
+                ("Signal markers", "Scan Results: double up = strong buy, up = buy, bar = hold, down = sell, double down = strong sell"),
+            ]),
             ("SECTOR ROTATION", [
-                ("LEADING", "Strong scores, outperforming - stay invested"),
-                ("IMPROVING", "Rising scores - accumulate"),
-                ("WEAKENING", "Declining scores - reduce exposure"),
-                ("LAGGING", "Weak scores - avoid or short"),
+                ("LEADING", "Scores above your watchlist's average and not falling - the strongest sectors"),
+                ("WEAKENING", "Above average, but the score has fallen since last week - losing strength"),
+                ("IMPROVING", "Below average, but the score has risen since last week - gaining strength"),
+                ("LAGGING", "Below average and not rising - the weakest sectors"),
+                ("Chg", "Change in the sector's average score against the scan of about a week earlier"),
             ]),
         ]
         
         for title, items in sections:
             sf = tk.LabelFrame(content, text=f" {title} ", bg=T['bg'], fg=T['gold'],
-                              font=('Segoe UI', 12, 'bold'))
+                              font=(ui.FONT, 12, 'bold'))
             sf.pack(fill=tk.X, padx=20, pady=10)
             for key, val in items:
                 row = tk.Frame(sf, bg=T['card'], padx=10, pady=4)
                 row.pack(fill=tk.X, padx=10, pady=2)
                 tk.Label(row, text=key, bg=T['card'], fg=T['accent'],
-                        font=('Segoe UI', 10, 'bold'), width=16, anchor=tk.W).pack(side=tk.LEFT)
+                        font=(ui.FONT, 10, 'bold'), width=16, anchor=tk.W).pack(side=tk.LEFT)
                 tk.Label(row, text=val, bg=T['card'], fg=T['fg'],
-                        font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=10)
+                        font=(ui.FONT, 10)).pack(side=tk.LEFT, padx=10)
     
 
     def _setup_market_status(self):
-        """Update market status indicator."""
-        try:
-            from datetime import datetime
-            now = datetime.now()
-            hour, minute = now.hour, now.minute
-            weekday = now.weekday()
-            is_open = weekday < 5 and ((hour == 9 and minute >= 15) or (10 <= hour < 15) or (hour == 15 and minute <= 30))
-            if is_open:
-                self.market_dot.delete('all')
-                self.market_dot.create_oval(2, 2, 10, 10, fill='#10b981', outline='')
-                self.market_status_lbl.configure(text="MARKET OPEN", fg='#10b981')
-            else:
-                self.market_dot.delete('all')
-                self.market_dot.create_oval(2, 2, 10, 10, fill='#ef4444', outline='')
-                self.market_status_lbl.configure(text="MARKET CLOSED", fg='#ef4444')
-        except:
-            pass
+        """Keep the market status indicator up to date (every minute)."""
+        self._update_market_light()
         self.root.after(60000, self._setup_market_status)
+
+    def _update_market_light(self):
+        try:
+            now = datetime.now()
+            # the saved holiday list only - _refresh_holidays downloads it, off the window's thread
+            holidays = scheduled_report.cached_holidays(now.year) if SCHEDULER_OK else None
+            is_open, text = market_status(now, holidays)
+            color = THEME['buy'] if is_open else THEME['sell']
+            self.market_dot.delete('all')
+            self.market_dot.create_oval(5, 5, 13, 13, fill=color, outline='', tags='dot')
+            self.market_status_lbl.configure(text=text, fg=THEME['fg2'])
+            self._market_open = is_open
+            if is_open:
+                self._pulse_market_dot()
+        except Exception as e:
+            logger.warning(f"Market status error: {e}")
+
+    def _pulse_market_dot(self):
+        """While the market is open, a ring keeps rippling out of the green dot."""
+        dot = self.market_dot
+        if getattr(self, '_pulsing', None) is dot or not ui.Motion.enabled:
+            return
+        self._pulsing = dot
+        T = THEME
+
+        def ring(v):
+            dot.delete('ring')
+            r = 4 + 5 * v
+            dot.create_oval(9 - r, 9 - r, 9 + r, 9 + r, outline=ui.blend(T['buy'], T['bg2'], v), width=2, tags='ring')
+            dot.tag_raise('dot')
+
+        def again():
+            if dot.winfo_exists() and getattr(self, '_market_open', False) and ui.Motion.enabled:
+                ui.tween(dot, 1500, ring, done=lambda: dot.after(700, again))
+            else:
+                if dot.winfo_exists():
+                    dot.delete('ring')
+                self._pulsing = None
+        again()
+
+    def _refresh_holidays(self):
+        """Download NSE's holiday list in the background if the saved one is over a week old, so
+        the market light (and the scheduled report) know about holidays declared during the year."""
+        if not SCHEDULER_OK:
+            return
+        def work():
+            try:
+                scheduled_report._nse_holidays(datetime.now().year)
+                self.gui.schedule(self._update_market_light)
+            except Exception as e:
+                logger.warning(f"Holiday list refresh failed: {e}")
+        threading.Thread(target=work, daemon=True).start()
 
     def _create_group(self):
         from tkinter import simpledialog
@@ -3248,10 +3407,11 @@ class App:
         dlg = tk.Toplevel(self.root)
         dlg.title("Add to Group")
         dlg.configure(bg=T['bg'])
+        ui.set_titlebar(dlg, T['mode'] == 'dark')
         dlg.transient(self.root)
         dlg.resizable(False, False)
         tk.Label(dlg, text=f"Add {stock} to which group?", bg=T['bg'], fg=T['fg'],
-                 font=('Segoe UI', 11)).pack(padx=25, pady=(18, 6))
+                 font=(ui.FONT, 11)).pack(padx=25, pady=(18, 6))
         var = tk.StringVar(value=groups[0])
         ttk.Combobox(dlg, textvariable=var, values=groups, state='readonly', width=24).pack(padx=25, pady=4)
         result = {}
@@ -3288,10 +3448,9 @@ class App:
 
     def save_watchlist_groups(self):
         try:
-            fp = BASE_DIR / "watchlist_groups.json"
-            with open(fp, 'w') as f:
-                json.dump(self.watchlist_groups, f, indent=2)
-        except: pass
+            write_json(BASE_DIR / "watchlist_groups.json", self.watchlist_groups, indent=2)
+        except Exception as e:
+            logger.error(f"Could not save watchlist groups: {e}")
 
     def load_watchlist_groups(self):
         try:
@@ -3345,6 +3504,9 @@ class App:
     def clear_list(self):
         if messagebox.askyesno("Confirm", "Clear all?"):
             self.watchlist.clear()
+            for members in self.watchlist_groups.values():   # as Delete does: or a stock added again
+                members.clear()                              # later would reappear in its old groups
+            self.save_watchlist_groups()
             self.refresh_watchlist()
             self.save_watchlist()
     
@@ -3374,10 +3536,10 @@ class App:
     
     def save_watchlist(self):
         try:
-            with open(WATCHLIST_FILE, 'w') as f:
-                json.dump(self.watchlist, f)
-        except: pass
-    
+            write_json(WATCHLIST_FILE, self.watchlist)
+        except Exception as e:
+            logger.error(f"Could not save the watchlist: {e}")
+
     def load_watchlist(self):
         try:
             if WATCHLIST_FILE.exists():
@@ -3385,7 +3547,9 @@ class App:
                     data = json.load(f)
                     if isinstance(data, list):
                         self.watchlist = data
-        except: self.watchlist = []
+        except Exception as e:
+            logger.error(f"Could not read the watchlist ({e}) - starting with an empty one")
+            self.watchlist = []
     
     def save_list(self):
         if not self.watchlist:
@@ -3437,19 +3601,22 @@ class App:
                                 s = re.sub(r'[^A-Za-z0-9&-]', '', w.strip()).upper()
                                 if self._looks_like_symbol(s):
                                     imported.append(s)
+            # utf-8-sig: files saved by Excel ("CSV UTF-8") or Notepad start with an invisible
+            # marker that used to stick to the first symbol and get it silently dropped
             elif ext == '.json':
-                with open(fp, 'r') as f:
+                with open(fp, 'r', encoding='utf-8-sig') as f:
                     data = json.load(f)
                     imported = data.get('watchlist', data) if isinstance(data, dict) else data
             elif ext == '.csv':
-                with open(fp, 'r') as f:
+                with open(fp, 'r', encoding='utf-8-sig', errors='replace', newline='') as f:
                     imported = [row[0] for row in csv.reader(f) if row]
             else:
-                with open(fp, 'r') as f:
+                with open(fp, 'r', encoding='utf-8-sig', errors='replace') as f:
                     imported = [l.strip() for l in f if l.strip()]
-            
+
             candidates = sorted({str(x).strip().upper() for x in imported if str(x).strip()} - set(self.watchlist))
-            candidates = [s for s in candidates if self._looks_like_symbol(s)]
+            # column headings ("Symbol", "Stock" ...) look like symbols but aren't stocks
+            candidates = [s for s in candidates if self._looks_like_symbol(s) and s not in self.IMPORT_HEADINGS]
 
             rejected = []
             if ext in ('.xlsx', '.xls', '.pdf') and candidates and MARKET_DATA_OK:
@@ -3457,7 +3624,8 @@ class App:
                 # keep only the ones Yahoo Finance knows as NSE/BSE stocks
                 self.status_lbl.configure(text=f"Checking {len(candidates)} possible symbols...")
                 self.root.update()
-                found = market_data.load_history(candidates, years=HISTORY_YEARS)
+                new_listings = {}   # stocks with under 20 days of history are real stocks too
+                found = set(market_data.load_history(candidates, years=HISTORY_YEARS, short=new_listings)) | set(new_listings)
                 self.status_lbl.configure(text="Ready")
                 if not found:
                     messagebox.showerror("Import", "Couldn't verify any symbols from this file.\n\n"
@@ -3477,6 +3645,8 @@ class App:
         except Exception as e:
             messagebox.showerror("Error", str(e))
     
+    IMPORT_HEADINGS = {'SYMBOL', 'SYMBOLS', 'STOCK', 'STOCKS', 'SCRIP', 'SCRIPS', 'TICKER', 'TICKERS', 'NAME', 'WATCHLIST'}
+
     @staticmethod
     def _looks_like_symbol(s):
         """NSE/BSE-style symbol: 2-20 chars of A-Z, 0-9, & or -, with at least one letter
@@ -3497,7 +3667,7 @@ class App:
                 ws.title = "DR. NILESH SHAH ANALYSIS"
                 headers = ['Symbol', 'Price', 'Change%', 'RSI', 'Score', 'Recommendation', 'Stop Loss', 'Target 1', 'Target 2', 'Risk:Reward',
                            'Traded/day (Rs Cr)', 'Liquidity', 'vs Nifty 1M (%)', 'vs Nifty 3M (%)', 'vs Nifty 6M (%)',
-                           'Score Chg', 'Previous Signal']
+                           'Score Chg', 'Previous Signal', 'Candle']
                 for i, h in enumerate(headers, 1):
                     c = ws.cell(row=1, column=i, value=h)
                     c.font = Font(bold=True, color="FFFFFF")
@@ -3522,6 +3692,7 @@ class App:
                     if r.get('prev_score') is not None:
                         ws.cell(row=row, column=16, value=round(r['score'] - r['prev_score'], 1))
                         ws.cell(row=row, column=17, value=f"{r.get('prev_rec', '')} ({r.get('prev_date', '')})")
+                    ws.cell(row=row, column=18, value='1 Hour' if r.get('hourly') else 'Daily')
                 wb.save(fp)
             else:
                 with open(fp, 'w', newline='') as f:
@@ -3546,13 +3717,13 @@ class App:
         if not fp: return
         
         try:
-            logo_path = LOGO_PATH
-            
+            logo = pdf_logo(LOGO_PATH) if LOGO_PATH.exists() else None
+
             def add_header(canvas_obj, doc):
                 canvas_obj.saveState()
-                if logo_path.exists():
+                if logo:
                     try:
-                        canvas_obj.drawImage(str(logo_path), 30, A4[1] - 80, width=50, height=50, preserveAspectRatio=True, mask='auto')
+                        canvas_obj.drawImage(logo, 30, A4[1] - 80, width=50, height=50, preserveAspectRatio=True, mask='auto')
                     except: pass
                 
                 canvas_obj.setFont('Helvetica-Bold', 16)
@@ -3624,7 +3795,7 @@ class App:
                     rec_text = f'<font color="#d97706"><b>{rec}</b></font>'
                 
                 table_data.append([
-                    r['symbol'], f"{r['price']:.2f}", f"{r['change']:+.2f}%",
+                    r['symbol'] + ('*' if r.get('hourly') else ''), f"{r['price']:.2f}", f"{r['change']:+.2f}%",
                     f"{r['rsi']:.1f}", f"{r['score']:.1f}",
                     Paragraph(rec_text, styles['Normal']),
                     f"{t.get('sl', 'N/A')}", f"{t.get('t1', 'N/A')}", f"{t.get('t2', 'N/A')}",
@@ -3643,7 +3814,10 @@ class App:
                 ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
             ]))
             elements.append(results_table)
-            
+            if any(r.get('hourly') for r in self.results):
+                elements.append(Spacer(1, 8))
+                elements.append(Paragraph(market_data.HOURLY_NOTE, subtitle_style))
+
             doc.build(elements, onFirstPage=add_header, onLaterPages=add_header)
             messagebox.showinfo("PDF Exported", f"Report saved to:\n{os.path.basename(fp)}")
         except Exception as e:
@@ -3660,21 +3834,22 @@ class App:
         log_win.title("Application Log")
         log_win.geometry("800x600")
         log_win.configure(bg=THEME['bg'])
+        ui.set_titlebar(log_win, THEME['mode'] == 'dark')
         
         header = tk.Frame(log_win, bg=THEME['bg2'], height=50)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
         tk.Label(header, text=f"Application Log: {log_path}", bg=THEME['bg2'], fg=THEME['gold'],
-                font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT, padx=15)
+                font=(ui.FONT, 11, 'bold')).pack(side=tk.LEFT, padx=15)
         
         text_frame = tk.Frame(log_win, bg=THEME['bg'])
         text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        scrollbar = tk.Scrollbar(text_frame)
+        scrollbar = ttk.Scrollbar(text_frame)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        log_text = tk.Text(text_frame, bg=THEME['input'], fg=THEME['fg'], font=('Consolas', 10),
-                          relief=tk.FLAT, yscrollcommand=scrollbar.set)
+        log_text = tk.Text(text_frame, bg=THEME['card'], fg=THEME['fg'], font=(ui.MONO, 10),
+                          relief=tk.FLAT, highlightthickness=1, highlightbackground=THEME['line'], yscrollcommand=scrollbar.set)
         log_text.pack(fill=tk.BOTH, expand=True)
         scrollbar.config(command=log_text.yview)
         
@@ -3707,83 +3882,71 @@ class App:
         T = THEME
         for w in self.pt_frame.winfo_children():
             w.destroy()
-        
+
         symbol = r['symbol']
         patterns = r.get('data', {}).get('patterns', {})
-        
+
         tk.Label(self.pt_frame, text=f"Pattern Analysis: {symbol}",
-                bg=T['bg'], fg=T['gold'], font=('Segoe UI', 20, 'bold')).pack(pady=20)
-        
+                 bg=T['bg'], fg=T['fg'], font=(ui.DISPLAY, 18, 'bold')).pack(anchor=tk.W, padx=100, pady=(22, 12))
+
         summary = patterns.get('summary', {})
         total = summary.get('total_patterns', 0)
         bullish = summary.get('bullish_count', 0)
         bearish = summary.get('bearish_count', 0)
         overall = summary.get('overall_signal', 'N/A')
-        
-        stats_frame = tk.Frame(self.pt_frame, bg=T['card'])
-        stats_frame.pack(fill=tk.X, padx=80, pady=10)
-        
-        for label, value, color in [("Total", str(total), T['accent']),
-                                     ("Bullish", str(bullish), T['success']),
-                                     ("Bearish", str(bearish), T['danger']),
-                                     ("Overall", overall, T['success'] if overall == 'BULLISH' else T['danger'] if overall == 'BEARISH' else T['warning'])]:
-            box = tk.Frame(stats_frame, bg=T['bg3'], padx=15, pady=8)
-            box.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
-            tk.Label(box, text=label, bg=T['bg3'], fg=T['fg3'], font=('Segoe UI', 9)).pack()
-            tk.Label(box, text=value, bg=T['bg3'], fg=color, font=('Segoe UI', 18, 'bold')).pack()
+
+        stats_frame = tk.Frame(self.pt_frame, bg=T['bg'])
+        stats_frame.pack(fill=tk.X, padx=100, pady=(0, 10))
+        overall_c = T['buy'] if overall == 'BULLISH' else T['sell'] if overall == 'BEARISH' else T['warning']
+        for i, (label, value, edge) in enumerate([("Total", str(total), T['accent']), ("Bullish", str(bullish), T['buy']),
+                                                  ("Bearish", str(bearish), T['sell']), ("Overall", overall, overall_c)]):
+            box = tk.Frame(stats_frame, bg=T['card'], highlightbackground=T['line'], highlightthickness=1)
+            box.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0 if i == 0 else 5, 0))
+            tk.Frame(box, bg=edge, height=3).pack(fill=tk.X)
+            tk.Label(box, text=label, bg=T['card'], fg=T['fg2'], font=(ui.FONT, 9)).pack(pady=(8, 0))
+            tk.Label(box, text=value, bg=T['card'], fg=T['fg'], font=(ui.DISPLAY, 18, 'bold')).pack(pady=(0, 8))
 
         ignored = summary.get('ignored_conflicts') or []
         if ignored:
             tk.Label(self.pt_frame, text=f"Ignored conflicting pattern(s): {', '.join(ignored)} - a stronger or more recent "
                                          f"pattern points the other way",
-                     bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9, 'italic')).pack(pady=(0, 5))
+                     bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 9, 'italic')).pack(anchor=tk.W, padx=100, pady=(0, 5))
 
-        # Chart Patterns
-        chart_patterns = patterns.get('chart', [])
-        if chart_patterns:
-            section = tk.LabelFrame(self.pt_frame, text=" CHART PATTERNS ", bg=T['bg'], fg=T['accent'], font=('Segoe UI', 12, 'bold'))
-            section.pack(fill=tk.X, padx=80, pady=10)
-            for pattern in chart_patterns:
-                p_frame = tk.Frame(section, bg=T['card'], padx=10, pady=8)
-                p_frame.pack(fill=tk.X, padx=10, pady=4)
-                signal_color = T['success'] if pattern.get('signal') == 'BULLISH' else T['danger'] if pattern.get('signal') == 'BEARISH' else T['warning']
-                tk.Label(p_frame, text=pattern.get('name', ''), bg=T['card'], fg=T['fg'], font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
-                tk.Label(p_frame, text=f" {pattern.get('signal', '')} ", bg=signal_color, fg='white', font=('Segoe UI', 9, 'bold'), padx=8, pady=2).pack(side=tk.LEFT, padx=10)
-                if pattern.get('description'):
-                    tk.Label(p_frame, text=pattern['description'], bg=T['card'], fg=T['fg3'], font=('Segoe UI', 10), wraplength=600).pack(anchor=tk.W)
-        else:
-            tk.Label(self.pt_frame, text="No chart patterns detected", bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 11)).pack(pady=10)
-        
-        # Candlestick Patterns
-        candle_patterns = patterns.get('candlestick', [])
-        if candle_patterns:
-            section = tk.LabelFrame(self.pt_frame, text=" CANDLESTICK PATTERNS ", bg=T['bg'], fg=T['accent'], font=('Segoe UI', 12, 'bold'))
-            section.pack(fill=tk.X, padx=80, pady=10)
-            for pattern in candle_patterns:
-                p_frame = tk.Frame(section, bg=T['card'], padx=10, pady=8)
-                p_frame.pack(fill=tk.X, padx=10, pady=4)
-                signal_color = T['success'] if pattern.get('signal') == 'BULLISH' else T['danger'] if pattern.get('signal') == 'BEARISH' else T['warning']
-                tk.Label(p_frame, text=pattern.get('name', ''), bg=T['card'], fg=T['fg'], font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
-                tk.Label(p_frame, text=f" {pattern.get('signal', '')} ", bg=signal_color, fg='white', font=('Segoe UI', 9, 'bold'), padx=8, pady=2).pack(side=tk.LEFT, padx=10)
-        else:
-            tk.Label(self.pt_frame, text="No candlestick patterns detected", bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 11)).pack(pady=10)
+        def badge(parent, signal):
+            bg, fg = {'BULLISH': (T['reward_bg'], T['reward_fg']), 'BEARISH': (T['risk_bg'], T['risk_fg'])}.get(
+                signal, (T['warn_bg'], T['warn_fg']))
+            tk.Label(parent, text=signal.capitalize() if signal else '', bg=bg, fg=fg, font=(ui.FONT, 9, 'bold'),
+                     padx=10, pady=2).pack(side=tk.LEFT, padx=10)
 
-        # Harmonic Patterns (they're included in the counts above, so list them too)
-        harmonic_patterns = patterns.get('harmonic', [])
-        if harmonic_patterns:
-            section = tk.LabelFrame(self.pt_frame, text=" HARMONIC PATTERNS ", bg=T['bg'], fg=T['accent'], font=('Segoe UI', 12, 'bold'))
-            section.pack(fill=tk.X, padx=80, pady=10)
-            for pattern in harmonic_patterns:
-                p_frame = tk.Frame(section, bg=T['card'], padx=10, pady=8)
-                p_frame.pack(fill=tk.X, padx=10, pady=4)
-                signal_color = T['success'] if pattern.get('signal') == 'BULLISH' else T['danger'] if pattern.get('signal') == 'BEARISH' else T['warning']
-                tk.Label(p_frame, text=pattern.get('name', ''), bg=T['card'], fg=T['fg'], font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT)
-                tk.Label(p_frame, text=f" {pattern.get('signal', '')} ", bg=signal_color, fg='white', font=('Segoe UI', 9, 'bold'), padx=8, pady=2).pack(side=tk.LEFT, padx=10)
-                if pattern.get('description'):
-                    tk.Label(p_frame, text=pattern['description'], bg=T['card'], fg=T['fg3'], font=('Segoe UI', 10)).pack(side=tk.LEFT, padx=5)
+        def section(title, items, empty, long_text):
+            if not items:
+                tk.Label(self.pt_frame, text=empty, bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 11)).pack(anchor=tk.W, padx=100, pady=8)
+                return
+            box = tk.Frame(self.pt_frame, bg=T['card'], highlightbackground=T['line'], highlightthickness=1)
+            box.pack(fill=tk.X, padx=100, pady=(4, 10))
+            tk.Label(box, text=title, bg=T['card'], fg=T['fg2'], font=(ui.FONT, 10, 'bold')).pack(anchor=tk.W, padx=18, pady=(12, 4))
+            for n, pattern in enumerate(items):
+                if n:
+                    tk.Frame(box, bg=T['line'], height=1).pack(fill=tk.X, padx=18)
+                row = tk.Frame(box, bg=T['card'])
+                row.pack(fill=tk.X, padx=18, pady=8)
+                head = tk.Frame(row, bg=T['card'])
+                head.pack(fill=tk.X)
+                tk.Label(head, text=pattern.get('name', ''), bg=T['card'], fg=T['fg'], font=(ui.FONT, 11, 'bold')).pack(side=tk.LEFT)
+                badge(head, pattern.get('signal', ''))
+                if long_text and pattern.get('description'):
+                    tk.Label(row, text=pattern['description'], bg=T['card'], fg=T['fg3'], font=(ui.FONT, 10),
+                             wraplength=700, justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+            tk.Frame(box, bg=T['card'], height=4).pack()
+
+        section("Chart patterns", patterns.get('chart', []), "No chart patterns detected", True)
+        section("Candlestick patterns", patterns.get('candlestick', []), "No candlestick patterns detected", False)
+        # Harmonic patterns are included in the counts above, so list them too
+        if patterns.get('harmonic'):
+            section("Harmonic patterns", patterns['harmonic'], "", True)
 
         self.nb.select(4)
-    
+
     def sort_tree(self, col):
         items = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
         
@@ -3807,6 +3970,7 @@ class App:
             ordered = sorted(numbered, key=lambda x: str(x[1]), reverse=not self._sort_asc)
         for index, (_, _, k) in enumerate(ordered):
             self.tree.move(k, '', index)
+        self._restripe()
     
     def start_scan(self):
         if not self.watchlist:
@@ -3814,7 +3978,7 @@ class App:
             return
         if self.scanning: return
         self.scanning = True
-        self.scan_btn.configure(state=tk.DISABLED, text="SCANNING...")
+        self.scan_btn.configure(state=tk.DISABLED, text="Scanning...")
         self.results = []
         self.tree.delete(*self.tree.get_children())
         threading.Thread(target=self._scan, daemon=True).start()
@@ -3823,6 +3987,7 @@ class App:
         watchlist = list(self.watchlist)
         total = len(watchlist)
         failed = []
+        too_new = []   # listed a day or two ago: not enough 1-hour candles to score yet
         t0 = time.time()
         
         # 1. Download every stock's prices in one batch (disk-cached; re-scans only fetch recent days)
@@ -3846,30 +4011,37 @@ class App:
         for i, sym in enumerate(watchlist):
             self.gui.schedule(self._status, f"Analysing {sym} ({i+1}/{total})...", 10 + (i / total) * 90)
             df = frames.get(sym)
-            if df is None or df.empty or len(df) < 20:
+            if df is None or df.empty:
                 self.gui.schedule(self._add_error, sym, "No data / delisted")
                 failed.append(sym)
                 continue
+            if len(df) < 20:   # only a new listing's 1-hour candles come this short
+                self.gui.schedule(self._add_error, sym, "Listed under 3 days ago")
+                too_new.append(sym)
+                continue
             try:
-                data = self.analyzer.analyze(df)
+                days = self.analyzer.listing_days.get(sym)   # None unless it's a new listing
+                data = self.analyzer.analyze(df, days=days)
                 score = self.scorer.score(data)
                 change = ((data['price'] - data['prev']) / data['prev'] * 100) if data['prev'] > 0 else 0
                 targets = TargetCalc.calc(data, score['rec'])
-                
+
                 # 52-week high/low (df holds 2 years, so use the last year only)
                 last_year = df[df.index > df.index[-1] - pd.DateOffset(weeks=52)]
                 high52 = float(last_year['High'].max()) if len(last_year) > 0 else data['price']
                 low52 = float(last_year['Low'].min()) if len(last_year) > 0 else data['price']
-                
+
                 result = {
                     'symbol': sym, 'price': data['price'], 'change': change,
                     'rsi': data['rsi'], 'score': score['total'], 'rec': score['rec'],
                     'breakdown': score['breakdown'], 'data': data, 'targets': targets,
                     'st_sig': data['supertrend']['sig'], 'st_dir': data['supertrend']['dir'],
                     'vwap_sig': data['vwap']['sig'],
-                    'patterns': data.get('patterns', {}), 'ai': data.get('ai', {}),
+                    'patterns': data.get('patterns', {}),
                     'high52': high52, 'low52': low52,
-                    'rs': relative_strength(df, nifty)
+                    # vs the Nifty: periods are in trading days, which a new listing doesn't have yet (N/A)
+                    'rs': relative_strength(df if days is None else days, nifty),
+                    'hourly': data['hourly']
                 }
                 self.results.append(result)
                 self.gui.schedule(self._add_tree, result)
@@ -3878,7 +4050,7 @@ class App:
                 self.gui.schedule(self._add_error, sym, str(e)[:30])
                 failed.append(sym)
         
-        logger.info(f"Scan: {total - len(failed)}/{total} stocks in {time.time() - t0:.1f}s")
+        logger.info(f"Scan: {total - len(failed) - len(too_new)}/{total} stocks in {time.time() - t0:.1f}s")
         self.results.sort(key=lambda x: x['symbol'])
 
         # 3. Compare with the previous scan day, then save this scan to the score history
@@ -3895,17 +4067,22 @@ class App:
                 score_history.record(self.results)
             except Exception as e:
                 logger.error(f"Score history: {e}")
-        self.gui.schedule(self._scan_done, failed, changes)
+        self.gui.schedule(self._scan_done, failed, changes, too_new)
     
     def _status(self, msg, pct):
         self.status_lbl.configure(text=msg)
         self.progress['value'] = pct
     
+    def _row_tag(self, rec, index):
+        """Row look: buy and sell rows lightly tinted, hold rows striped."""
+        if 'BUY' in rec:
+            return 'tb'
+        if 'SELL' in rec:
+            return 'ts'
+        return 'zebra' if index % 2 else 'plain'
+
     def _add_tree(self, r):
-        tags = {'STRONG BUY': 'sb', 'BUY': 'buy', 'HOLD': 'hold', 'SELL': 'sell', 'STRONG SELL': 'ss'}
-        tag = tags.get(r['rec'], '')
-        
-        # Get additional data
+        """One results row. The signal shows as a marker shape (not colour alone) in the first column."""
         data = r.get('data', {})
         high52 = r.get('high52', 0)
         low52 = r.get('low52', 0)
@@ -3914,64 +4091,104 @@ class App:
         rs3 = (r.get('rs') or {}).get('3M')
         rs_text = f"{rs3:+.1f}%" if rs3 is not None else "N/A"
         chg_text = f"{r['score'] - r['prev_score']:+.1f}" if r.get('prev_score') is not None else "new"
-
-        self.tree.insert('', tk.END, values=(
-            r['symbol'], f"{r['price']:.2f}", f"{r['change']:+.2f}%", rs_text,
+        index = len(self.tree.get_children())
+        self.tree.insert('', tk.END, text='', image=self.markers.get(r['rec'], self.markers['ERROR']), values=(
+            r['symbol'], f"{r['price']:,.2f}", f"{r['change']:+.2f}%", rs_text,
             f"{r['rsi']:.1f}", r.get('st_sig', ''), r.get('vwap_sig', ''),
             f"{r['score']:.1f}", chg_text, r['rec'],
-            f"{high52:.2f}", f"{low52:.2f}", f"{atr:.2f}", liq
-        ), tags=(tag,))
-        
-        self.tree.tag_configure('sb', background='#059669', foreground='white')
-        self.tree.tag_configure('buy', background='#10b981', foreground='white')
-        self.tree.tag_configure('hold', background='#d97706', foreground='white')
-        self.tree.tag_configure('sell', background='#ef4444', foreground='white')
-        self.tree.tag_configure('ss', background='#dc2626', foreground='white')
-    
-    def _scan_done(self, failed=None, changes=None):
+            f"{high52:,.2f}", f"{low52:,.2f}", f"{atr:.2f}", liq,
+            '1 Hour' if r.get('hourly') else 'Daily'
+        ), tags=(self._row_tag(r['rec'], index),))
+
+    def _restripe(self):
+        """Stripes follow the rows' order again (after sorting or filtering)."""
+        for i, item in enumerate(self.tree.get_children()):
+            tags = self.tree.item(item, 'tags')
+            if tags and tags[0] in ('zebra', 'plain'):
+                self.tree.item(item, tags=('zebra' if i % 2 else 'plain',))
+
+    def _flash_changes(self):
+        """Rows whose signal changed since the last scan glow once and settle, so they stand out."""
+        T = THEME
+        by_symbol = {r['symbol']: r for r in self.results}
+        k = 0
+        for i, item in enumerate(self.tree.get_children()):
+            r = by_symbol.get(str(self.tree.item(item)['values'][0]))
+            if not r or not r.get('prev_rec') or r['prev_rec'] == r['rec']:
+                continue
+            base_tag = self._row_tag(r['rec'], i)
+            base = {'tb': T['tint_b'], 'ts': T['tint_s'], 'zebra': T['zebra'], 'plain': T['card']}[base_tag]
+            tag = f'flash{k}'
+            k += 1
+            self.tree.item(item, tags=(tag,))
+
+            def step(v, tag=tag, base=base):
+                self.tree.tag_configure(tag, background=ui.blend(T['flash'], base, v))
+
+            def done(item=item, base_tag=base_tag):
+                if self.tree.exists(item):
+                    self.tree.item(item, tags=(base_tag,))
+            self.tree.tag_configure(tag, background=T['flash'])
+            self.root.after(250, lambda step=step, done=done: ui.tween(self.tree, 1800, step, done=done, ease=ui.ease_in_out))
+
+    def toast(self, title, message='', kind='info', ms=6000):
+        """A message that slides up in the corner and leaves by itself (ui.Toast)."""
+        self.last_toast = (title, message)
+        ui.Toast(self.root, title, message, THEME, ms=ms, kind=kind)
+
+    def _scan_done(self, failed=None, changes=None, too_new=None):
         self.scanning = False
-        self.scan_btn.configure(state=tk.NORMAL, text="SCAN ALL STOCKS")
+        self.scan_btn.configure(state=tk.NORMAL, text="Scan all stocks")
         self.progress['value'] = 100
-        self.status_lbl.configure(text="Complete!")
-        
+        self.status_lbl.configure(text="Complete")
+
         self.results.sort(key=lambda x: x['symbol'])
         self.tree.delete(*self.tree.get_children())
         for r in self.results:
             self._add_tree(r)
-        
+
         self._all_results = self.results.copy()
-        
+        self._last_scan_at = datetime.now()
+
         self.nb.select(1)
         self.update_dash()
-        self.last_scan_lbl.configure(text=f"Last Scan: {datetime.now().strftime('%H:%M:%S')}")
-        
-        msg = f"Scanned {len(self.results)} stocks!"
+        self.last_scan_lbl.configure(text=f"Last scan: {self._last_scan_at:%H:%M:%S}")
+        self.cache_lbl.configure(text=f"Cache: {self.analyzer.cache.count()}")   # it used to stay at 0 forever
+        self._flash_changes()
+
+        # The result slides in at the corner instead of a box that has to be closed
+        lines = []
         if failed:
-            msg += f"\n{len(failed)} failed: {', '.join(failed[:5])}"
+            lines.append(f"{len(failed)} failed: {', '.join(failed[:5])}")
+        if too_new:
+            lines.append(f"{len(too_new)} listed under 3 trading days ago: {', '.join(too_new[:5])} "
+                         "(a new listing is scored from its 3rd day, on 1-hour candles)")
         if changes:
-            msg += f"\n\nSignal changes since the last scan ({len(changes)}):\n" + "\n".join(changes[:15])
-            if len(changes) > 15:
-                msg += f"\n... and {len(changes) - 15} more (see the 'Score Chg' column)"
-        messagebox.showinfo("Done", msg)
-    
+            shown = [c.split('  (since')[0].replace(' -> ', ' to ') for c in changes[:4]]
+            line = f"Signal changes since the last scan ({len(changes)}): " + "; ".join(shown)
+            if len(changes) > 4:
+                line += f"; and {len(changes) - 4} more (see the 'Score Chg' column)"
+            lines.append(line)
+        self.toast(f"Scan complete: {len(self.results)} stocks", "\n".join(lines) or "No signal changes since your last scan.",
+                   kind='warn' if failed else 'good', ms=10000 if changes or failed else 6000)
+
     def _add_error(self, symbol, error):
         """Add error entry to tree."""
         values = [symbol] + ['N/A'] * (len(self.tree['columns']) - 1)
         values[list(self.tree['columns']).index('Recommendation')] = f'Error: {error}'
-        self.tree.insert('', tk.END, values=values, tags=('error',))
-        self.tree.tag_configure('error', background='#636e72', foreground='white')
-    
+        self.tree.insert('', tk.END, image=self.markers['ERROR'], values=values, tags=('error',))
+
     def filter_results(self):
         """Filter results based on search and recommendation filter."""
         search = self.search_var.get().upper()
         rec_filter = self.result_filter_var.get()
-        
+
         if not hasattr(self, '_all_results'):
             self._all_results = self.results.copy()
-        
+
         for item in self.tree.get_children():
             self.tree.delete(item)
-        
+
         for r in self._all_results:
             if search and search not in r['symbol'].upper():
                 continue
@@ -3980,32 +4197,30 @@ class App:
             if self.hide_illiquid_var.get() and self._is_illiquid(r):
                 continue
             self._add_tree(r)
-    
+
     def _is_illiquid(self, r):
         return r.get('data', {}).get('liquidity_cr', 0) < self.min_liquidity_cr
-    
+
     def _liquidity_text(self, r):
         liq = r.get('data', {}).get('liquidity_cr', 0)
         text = f"{liq:,.2f}" if liq < 100 else f"{liq:,.0f}"
         return f"{text}  LOW" if self._is_illiquid(r) else text
-    
-    def update_dash(self):
+
+    def update_dash(self, animate=True):
+        """The summary card: numbers count up and the buy / hold / sell bar grows."""
         if not self.results: return
-        n = len(self.results)
-        self.dash_cards['total'].configure(text=str(n))
-        self.dash_cards['sb'].configure(text=str(sum(1 for r in self.results if r['rec'] == 'STRONG BUY')))
-        self.dash_cards['buy'].configure(text=str(sum(1 for r in self.results if r['rec'] == 'BUY')))
-        self.dash_cards['hold'].configure(text=str(sum(1 for r in self.results if r['rec'] == 'HOLD')))
-        self.dash_cards['sell'].configure(text=str(sum(1 for r in self.results if r['rec'] == 'SELL')))
-        self.dash_cards['ss'].configure(text=str(sum(1 for r in self.results if r['rec'] == 'STRONG SELL')))
-        self.dash_cards['avg'].configure(text=f"{sum(r['score'] for r in self.results)/n:.1f}")
-    
+        counts = {k: sum(1 for r in self.results if r['rec'] == k) for k in ('STRONG BUY', 'BUY', 'HOLD', 'SELL', 'STRONG SELL')}
+        avg = sum(r['score'] for r in self.results) / len(self.results)
+        when = getattr(self, '_last_scan_at', None)
+        self.summary.update_values(counts, len(self.results), avg, f"Last scan at {when:%H:%M}" if when else '', animate)
+
     def show_details(self, event):
         sel = self.tree.selection()
         if not sel: return
         sym = str(self.tree.item(sel[0])['values'][0])  # Treeview turns numeric symbols (BSE codes) into int
         r = next((x for x in self.results if x['symbol'] == sym), None)
         if not r: return
+        self._detail_symbol = sym
         self.update_breakdown(r)
         self.update_targets(r)
         self.update_patterns(r)
@@ -4015,59 +4230,76 @@ class App:
         T = THEME
         for w in self.bd_frame.winfo_children():
             w.destroy()
-        
-        score = r['score']
-        color = '#059669' if score >= 75 else '#10b981' if score >= 60 else '#d97706' if score >= 45 else '#ef4444'
-        
+
+        score, rec = r['score'], r['rec']
+        color = ui.signal_color(T, rec)
+
         tk.Label(self.bd_frame, text=f"Score Breakdown: {r['symbol']}",
-                bg=T['bg'], fg=T['gold'], font=('Segoe UI', 20, 'bold')).pack(pady=20)
-        
-        canvas = tk.Canvas(self.bd_frame, width=150, height=150, bg=T['bg'], highlightthickness=0)
-        canvas.pack(pady=10)
-        canvas.create_oval(10, 10, 140, 140, fill=T['card'], outline=color, width=4)
-        canvas.create_text(75, 60, text=f"{score}", fill=color, font=('Segoe UI', 36, 'bold'))
-        canvas.create_text(75, 100, text="/100", fill=T['fg3'], font=('Segoe UI', 12))
-        
-        tk.Label(self.bd_frame, text=r['rec'], bg=T['bg'], fg=color, font=('Segoe UI', 16, 'bold')).pack(pady=5)
-        tk.Label(self.bd_frame, text=f"Price: {r['price']:.2f} | Change: {r['change']:+.2f}%",
-                bg=T['bg'], fg=T['fg'], font=('Segoe UI', 12)).pack(pady=5)
+                 bg=T['bg'], fg=T['fg'], font=(ui.DISPLAY, 18, 'bold')).pack(anchor=tk.W, padx=100, pady=(22, 12))
+
+        # The score: a ring that sweeps round to it, with the facts beside it
+        top = tk.Frame(self.bd_frame, bg=T['card'], highlightbackground=T['line'], highlightthickness=1)
+        top.pack(fill=tk.X, padx=100, pady=(0, 10))
+        ring = ui.ScoreRing(top, T)
+        ring.pack(side=tk.LEFT, padx=18, pady=14)
+        ring.show(score, color, rec)
+        info = tk.Frame(top, bg=T['card'])
+        info.pack(side=tk.LEFT, fill=tk.X, padx=(4, 18))
+        tk.Label(info, text=rec, bg=T['card'], fg=T['fg'], font=(ui.DISPLAY, 20, 'bold')).pack(anchor=tk.W)
+        tk.Label(info, text=f"Price {r['price']:,.2f}, {r['change']:+.2f}% on the day",
+                 bg=T['card'], fg=T['fg2'], font=(ui.FONT, 12)).pack(anchor=tk.W, pady=(2, 8))
 
         # Relative strength: did the stock beat the Nifty 50?
         rs = r.get('rs') or {}
         if any(v is not None for v in rs.values()):
-            rs_row = tk.Frame(self.bd_frame, bg=T['bg'])
-            rs_row.pack(pady=(2, 8))
-            tk.Label(rs_row, text="vs Nifty 50:", bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 11)).pack(side=tk.LEFT, padx=4)
+            rs_row = tk.Frame(info, bg=T['card'])
+            rs_row.pack(anchor=tk.W)
+            tk.Label(rs_row, text="vs Nifty 50:", bg=T['card'], fg=T['fg2'], font=(ui.FONT, 11)).pack(side=tk.LEFT, padx=(0, 4))
             for label, v in rs.items():
                 text = f"{label} {v:+.1f}%" if v is not None else f"{label} N/A"
-                fg = T['fg3'] if v is None else T['success'] if v > 0 else T['danger'] if v < 0 else T['fg']
-                tk.Label(rs_row, text=text, bg=T['bg'], fg=fg, font=('Segoe UI', 11, 'bold')).pack(side=tk.LEFT, padx=8)
+                fg = T['fg3'] if v is None else T['success'] if v > 0 else T['danger2'] if v < 0 else T['fg']
+                tk.Label(rs_row, text=text, bg=T['card'], fg=fg, font=(ui.FONT, 11, 'bold')).pack(side=tk.LEFT, padx=8)
             rs3 = rs.get('3M')
             if rs3 is not None:
                 verdict = "beating" if rs3 > 0 else "lagging"
-                tk.Label(self.bd_frame, text=f"Over 3 months the stock is {verdict} the market by {abs(rs3):.1f} percentage points.",
-                         bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9)).pack()
+                tk.Label(info, text=f"Over 3 months the stock is {verdict} the market by {abs(rs3):.1f} percentage points.",
+                         bg=T['card'], fg=T['fg3'], font=(ui.FONT, 10)).pack(anchor=tk.W, pady=(6, 0))
+        if r.get('hourly'):
+            tk.Label(self.bd_frame, text=f"New listing ({r['data']['days']} trading days of history): "
+                                         "analysed on 1-hour candles instead of daily ones.",
+                     bg=T['info_bg'], fg=T['info_fg'], font=(ui.FONT, 10, 'bold'), padx=12, pady=8,
+                     anchor=tk.W).pack(fill=tk.X, padx=100, pady=(0, 10))
 
+        # What makes up the score: bars that grow one after another
         names = {'rsi': 'RSI', 'macd': 'MACD', 'ma': 'Moving Avg', 'boll': 'Bollinger',
-                'stoch': 'Stochastic', 'adx': 'ADX', 'vol': 'Volume', 'mom': 'Momentum',
-                'st': 'SuperTrend', 'vwap': 'VWAP'}
-        
-        for key, val in r['breakdown'].items():
-            row = tk.Frame(self.bd_frame, bg=T['bg'])
-            row.pack(fill=tk.X, padx=100, pady=4)
-            
-            tk.Label(row, text=f"{names.get(key, key)}:", bg=T['bg'], fg=T['fg'],
-                    font=('Segoe UI', 11), width=14, anchor=tk.W).pack(side=tk.LEFT)
-            
-            bar = tk.Canvas(row, height=24, bg=T['bg3'], highlightthickness=0)
-            bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-            
-            c = '#059669' if val >= 70 else '#10b981' if val >= 50 else '#d97706' if val >= 30 else '#ef4444'
-            bar.create_rectangle(0, 0, int(val * 2.5), 24, fill=c, outline='')
-            bar.create_text(int(val * 2.5) // 2, 12, text=f"{val}", fill='white', font=('Segoe UI', 10, 'bold'))
-            
+                 'stoch': 'Stochastic', 'adx': 'ADX', 'vol': 'Volume', 'mom': 'Momentum',
+                 'st': 'SuperTrend', 'vwap': 'VWAP'}
+        card = tk.Frame(self.bd_frame, bg=T['card'], highlightbackground=T['line'], highlightthickness=1)
+        card.pack(fill=tk.X, padx=100, pady=(0, 10))
+        tk.Label(card, text="What makes up the score (each part 0 to 100)", bg=T['card'], fg=T['fg2'],
+                 font=(ui.FONT, 10, 'bold')).pack(anchor=tk.W, padx=18, pady=(12, 6))
+        bar_w = 380
+        for i, (key, val) in enumerate(r['breakdown'].items()):
+            row = tk.Frame(card, bg=T['card'])
+            row.pack(fill=tk.X, padx=18, pady=3)
+            tk.Label(row, text=names.get(key, key), bg=T['card'], fg=T['fg'],
+                     font=(ui.FONT, 11), width=14, anchor=tk.W).pack(side=tk.LEFT)
+            c = T['sb'] if val >= 70 else T['buy'] if val >= 50 else T['hold'] if val >= 30 else T['sell']
+            bar = tk.Canvas(row, width=bar_w, height=14, bg=T['card'], highlightthickness=0)
+            bar.pack(side=tk.LEFT, padx=8)
+            ui.round_rect(bar, 0, 2, bar_w, 12, 5, fill=T['bg3'], outline='')
+
+            def grow(v, bar=bar, val=val, c=c):
+                bar.delete('fill')
+                w = bar_w * val / 100 * v
+                if w > 1:
+                    ui.round_rect(bar, 0, 2, w, 12, 5, fill=c, outline='', tags='fill')
+            self.root.after(i * 45, lambda grow=grow, bar=bar: ui.tween(bar, 700, grow))
+            tk.Label(row, text=f"{val}", bg=T['card'], fg=T['fg'], font=(ui.DISPLAY, 11, 'bold'), width=4,
+                     anchor=tk.E).pack(side=tk.LEFT)
             lbl = "Strong" if val >= 70 else "Good" if val >= 50 else "Weak" if val >= 30 else "Bearish"
-            tk.Label(row, text=lbl, bg=T['bg'], fg=c, font=('Segoe UI', 9), width=8).pack(side=tk.LEFT)
+            tk.Label(row, text=lbl, bg=T['card'], fg=T['fg2'], font=(ui.FONT, 10), width=8, anchor=tk.W).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Frame(card, bg=T['card'], height=8).pack()
 
         self._draw_score_history(r)
 
@@ -4081,27 +4313,25 @@ class App:
         except Exception as e:
             logger.error(f"Score history read failed: {e}")
             return
-        box = tk.LabelFrame(self.bd_frame, text=" SCORE HISTORY ", bg=T['bg'], fg=T['accent'],
-                            font=('Segoe UI', 11, 'bold'))
-        box.pack(fill=tk.X, padx=100, pady=(18, 10))
+        box = tk.Frame(self.bd_frame, bg=T['card'], highlightbackground=T['line'], highlightthickness=1)
+        box.pack(fill=tk.X, padx=100, pady=(0, 16))
+        tk.Label(box, text="Score history", bg=T['card'], fg=T['fg2'],
+                 font=(ui.FONT, 10, 'bold')).pack(anchor=tk.W, padx=18, pady=(12, 4))
         if len(hist) < 2 or not MATPLOTLIB_OK:
             tk.Label(box, text="The history builds up as you scan on different days - one point per day.",
-                     bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 10)).pack(pady=8)
+                     bg=T['card'], fg=T['fg3'], font=(ui.FONT, 10)).pack(anchor=tk.W, padx=18, pady=(0, 12))
             return
         dates = [datetime.strptime(h['date'], '%Y-%m-%d') for h in hist]
         scores = [safe_float(h['score']) for h in hist]
-        fig = Figure(figsize=(9, 2.6), dpi=100, facecolor=T['bg'])
+        fig = Figure(figsize=(9, 2.6), dpi=100, facecolor=T['card'], layout='constrained')
         ax = fig.add_subplot(111)
-        ax.set_facecolor(T['card'])
-        for level, col in ((75, '#059669'), (60, '#10b981'), (45, '#d97706'), (30, '#ef4444')):
-            ax.axhline(level, color=col, linewidth=0.8, linestyle='--', alpha=0.7)
-        ax.plot(dates, scores, color='#60a5fa', linewidth=1.8, marker='o', markersize=4)
+        self._style_axes(ax)
+        for level, col in ((75, T['sb']), (60, T['buy']), (45, T['hold']), (30, T['sell'])):
+            ax.axhline(level, color=col, linewidth=0.9, linestyle='--', alpha=1.0)
+        ax.plot(dates, scores, color=T['series0'], linewidth=2, marker='o', markersize=4)
         ax.set_ylim(0, 100)
-        ax.set_ylabel('Score', color='#94a3b8', fontsize=9)
-        ax.tick_params(colors='#94a3b8', labelsize=8)
-        ax.grid(True, alpha=0.15)
+        ax.set_ylabel('Score', color=T['chart_fg'], fontsize=9)
         fig.autofmt_xdate()
-        fig.tight_layout()
         chart = FigureCanvasTkAgg(fig, master=box)
         chart.draw()
         chart.get_tk_widget().pack(fill=tk.X, padx=5, pady=5)
@@ -4109,107 +4339,184 @@ class App:
         tk.Label(box, text=f"{len(hist)} scan days | first {first['date']}: {safe_float(first['score']):.1f} ({first['rec']})  ->  "
                            f"latest {last['date']}: {safe_float(last['score']):.1f} ({last['rec']})   "
                            f"(dashed lines: 75 Strong Buy, 60 Buy, 45 Hold, 30 Sell)",
-                 bg=T['bg'], fg=T['fg3'], font=('Segoe UI', 9)).pack(pady=(0, 6))
+                 bg=T['card'], fg=T['fg3'], font=(ui.FONT, 9)).pack(pady=(0, 10))
+
+    def _style_axes(self, ax):
+        """Chart axes in the theme's colours: quiet grid and labels, no heavy frame."""
+        T = THEME
+        ax.set_facecolor(T['chart_bg'])
+        ax.tick_params(colors=T['chart_fg'], labelsize=8)
+        for side in ax.spines.values():
+            side.set_color(T['chart_grid'])
+        ax.grid(True, color=T['chart_grid'], linewidth=0.6)
+        ax.set_axisbelow(True)
+
+    def _panel(self, parent, edge=None, **pack):
+        """A white (dark: raised) card with a thin border; `edge` adds a coloured strip on its left."""
+        T = THEME
+        outer = tk.Frame(parent, bg=T['card'], highlightbackground=T['line'], highlightthickness=1)
+        outer.pack(fill=tk.X, padx=100, **pack)
+        if edge:
+            tk.Frame(outer, bg=edge, width=4).pack(side=tk.LEFT, fill=tk.Y)
+        body = tk.Frame(outer, bg=T['card'])
+        body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        return body
+
+    def _price_ladder(self, parent, price, levels):
+        """The stop-loss, price and targets on one line, to scale. The marks slide out from
+        the price to where they sit, so you see at a glance how far each level is."""
+        T = THEME
+        pts = [(lbl, v, c) for lbl, v, c in levels if v]
+        if not pts or not price:
+            return
+        lo = min([price] + [v for _, v, _ in pts])
+        hi = max([price] + [v for _, v, _ in pts])
+        span = (hi - lo) or price * 0.01 or 1
+        cv = tk.Canvas(parent, height=96, bg=T['card'], highlightthickness=0)
+        cv.pack(fill=tk.X, padx=18, pady=(4, 12))
+
+        def draw(v):
+            cv.delete('all')
+            w = cv.winfo_width()
+            if w < 100:
+                return
+            x0, x1 = 40, w - 40
+            pos = lambda val: x0 + (val - lo) / span * (x1 - x0)
+            y = 40
+            ui.round_rect(cv, x0 - 6, y - 3, x1 + 6, y + 3, 3, fill=T['bg3'], outline='')
+            px = pos(price)
+            for lbl, val, c in sorted(pts, key=lambda p: -abs(p[1] - price)):    # nearer levels drawn on top
+                cv.create_line(px, y, px + (pos(val) - px) * v, y, fill=c, width=3)
+            for i, (lbl, val, c) in enumerate(sorted(pts, key=lambda p: p[1])):
+                x = px + (pos(val) - px) * v
+                cv.create_oval(x - 7, y - 7, x + 7, y + 7, fill=c, outline=T['card'], width=2)
+                up = i % 2 == 0
+                cv.create_text(x, y - 16 if up else y + 18, text=lbl, fill=T['fg2'], font=(ui.FONT, 9),
+                               anchor='s' if up else 'n')
+                cv.create_text(x, y - 28 if up else y + 32, text=f"{val:,.2f}", fill=T['fg'], font=(ui.FONT, 9, 'bold'),
+                               anchor='s' if up else 'n')
+            cv.create_rectangle(px - 2, y - 13, px + 2, y + 13, fill=T['fg'], outline='')
+            cv.create_text(px, y + 30, text=f"Price {price:,.2f}", fill=T['fg'], font=(ui.FONT, 9, 'bold'))
+
+        cv.bind('<Configure>', lambda e: draw(1.0))
+        self.root.after(80, lambda: ui.tween(cv, 800, draw))
 
     def update_targets(self, r):
         T = THEME
         for w in self.tg_frame.winfo_children():
             w.destroy()
-        
+
         t = r.get('targets', {})
         if not t:
             tk.Label(self.tg_frame, text="No target data", bg=T['bg'], fg=T['fg3']).pack(pady=50)
             return
-        
+
         price = t.get('price', 0)
         rec = r['rec']
-        
+
         tk.Label(self.tg_frame, text=f"Stop-Loss & Targets: {r['symbol']}",
-                bg=T['bg'], fg=T['gold'], font=('Segoe UI', 20, 'bold')).pack(pady=20)
-        
-        tk.Label(self.tg_frame, text=f"{price:,.2f}", bg=T['card'], fg='white',
-                font=('Segoe UI', 28, 'bold')).pack(pady=10, padx=100, fill=tk.X)
-        
-        rec_c = '#059669' if rec in ['STRONG BUY', 'BUY'] else '#ef4444' if rec in ['SELL', 'STRONG SELL'] else '#d97706'
-        tk.Label(self.tg_frame, text=f"{rec} | {t.get('pos', '')}", bg=T['bg'], fg=rec_c,
-                font=('Segoe UI', 14, 'bold')).pack(pady=10)
+                 bg=T['bg'], fg=T['fg'], font=(ui.DISPLAY, 18, 'bold')).pack(anchor=tk.W, padx=100, pady=(22, 12))
+
+        head = self._panel(self.tg_frame, edge=ui.signal_color(T, rec), pady=(0, 10))
+        tk.Label(head, text=f"{price:,.2f}", bg=T['card'], fg=T['fg'], font=(ui.DISPLAY, 28, 'bold')).pack(anchor=tk.W, padx=18, pady=(12, 0))
+        tk.Label(head, text=f"{rec}   |   Position: {t.get('pos', '')}", bg=T['card'], fg=T['fg2'],
+                 font=(ui.FONT, 12, 'bold')).pack(anchor=tk.W, padx=18, pady=(0, 12))
 
         if self._is_illiquid(r):
             liq = r.get('data', {}).get('liquidity_cr', 0)
-            tk.Label(self.tg_frame, text=f"LOW LIQUIDITY: only about Rs {liq:.2f} crore traded per day "
+            tk.Label(self.tg_frame, text=f"Low liquidity: only about Rs {liq:.2f} crore traded per day "
                                          f"(threshold Rs {self.min_liquidity_cr:g} Cr).\n"
                                          "Price can gap past the stop-loss and orders may not fill - treat these levels with caution.",
-                     bg='#78350f', fg='#fde68a', font=('Segoe UI', 10, 'bold'), padx=12, pady=8,
-                     justify=tk.LEFT).pack(fill=tk.X, padx=100, pady=(0, 10))
-        
+                     bg=T['warn_bg'], fg=T['warn_fg'], font=(ui.FONT, 10, 'bold'), padx=12, pady=8,
+                     justify=tk.LEFT, anchor=tk.W).pack(fill=tk.X, padx=100, pady=(0, 10))
+
+        if r.get('hourly'):
+            tk.Label(self.tg_frame, text="New listing, 1-hour candles: the stop-loss and targets come from hourly price swings,\n"
+                                         "so they sit closer to the price than for stocks analysed on daily candles.",
+                     bg=T['info_bg'], fg=T['info_fg'], font=(ui.FONT, 10, 'bold'), padx=12, pady=8,
+                     justify=tk.LEFT, anchor=tk.W).pack(fill=tk.X, padx=100, pady=(0, 10))
+
+        # Each level says where it comes from: the stock's own support/resistance, or the ATR
+        basis = t.get('basis', {})
+        def why(key, text):
+            return f"{text}  |  {basis[key][0].upper()}{basis[key][1:]}" if basis.get(key) else text
+        stop_text = 'Exit if price rises above' if t.get('pos') == 'SHORT' else 'Exit if price falls below'
         levels = [
-            ("STOP LOSS", t.get('sl', 0), '#ef4444', 'Exit if price falls below'),
-            ("TARGET 1 (Conservative)", t.get('t1', 0), '#10b981', 'Book partial profits'),
-            ("TARGET 2 (Moderate)", t.get('t2', 0), '#059669', 'Main target - book 50%'),
-            ("TARGET 3 (Aggressive)", t.get('t3', 0), '#3b82f6', 'Trail stop loss'),
+            ("STOP LOSS", t.get('sl', 0), T['sell'], why('sl', stop_text)),
+            ("TARGET 1 (Conservative)", t.get('t1', 0), T['buy'], why('t1', 'Book partial profits')),
+            ("TARGET 2 (Moderate)", t.get('t2', 0), T['sb'], why('t2', 'Main target - book 50%')),
+            ("TARGET 3 (Aggressive)", t.get('t3', 0), T['accent'], why('t3', 'Trail stop loss')),
         ]
-        
-        for label, val, color, desc in levels:
-            frame = tk.Frame(self.tg_frame, bg=T['card'], highlightbackground=color, highlightthickness=2)
-            frame.pack(fill=tk.X, padx=100, pady=6)
-            tk.Label(frame, text=label, bg=T['card'], fg=color, font=('Segoe UI', 11, 'bold')).pack(anchor=tk.W, padx=15, pady=(10, 0))
-            tk.Label(frame, text=f"{val:,.2f}" if val else "N/A", bg=T['card'], fg=color, font=('Segoe UI', 22, 'bold')).pack(padx=15, pady=5)
-            tk.Label(frame, text=desc, bg=T['card'], fg=T['fg3'], font=('Segoe UI', 9)).pack(anchor=tk.W, padx=15, pady=(0, 10))
-        
+
+        ladder = self._panel(self.tg_frame, pady=(0, 10))
+        tk.Label(ladder, text="Where the levels sit", bg=T['card'], fg=T['fg2'],
+                 font=(ui.FONT, 10, 'bold')).pack(anchor=tk.W, padx=18, pady=(12, 0))
+        self._price_ladder(ladder, price, [("Stop", t.get('sl', 0), T['sell']), ("T1", t.get('t1', 0), T['buy']),
+                                           ("T2", t.get('t2', 0), T['sb']), ("T3", t.get('t3', 0), T['accent'])])
+
+        grid = tk.Frame(self.tg_frame, bg=T['bg'])
+        grid.pack(fill=tk.X, padx=100, pady=(0, 4))
+        for i, (label, val, color, desc) in enumerate(levels):
+            grid.columnconfigure(i % 2, weight=1, uniform='lv')
+            outer = tk.Frame(grid, bg=T['card'], highlightbackground=T['line'], highlightthickness=1)
+            outer.grid(row=i // 2, column=i % 2, sticky='nsew', padx=(0 if i % 2 == 0 else 5, 5 if i % 2 == 0 else 0), pady=5)
+            tk.Frame(outer, bg=color, width=4).pack(side=tk.LEFT, fill=tk.Y)
+            body = tk.Frame(outer, bg=T['card'])
+            body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            tk.Label(body, text=label, bg=T['card'], fg=T['fg2'], font=(ui.FONT, 10, 'bold')).pack(anchor=tk.W, padx=15, pady=(10, 0))
+            tk.Label(body, text=f"{val:,.2f}" if val else "N/A", bg=T['card'], fg=T['fg'], font=(ui.DISPLAY, 22, 'bold')).pack(anchor=tk.W, padx=15, pady=2)
+            tk.Label(body, text=desc, bg=T['card'], fg=T['fg3'], font=(ui.FONT, 9), wraplength=420,
+                     justify=tk.LEFT).pack(anchor=tk.W, padx=15, pady=(0, 10))
+
         # Risk-Reward
-        rr_frame = tk.Frame(self.tg_frame, bg=T['card'], highlightbackground=T['gold'], highlightthickness=2)
-        rr_frame.pack(fill=tk.X, padx=100, pady=15)
-        
-        tk.Label(rr_frame, text="RISK-REWARD ANALYSIS", bg=T['card'], fg=T['gold'], font=('Segoe UI', 14, 'bold')).pack(pady=(15, 10))
-        
+        rr_frame = self._panel(self.tg_frame, pady=10)
+        tk.Label(rr_frame, text="Risk-reward", bg=T['card'], fg=T['fg'], font=(ui.DISPLAY, 14, 'bold')).pack(anchor=tk.W, padx=18, pady=(14, 6))
+
         risk_amt = t.get('risk', 0) or 0
         reward_amt = t.get('reward', 0) or 0
         rr = t.get('rr', 0) or 0
-        
+
         boxes = tk.Frame(rr_frame, bg=T['card'])
-        boxes.pack(fill=tk.X, padx=20, pady=10)
-        
-        # Risk
-        rb = tk.Frame(boxes, bg='#7f1d1d', highlightbackground='#ef4444', highlightthickness=1)
-        rb.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=10)
-        tk.Label(rb, text="RISK", bg='#7f1d1d', fg='#fca5a5', font=('Segoe UI', 10, 'bold')).pack(pady=(10, 2))
-        tk.Label(rb, text=f"{risk_amt:,.2f}", bg='#7f1d1d', fg='white', font=('Segoe UI', 22, 'bold')).pack(pady=2)
-        tk.Label(rb, text=f"{(risk_amt/price*100):.1f}%" if price > 0 else "", bg='#7f1d1d', fg='#fca5a5', font=('Segoe UI', 10)).pack(pady=(0, 10))
-        
-        tk.Label(boxes, text="-->", bg=T['card'], fg='white', font=('Segoe UI', 24, 'bold')).pack(side=tk.LEFT, padx=15)
-        
-        # Reward
-        rwb = tk.Frame(boxes, bg='#064e3b', highlightbackground='#10b981', highlightthickness=1)
-        rwb.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=10)
-        tk.Label(rwb, text="REWARD", bg='#064e3b', fg='#6ee7b7', font=('Segoe UI', 10, 'bold')).pack(pady=(10, 2))
-        tk.Label(rwb, text=f"{reward_amt:,.2f}", bg='#064e3b', fg='white', font=('Segoe UI', 22, 'bold')).pack(pady=2)
-        tk.Label(rwb, text=f"{(reward_amt/price*100):.1f}%" if price > 0 else "", bg='#064e3b', fg='#6ee7b7', font=('Segoe UI', 10)).pack(pady=(0, 10))
-        
+        boxes.pack(fill=tk.X, padx=18, pady=6)
+        for title, amt, bg, fg in (("Risk", risk_amt, T['risk_bg'], T['risk_fg']), (None, None, None, None),
+                                   ("Reward", reward_amt, T['reward_bg'], T['reward_fg'])):
+            if title is None:
+                tk.Label(boxes, text="->", bg=T['card'], fg=T['fg3'], font=(ui.FONT, 20, 'bold')).pack(side=tk.LEFT, padx=12)
+                continue
+            box = tk.Frame(boxes, bg=bg)
+            box.pack(side=tk.LEFT, expand=True, fill=tk.X)
+            tk.Label(box, text=title, bg=bg, fg=fg, font=(ui.FONT, 10, 'bold')).pack(pady=(10, 2))
+            tk.Label(box, text=f"{amt:,.2f}", bg=bg, fg=T['fg'], font=(ui.DISPLAY, 22, 'bold')).pack(pady=2)
+            tk.Label(box, text=f"{(amt/price*100):.1f}% of the price" if price > 0 else "", bg=bg, fg=fg,
+                     font=(ui.FONT, 10)).pack(pady=(0, 10))
+
         # Ratio
-        rr_c = '#059669' if rr >= 2 else '#10b981' if rr >= 1.5 else '#d97706' if rr >= 1 else '#ef4444'
-        quality = "EXCELLENT" if rr >= 2 else "GOOD" if rr >= 1.5 else "ACCEPTABLE" if rr >= 1 else "POOR"
-        
-        tk.Label(rr_frame, text="Risk : Reward", bg=T['card'], fg=T['fg3'], font=('Segoe UI', 11)).pack(pady=(15, 5))
-        tk.Label(rr_frame, text=f"1 : {rr:.2f}" if rr > 0 else "N/A", bg=T['card'], fg=rr_c, font=('Segoe UI', 36, 'bold')).pack(pady=5)
-        tk.Label(rr_frame, text=f"Quality: {quality}", bg=T['card'], fg=rr_c, font=('Segoe UI', 14, 'bold')).pack(pady=(5, 15))
-        
+        rr_c = T['sb'] if rr >= 2 else T['success'] if rr >= 1.5 else T['warning'] if rr >= 1 else T['danger2']
+        quality = "Excellent" if rr >= 2 else "Good" if rr >= 1.5 else "Acceptable" if rr >= 1 else "Poor"
+
+        tk.Label(rr_frame, text="Risk : Reward", bg=T['card'], fg=T['fg3'], font=(ui.FONT, 11)).pack(pady=(12, 0))
+        tk.Label(rr_frame, text=f"1 : {rr:.2f}" if rr > 0 else "N/A", bg=T['card'], fg=rr_c, font=(ui.DISPLAY, 34, 'bold')).pack()
+        tk.Label(rr_frame, text=f"Quality: {quality}", bg=T['card'], fg=rr_c, font=(ui.FONT, 13, 'bold')).pack(pady=(0, 6))
+        main_target = "Target 1" if t.get('pos') == 'HOLD' else "Target 2"
+        tk.Label(rr_frame, text=f"Risk = from the price to the stop-loss.  Reward = from the price to {main_target}.\n"
+                                "The levels are this stock's own support and resistance, so the ratio differs from stock to stock.",
+                 bg=T['card'], fg=T['fg3'], font=(ui.FONT, 9)).pack(pady=(0, 14))
+
         # Advice
-        advice_f = tk.Frame(self.tg_frame, bg=T['card'], highlightbackground=T['warning'], highlightthickness=1)
-        advice_f.pack(fill=tk.X, padx=100, pady=15)
-        
-        tk.Label(advice_f, text="TRADING ADVICE", bg=T['card'], fg=T['warning'], font=('Segoe UI', 12, 'bold')).pack(pady=(10, 5))
-        
+        advice_f = self._panel(self.tg_frame, edge=T['warning'], pady=(4, 20))
+        tk.Label(advice_f, text="Trading advice", bg=T['card'], fg=T['fg'], font=(ui.DISPLAY, 12, 'bold')).pack(anchor=tk.W, padx=18, pady=(12, 4))
+
         if rec in ['STRONG BUY', 'BUY']:
             advice = f"Enter at: {price:,.2f}\nStop Loss: {t.get('sl', 0):,.2f}\nTarget: {t.get('t1', 0):,.2f}\nRisk: {(risk_amt/price*100):.1f}% per trade"
         elif rec in ['SELL', 'STRONG SELL']:
             advice = f"Exit at: {price:,.2f}\nStop Loss: {t.get('sl', 0):,.2f}\nTarget: {t.get('t1', 0):,.2f}"
         else:
             advice = f"Support: {t.get('sl', 0):,.2f}\nResistance: {t.get('t1', 0):,.2f}\nWait for breakout"
-        
-        tk.Label(advice_f, text=advice, bg=T['card'], fg=T['fg'], font=('Segoe UI', 11), justify=tk.LEFT).pack(padx=15, pady=15)
-        
+
+        tk.Label(advice_f, text=advice, bg=T['card'], fg=T['fg'], font=(ui.FONT, 11), justify=tk.LEFT).pack(anchor=tk.W, padx=18, pady=(0, 14))
+
         self.nb.select(3)
-    
+
     def generate_daily_report(self):
         if not REPORT_OK:
             messagebox.showerror("Error", "Daily report module not found.")
@@ -4468,7 +4775,7 @@ class App:
             html += '<tr><th>Symbol</th><th>Price</th><th>Change%</th><th>RSI</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>R:R</th></tr>'
             for r in top_picks:
                 t = r.get('targets', {})
-                html += f'<tr class="top-pick"><td><b>{r["symbol"]}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{r["rsi"]:.0f}</td><td><b>{r["score"]:.0f}</b></td><td><span class="{r["rec"].lower().replace(" ", "-")}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>1:{t.get("rr", 0)}</td></tr>'
+                html += f'<tr class="top-pick"><td><b>{r["symbol"]}{"*" if r.get("hourly") else ""}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{r["rsi"]:.0f}</td><td><b>{r["score"]:.0f}</b></td><td><span class="{r["rec"].lower().replace(" ", "-")}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>1:{t.get("rr", 0)}</td></tr>'
             html += '</table></div>'
         
         # All results table
@@ -4481,11 +4788,14 @@ class App:
             row_class = 'top-pick' if r['rec'] in ['STRONG BUY', 'BUY'] else 'avoid' if r['rec'] in ['SELL', 'STRONG SELL'] else ''
             rs3 = (r.get('rs') or {}).get('3M')
             rs_cell = f"{rs3:+.1f}%" if rs3 is not None else "N/A"
-            html += f'<tr class="{row_class}"><td>{i}</td><td><b>{r["symbol"]}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{rs_cell}</td><td>{r["rsi"]:.0f}</td><td>{r.get("st_sig", "")}</td><td>{r["score"]:.0f}</td><td><span class="{rec_class}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>{self._liquidity_text(r)}</td></tr>'
+            html += f'<tr class="{row_class}"><td>{i}</td><td><b>{r["symbol"]}{"*" if r.get("hourly") else ""}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{rs_cell}</td><td>{r["rsi"]:.0f}</td><td>{r.get("st_sig", "")}</td><td>{r["score"]:.0f}</td><td><span class="{rec_class}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>{self._liquidity_text(r)}</td></tr>'
         
         html += '</table>'
         html += (f'<p style="font-size:11px;color:#666">LOW = average traded value below Rs {self.min_liquidity_cr:g} crore/day: '
-                 'stop-loss and targets are less reliable for these stocks.</p></div>')
+                 'stop-loss and targets are less reliable for these stocks.</p>')
+        if any(r.get('hourly') for r in self.results):
+            html += f'<p style="font-size:11px;color:#666">{market_data.HOURLY_NOTE}</p>'
+        html += '</div>'
         
         # Stocks to avoid
         avoid_list = [r for r in sorted_results if r['rec'] in ['SELL', 'STRONG SELL']][:5]
@@ -4520,13 +4830,13 @@ class App:
                                 f'watchlist_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf')
         os.makedirs(os.path.dirname(pdf_file), exist_ok=True)
         
-        logo_path = LOGO_PATH
-        
+        logo = pdf_logo(LOGO_PATH) if LOGO_PATH.exists() else None
+
         def add_header(canvas_obj, doc):
             canvas_obj.saveState()
-            if logo_path.exists():
+            if logo:
                 try:
-                    canvas_obj.drawImage(str(logo_path), 25, A4[1] - 75, 
+                    canvas_obj.drawImage(logo, 25, A4[1] - 75,
                                        width=45, height=45, preserveAspectRatio=True, mask='auto')
                 except: pass
             canvas_obj.setFont('Helvetica-Bold', 14)
@@ -4584,7 +4894,7 @@ class App:
         for i, r in enumerate(sorted_results, 1):
             t_data = r.get('targets', {})
             data.append([
-                str(i), r['symbol'], f"{r['price']:.2f}", f"{r['change']:+.1f}%",
+                str(i), r['symbol'] + ('*' if r.get('hourly') else ''), f"{r['price']:.2f}", f"{r['change']:+.1f}%",
                 f"{r['rsi']:.0f}", r.get('st_sig', ''), f"{r['score']:.0f}", r['rec'],
                 f"{t_data.get('sl', 'N/A')}", f"{t_data.get('t1', 'N/A')}", f"1:{t_data.get('rr', 0)}"
             ])
@@ -4601,7 +4911,10 @@ class App:
             ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
         ]))
         elements.append(t)
-        
+        if any(r.get('hourly') for r in self.results):
+            elements.append(Spacer(1, 8))
+            elements.append(Paragraph(market_data.HOURLY_NOTE, ParagraphStyle('N', parent=styles['Normal'], fontSize=8, textColor=colors.gray)))
+
         doc.build(elements, onFirstPage=add_header, onLaterPages=add_header)
         return pdf_file
     
@@ -4690,6 +5003,14 @@ def _self_test():
     check("analysis + score", lambda: (lambda d: f"{Scorer.score(d)['total']} / patterns {d['patterns']['summary']['total_patterns']}")(
         Analyzer().analyze(data['RELIANCE'])))
 
+    def targets():
+        d = Analyzer().analyze(data['RELIANCE'])
+        t = TargetCalc.calc(d, Scorer.score(d)['rec'])
+        if not t.get('basis') or min(t['sl'], t['t1'], t['t2'], t['t3']) <= 0:
+            raise RuntimeError(str(t))
+        return f"stop {t['sl']} ({t['basis']['sl']}), target 1 {t['t1']} ({t['basis']['t1']}), risk:reward 1:{t['rr']}"
+    check("stop-loss and targets (support/resistance)", targets)
+
     def vs_nifty():
         nifty = market_data.load_history([NIFTY_SYMBOL], years=2, exchange='INDEX').get(NIFTY_SYMBOL)
         if nifty is None or len(nifty) < 130:
@@ -4699,6 +5020,27 @@ def _self_test():
             raise RuntimeError(f"no 3-month figure: {rs}")
         return f"RELIANCE vs Nifty 50: {rs}"
     check("relative strength (Nifty 50)", vs_nifty)
+
+    def hourly_candles():   # what new listings are scanned on: built from 15-minute candles
+        ticker = 'RELIANCE.NS'
+        df = market_data._hourly(market_data._download([ticker], tz=market_data.HOURLY_TZ, period='5d', interval='15m')[ticker])
+        first_hour = df[df.index.strftime('%H:%M') == '09:15']
+        if not market_data.is_hourly(df) or len(first_hour) < 2 or first_hour['Volume'].sum() <= 0:
+            raise RuntimeError(f"{len(df)} candles, {len(first_hour)} of them 09:15-10:15")
+        return f"{len(df)} candles over {Analyzer().analyze(df)['days']} days"
+    check("1-hour candles (new listings)", hourly_candles)
+
+    def report_parts():   # the daily report must score a stock exactly as the scan does
+        import daily_report
+        r = daily_report.StockAnalyzer().analyze('RELIANCE', 'NSE', data['RELIANCE'])
+        scan = Scorer.score(Analyzer().analyze(data['RELIANCE']))
+        if r is None or abs(r['score'] - scan['total']) > 0.05 or r['recommendation'] != scan['rec']:
+            raise RuntimeError(f"report {r and r['score']} vs scan {scan['total']}")
+        if isinstance(pdf_logo(LOGO_PATH), str):
+            raise RuntimeError("small logo for PDFs could not be made")
+        return (f"score {r['score']} {r['recommendation']} as in the scan, {len(daily_report.nifty50_stocks())} Nifty 50 stocks, "
+                f"{len(daily_report.NewsFetcher().fetch_news(max_articles=5))} news headlines")
+    check("daily report (same score as the scan)", report_parts)
     def full_backtest():   # the whole thing incl. statistics (SciPy-free since 1 Oct fix)
         r = backtest.run_backtest(data, Scorer, dict(Scorer.WEIGHTS), 10)
         if 'error' in r:
@@ -4721,6 +5063,30 @@ def _self_test():
         return f"TkAgg on Tk {tk.TkVersion}"
     check("chart", chart)
 
+    def chart_3d():      # the 3D market map and the 3D sector chart
+        root = tk.Tk(); root.withdraw()
+        fig = Figure(figsize=(4, 3))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.scatter([10, 50, 70], [-5, 0, 8], [30, 50, 80], depthshade=True)
+        ax.bar3d(0, 0, 0, 0.6, 0.6, 3, shade=True)
+        ax.view_init(elev=24, azim=-60)
+        FigureCanvasTkAgg(fig, master=root).draw(); root.destroy()
+        return "3D scatter and bars drawn"
+    check("3D charts", chart_3d)
+
+    def look():          # both colour schemes, fonts, 3D buttons and signal markers
+        root = tk.Tk(); root.withdraw()
+        ui.init_fonts(root)
+        for mode in ('light', 'dark'):
+            T = ui.palette(mode)
+            ui.style_ttk(root, T)
+            ui.marker_images(T)
+            ui.RoundButton(root, "Test", kind='primary', theme=T).invoke()
+            ui.SummaryCard(root, T).update_values({'BUY': 1}, 1, 60.0, animate=False)
+        root.destroy()
+        return f"light + dark; fonts {ui.FONT} / {ui.DISPLAY}"
+    check("look (light and dark)", look)
+
     def pdf():
         path = os.path.join(tempfile.gettempdir(), 'dr_shah_selftest.pdf')
         SimpleDocTemplate(path, pagesize=A4).build([Paragraph("Self-test", getSampleStyleSheet()['Normal'])])
@@ -4731,6 +5097,7 @@ def _self_test():
     check("PDF export + import", pdf)
     check("NSE corporate actions", lambda: f"{len(CorporateActionsEngine().nse.fetch_all_actions())} actions")
     check("NSE holiday calendar", lambda: f"{len(scheduled_report._nse_holidays(datetime.now().year))} holidays")
+    check("market light", lambda: market_status(datetime.now(), scheduled_report.cached_holidays(datetime.now().year))[1])
 
     lines.append("RESULT: " + ("ALL PASSED" if not failed else f"{len(failed)} FAILED: {', '.join(failed)}"))
     (DATA_DIR / "self_test_result.txt").write_text("\n".join(lines), encoding='utf-8')

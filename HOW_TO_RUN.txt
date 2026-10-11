@@ -24,7 +24,7 @@ STEP 2: VERIFY INSTALLATION
 -----------------------------
 
 Run this command to verify:
-   python -c "import yfinance, pandas, numpy, ta, sklearn, openpyxl, reportlab, pdfplumber; print('All OK!')"
+   python -c "import yfinance, pandas, numpy, ta, openpyxl, reportlab, pdfplumber; print('All OK!')"
 
 
 STEP 3: RUN THE APP
@@ -97,6 +97,84 @@ NEW FEATURES
 10. FULL AUTOMATIC TEST
    Double-click run_tests.bat - tests every feature on a throwaway copy.
 
+11. NEW LISTINGS ARE SCANNED ON 1-HOUR CANDLES
+   A stock listed less than a month ago doesn't have enough daily candles,
+   so the scan uses its 1-hour candles for every indicator (RSI, MACD,
+   averages, SuperTrend, VWAP, ATR, patterns ...). Scan Results marks it
+   "1 Hour" in the "Candle" column; reports mark it with a *.
+   - It gets a score from its 3rd trading day (20 hourly candles). Before
+     that the scan lists it as "listed under 3 trading days ago".
+   - Its stop-loss and targets come from hourly price swings, so they sit
+     closer to the price than for stocks analysed on daily candles.
+   - "vs Nifty" shows N/A until it has traded for the full period.
+   - After a month it switches to daily candles like every other stock, so
+     its score can jump that day.
+
+12. FIXES FROM THE OCTOBER 2026 DEEP SCAN
+   - The daily emailed report now gives every stock the SAME score and
+     signal as the scan (it used a simpler formula of its own: 3 stocks
+     in 4 showed a different signal). Scores in the report change once.
+   - The report's Top Picks no longer list a stock twice (NSE and BSE),
+     its "Nifty 50" is NSE's current list, and its news is real headlines
+     (it was showing made-up placeholder lines when Yahoo had no news).
+   - SuperTrend now flips on the same candle as broker charts (standard
+     ATR smoothing); about 1 stock in 20 shows a different SuperTrend.
+   - 1-month chart no longer says "No data" in months with few trading days.
+   - Corporate Actions: an event announced on both NSE and BSE is listed
+     once; "Amount" is shown for dividends only.
+   - Import: files saved by Excel no longer lose their first symbol, and
+     a heading such as "Symbol" is no longer added as a stock.
+   - Report PDFs shrink from about 2 MB to under 100 KB (the logo was
+     stored full-size in each one).
+
+13. STOP-LOSS AND TARGETS FROM SUPPORT AND RESISTANCE
+   The stop-loss now sits just beyond the stock's nearest support (for a
+   SELL: its nearest resistance) and the three targets at its next
+   resistance levels (for a SELL: supports). The levels are the swing
+   highs and lows of the last year. The Stop-Loss & Targets tab says where
+   each level comes from, e.g. "Just below support at 96.00, tested 3
+   times".
+   - Risk:Reward now differs from stock to stock: low when a resistance is
+     close overhead, high when the next one is far. Before, every BUY
+     showed 1:1.67 because all levels were fixed multiples of the ATR.
+   - Where a stock has no level within reach (for example at a new high,
+     with no resistance above), a multiple of its ATR is still used and
+     the tab says so.
+   - The daily emailed report uses the same levels.
+
+14. SECTOR ROTATION SHOWS DIRECTION, NOT JUST STRENGTH
+   The Sector tab has a "Chg" column: the change in each sector's average
+   score since the scan of about a week earlier (or your previous scan
+   day, until the score history is a week long). Rotation is now:
+     LEADING    above your watchlist's average and not falling
+     WEAKENING  above average, but the score has fallen
+     IMPROVING  below average, but the score has risen
+     LAGGING    below average and not rising
+   Before, "IMPROVING" and "WEAKENING" only reflected the score level.
+
+15. MARKET OPEN / CLOSED LIGHT KNOWS NSE HOLIDAYS
+   On an NSE holiday the light shows "Market closed: NSE holiday". The
+   holiday list is downloaded again every week, so holidays declared
+   during the year are picked up (also by the scheduled email report).
+
+16. UNUSED FILES REMOVED
+   ai_engine.py and live_trading.py were never used by the app and have
+   been deleted; scikit-learn is no longer installed for the app.
+
+17. NEW LOOK: DAYLIGHT DESIGN, DARK MODE, 3D AND ANIMATIONS
+   - Light "Daylight" design. Settings > Appearance > Dark switches to dark
+     mode straight away (your results stay on screen) and is remembered.
+   - Settings > Appearance > Animations turns the motion on or off.
+   - Raised 3D buttons that press down, a sliding tab underline, a scan
+     summary that counts up, a score ring that sweeps round, bars that
+     grow, price charts that draw themselves in, and a pulsing market light.
+   - After a scan, the result slides in at the bottom right instead of a
+     box you had to close; rows whose signal changed glow for a moment.
+   - Charts tab > "3D market map": every scanned stock in 3D (score, RSI,
+     strength vs the Nifty 50). It turns by itself; click it to stop and
+     drag to turn it.
+   - Sector tab: a 3D chart of buy, hold and sell stocks in each sector.
+
 
 TROUBLESHOOTING
 -----------------
@@ -122,6 +200,9 @@ FILES IN THIS FOLDER:
 
 Required files (must be in same folder):
 - dr_shah_analysis.py          (Main app)
+- scoring.py                   (Indicators, score, stop-loss and targets)
+- score_history.py             (Score history)
+- app_paths.py                 (Where the app keeps its files)
 - daily_report.py              (Daily report + email)
 - market_data.py               (Fast price downloads + cache)
 - backtest.py                  (Backtest tab)
@@ -129,7 +210,7 @@ Required files (must be in same folder):
 - corporate_actions_engine.py  (Live NSE/BSE corporate actions)
 - corporate_actions.py         (Dividend fallback data)
 - pattern_recognition.py       (Pattern detection)
-- ai_engine.py                 (AI/ML engine)
+- ui_theme.py                  (Light/dark colours, 3D buttons, animations)
 - logo_new.png                 (Logo image)
 
 Helper files:
@@ -137,7 +218,6 @@ Helper files:
 - run.bat                  (Launcher - starts the app directly)
 - install_dependencies.bat (Install all packages)
 - setup.bat                (Setup check)
-- live_trading.py          (Not used by the app; kept for the setup checks)
 
 Your data (created as you use the app, not tracked by git):
 - watchlist.json, watchlist_groups.json, my_watchlist.json

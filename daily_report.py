@@ -25,7 +25,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 from typing import Dict, List, Optional
 
-from app_paths import DATA_DIR, RESOURCE_DIR
+from app_paths import DATA_DIR, RESOURCE_DIR, pdf_logo
 
 # Data imports
 try:
@@ -33,6 +33,7 @@ try:
     import pandas as pd
     import numpy as np
     import ta
+    import scoring   # the app's own indicators, score and targets - the report must match the scan
     DATA_OK = True
 except ImportError:
     DATA_OK = False
@@ -67,31 +68,61 @@ except ImportError:
 # NIFTY 50 STOCKS (All 50)
 # ============================================================
 
+# The index changes twice a year, so the report uses NSE's own current list (nifty50_stocks()
+# below). This copy - NSE's list on 10 Oct 2026 - is only the fallback when NSE can't be reached.
 NIFTY50_STOCKS = [
     'RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK', 'HINDUNILVR',
     'ITC', 'SBIN', 'BHARTIARTL', 'KOTAKBANK', 'LT', 'AXISBANK',
     'BAJFINANCE', 'ASIANPAINT', 'MARUTI', 'SUNPHARMA', 'TITAN',
-    'BAJAJFINSV', 'WIPRO', 'HCLTECH', 'ULTRACEMCO', 'NTPC',
+    'BAJAJFINSV', 'HCLTECH', 'ULTRACEMCO', 'NTPC',
     'NESTLEIND', 'POWERGRID', 'TMPV', 'M&M', 'JSWSTEEL',
     'TATASTEEL', 'TECHM', 'ADANIENT', 'ONGC', 'HINDALCO',
-    'INDUSINDBK', 'DIVISLAB', 'DRREDDY', 'CIPLA', 'GRASIM',
-    'BPCL', 'COALINDIA', 'HEROMOTOCO', 'EICHERMOT', 'UPL',
-    'TATACONSUM', 'BAJAJ-AUTO', 'APOLLOHOSP', 'BRITANNIA',
-    'PIDILITIND', 'SBILIFE', 'HDFCLIFE', 'ICICIPRULI'
+    'DRREDDY', 'CIPLA', 'GRASIM', 'COALINDIA', 'EICHERMOT',
+    'TATACONSUM', 'BAJAJ-AUTO', 'APOLLOHOSP', 'SBILIFE', 'HDFCLIFE',
+    'ADANIPORTS', 'BEL', 'BSE', 'ETERNAL', 'INDIGO', 'JIOFIN',
+    'MAXHEALTH', 'SHRIRAMFIN', 'TRENT'
 ]
+
+NIFTY50_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv"
+INDEX_LIST_DAYS = 7   # download the list again after this many days
+
+
+def nifty50_stocks() -> list:
+    """The Nifty 50's current members, from NSE's own list (kept for a week in data_cache/)."""
+    cache_file = DATA_DIR / "data_cache" / "nifty50.json"
+    cached = None
+    try:
+        cached = json.loads(cache_file.read_text())
+        if (datetime.now() - datetime.strptime(cached['fetched'], '%Y-%m-%d')).days < INDEX_LIST_DAYS:
+            return cached['symbols']
+    except Exception:
+        pass
+    try:
+        import requests
+        resp = requests.get(NIFTY50_URL, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
+        symbols = [row['Symbol'].strip().upper() for row in csv.DictReader(resp.text.splitlines()) if row.get('Symbol')]
+        if resp.status_code == 200 and 45 <= len(symbols) <= 55:   # anything else isn't the Nifty 50 list
+            cache_file.parent.mkdir(exist_ok=True)
+            cache_file.write_text(json.dumps({'fetched': datetime.now().strftime('%Y-%m-%d'), 'symbols': symbols}))
+            return symbols
+    except Exception as e:
+        print(f"   Could not download the Nifty 50 list ({e})")
+    return cached['symbols'] if cached else list(NIFTY50_STOCKS)
 
 
 # ============================================================
 # SENSEX 30 STOCKS (All 30)
 # ============================================================
 
+# BSE publishes no downloadable list, so this one is kept by hand: update it when the Sensex
+# changes (June and December). Checked 10 Oct 2026; last change Dec 2025 (IndiGo in, Tata Motors out).
 SENSEX30_STOCKS = [
     'RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK', 'HINDUNILVR',
     'ITC', 'SBIN', 'BHARTIARTL', 'KOTAKBANK', 'LT', 'AXISBANK',
     'BAJFINANCE', 'ASIANPAINT', 'MARUTI', 'SUNPHARMA', 'TITAN',
-    'BAJAJFINSV', 'WIPRO', 'HCLTECH', 'ULTRACEMCO', 'NTPC',
-    'NESTLEIND', 'POWERGRID', 'TMPV', 'M&M', 'JSWSTEEL',
-    'TATASTEEL', 'TECHM', 'INDUSINDBK'
+    'BAJAJFINSV', 'HCLTECH', 'ULTRACEMCO', 'NTPC', 'POWERGRID',
+    'M&M', 'TATASTEEL', 'TECHM', 'ADANIPORTS', 'BEL', 'ETERNAL',
+    'INDIGO', 'TRENT'
 ]
 
 
@@ -415,14 +446,22 @@ def _delete_password(email: str):
 # STOCK ANALYZER
 # ============================================================
 
+# History the indicators are worked out on - the same as the app's scan. A different length
+# gives slightly different values for the indicators that build up over time (OBV, SuperTrend).
+SCAN_PERIOD = '2y'
+
+
 class StockAnalyzer:
-    """Analyze stocks for daily report."""
-    
+    """Analyze stocks for daily report - with the same scoring (and weights) as the app's scan."""
+
     def __init__(self):
         self.cache = {}
+        if DATA_OK:
+            scoring.load_weights()   # the scheduled report runs without the app: pick up its saved weights
     
-    def analyze(self, symbol, exchange='NSE', df=None):
-        """Analyze a single stock. Fetches its history unless df is given."""
+    def analyze(self, symbol, exchange='NSE', df=None, days=None):
+        """Analyze a single stock. Fetches its history unless df is given.
+        `days`: a new listing's daily candles, when df holds its 1-hour candles."""
         if not DATA_OK:
             return None
 
@@ -431,177 +470,75 @@ class StockAnalyzer:
                 # NSE symbols fall back to BSE (.BO) for BSE-only listings
                 suffixes = {'NSE': ['.NS', '.BO'], 'BSE': ['.BO'], 'NYSE': [''], 'NASDAQ': ['']}
                 for suffix in suffixes.get(exchange, ['']):
-                    df = yf.Ticker(f"{symbol}{suffix}").history(period='1y')
+                    df = yf.Ticker(f"{symbol}{suffix}").history(period=SCAN_PERIOD)
                     if df is not None and len(df) >= 20:
                         break
 
             if df is None or df.empty or len(df) < 20:
                 return None
             
-            close = df['Close'].values
-            high = df['High'].values
-            low = df['Low'].values
+            # The same indicators, score and stop-loss/targets as the app's scan (scoring.py)
+            data = scoring.indicators(df, days)
+            result = scoring.Scorer.score(data)
+            rec = result['rec']
+            targets = scoring.TargetCalc.calc(data, rec)
+
+            price, prev = data['price'], data['prev']
+            last_year = df[df.index > df.index[-1] - pd.DateOffset(weeks=52)]
             volume = df['Volume'].values
-            
-            current_price = float(close[-1])
-            prev_price = float(close[-2]) if len(close) > 1 else current_price
-            change = current_price - prev_price
-            change_pct = (change / prev_price * 100) if prev_price > 0 else 0
-            
-            # 52-week high/low
-            week52_high = float(high.max())
-            week52_low = float(low.min())
-            
-            # Volume
             avg_volume = float(volume[-20:].mean()) if len(volume) >= 20 else float(volume[-1])
-            current_volume = float(volume[-1])
-            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
-            
-            # RSI
-            try:
-                rsi = float(ta.momentum.RSIIndicator(df['Close'], 14).rsi().iloc[-1])
-                if pd.isna(rsi): rsi = 50
-            except: rsi = 50
-            
-            # MACD
-            try:
-                macd_ind = ta.trend.MACD(df['Close'])
-                macd_hist = float(macd_ind.macd_diff().iloc[-1])
-                macd_signal = 'Bullish' if macd_hist > 0 else 'Bearish'
-                if pd.isna(macd_hist): macd_hist = 0
-            except:
-                macd_hist = 0
-                macd_signal = 'Neutral'
-            
-            # Moving Averages
-            try:
-                sma20 = float(ta.trend.SMAIndicator(df['Close'], 20).sma_indicator().iloc[-1])
-                # None = stock too new for that average; it's skipped in scoring instead of counting as bearish
-                sma50 = float(ta.trend.SMAIndicator(df['Close'], 50).sma_indicator().iloc[-1]) if len(df) >= 50 else None
-                sma200 = float(ta.trend.SMAIndicator(df['Close'], 200).sma_indicator().iloc[-1]) if len(df) >= 200 else None
-            except:
-                sma20, sma50, sma200 = current_price, None, None
-            
-            # SuperTrend
-            try:
-                st_signal = 'BUY' if current_price > sma20 else 'SELL'
-                st_direction = 'BULLISH' if st_signal == 'BUY' else 'BEARISH'
-            except:
-                st_signal = 'HOLD'
-                st_direction = 'NEUTRAL'
-            
-            # VWAP
-            try:
-                typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-                vwap = float((typical_price * df['Volume']).rolling(20).sum().iloc[-1] / df['Volume'].rolling(20).sum().iloc[-1])
-                if pd.isna(vwap) or vwap == 0: vwap = current_price
-                vwap_signal = 'Bullish' if current_price > vwap * 1.02 else 'Bearish' if current_price < vwap * 0.98 else 'Neutral'
-            except:
-                vwap = current_price
-                vwap_signal = 'Neutral'
-            
-            # Calculate Score
-            score = 50
-            
-            # RSI scoring
-            if rsi < 30: score += 20
-            elif rsi < 40: score += 10
-            elif rsi > 70: score -= 20
-            elif rsi > 60: score -= 10
-            
-            # MACD scoring
-            if macd_hist > 0: score += 10
-            else: score -= 10
-            
-            # MA scoring
-            if current_price > sma20: score += 10
-            else: score -= 10
-            if sma50 is not None:
-                score += 5 if current_price > sma50 else -5
-            if sma200 is not None:
-                score += 5 if current_price > sma200 else -5
-            
-            # Volume scoring
-            if volume_ratio > 1.5: score += 5
-            elif volume_ratio < 0.5: score -= 5
-            
-            # VWAP scoring
-            if vwap_signal == 'Bullish': score += 5
-            elif vwap_signal == 'Bearish': score -= 5
-            
-            score = max(0, min(100, score))
-            
-            # Recommendation
-            if score >= 75: rec = 'STRONG BUY'
-            elif score >= 60: rec = 'BUY'
-            elif score >= 45: rec = 'HOLD'
-            elif score >= 30: rec = 'SELL'
-            else: rec = 'STRONG SELL'
-            
-            # ATR for targets
-            try:
-                atr = float(ta.volatility.AverageTrueRange(df['High'], df['Low'], df['Close'], 14).average_true_range().iloc[-1])
-                if pd.isna(atr): atr = current_price * 0.02
-            except:
-                atr = current_price * 0.02
-            
-            # Stop Loss & Targets
-            if rec in ['STRONG BUY', 'BUY']:
-                stop_loss = current_price - (atr * 1.5)
-                target1 = current_price + (atr * 1.5)
-                target2 = current_price + (atr * 2.5)
-            elif rec in ['SELL', 'STRONG SELL']:
-                stop_loss = current_price + (atr * 1.5)
-                target1 = current_price - (atr * 1.5)
-                target2 = current_price - (atr * 2.5)
-            else:
-                stop_loss = current_price - (atr * 1.5)
-                target1 = current_price + (atr * 1.5)
-                target2 = current_price + (atr * 2.5)
-            
+            hist, ma = data['macd']['hist'], data['ma']
+
+            def r2(v):
+                return round(v, 2) if v is not None else None
+
             return {
                 'symbol': symbol,
                 'exchange': exchange,
-                'price': round(current_price, 2),
-                'change': round(change, 2),
-                'change_pct': round(change_pct, 2),
-                'week52_high': round(week52_high, 2),
-                'week52_low': round(week52_low, 2),
-                'volume': int(current_volume),
-                'avg_volume': int(avg_volume),
-                'volume_ratio': round(volume_ratio, 2),
-                'rsi': round(rsi, 1),
-                'macd_hist': round(macd_hist, 4),
-                'macd_signal': macd_signal,
-                'sma20': round(sma20, 2),
-                'sma50': round(sma50, 2) if sma50 is not None else None,
-                'sma200': round(sma200, 2) if sma200 is not None else None,
-                'avg_value_cr': round(float((df['Close'] * df['Volume']).tail(20).mean()) / 1e7, 2),
-                'supertrend': st_signal,
-                'supertrend_dir': st_direction,
-                'vwap': round(vwap, 2),
-                'vwap_signal': vwap_signal,
-                'score': round(score, 1),
+                'price': round(price, 2),
+                'change': round(price - prev, 2),
+                'change_pct': round((price - prev) / prev * 100, 2) if prev > 0 else 0,
+                'week52_high': round(float(last_year['High'].max()), 2),
+                'week52_low': round(float(last_year['Low'].min()), 2),
+                'volume': int(volume[-1]) if volume[-1] == volume[-1] else 0,
+                'avg_volume': int(avg_volume) if avg_volume == avg_volume else 0,
+                'volume_ratio': round(volume[-1] / avg_volume, 2) if avg_volume > 0 else 1.0,
+                'rsi': round(data['rsi'], 1),
+                'macd_hist': round(hist, 4) if hist is not None else 0,
+                'macd_signal': 'Neutral' if hist is None else 'Bullish' if hist > 0 else 'Bearish',
+                'sma20': r2(ma['sma20']),
+                'sma50': r2(ma['sma50']),
+                'sma200': r2(ma['sma200']),
+                'avg_value_cr': round(data['liquidity_cr'], 2),
+                'hourly': data['hourly'],
+                'supertrend': data['supertrend']['sig'],
+                'supertrend_dir': data['supertrend']['dir'],
+                'vwap': round(data['vwap']['val'], 2),
+                'vwap_signal': data['vwap']['sig'].title(),
+                'score': result['total'],
+                'breakdown': result['breakdown'],
                 'recommendation': rec,
-                'stop_loss': round(stop_loss, 2),
-                'target1': round(target1, 2),
-                'target2': round(target2, 2),
-                'atr': round(atr, 2),
+                'stop_loss': targets['sl'],
+                'target1': targets['t1'],
+                'target2': targets['t2'],
+                'atr': round(data['atr'], 2),
             }
-            
+
         except Exception as e:
             return None
     
     def analyze_batch(self, symbols, exchange='NSE', max_stocks=50):
-        """Analyze multiple stocks (one batch download via market_data when available)."""
+        """Analyze multiple stocks (one batch download via market_data when available).
+        Stocks listed within the last month are analysed on 1-hour candles."""
         symbols = list(symbols)[:max_stocks]
         if MARKET_DATA_OK:
-            data = market_data.load_history(symbols, years=5, exchange=exchange)
+            days = {}
+            data = market_data.load_scan_history(symbols, years=5, exchange=exchange, days=days)
             results = []
             for symbol in symbols:
                 df = data.get(symbol.upper())
                 if df is not None:
-                    result = self.analyze(symbol, exchange, market_data.slice_period(df, '1y'))
+                    result = self.analyze(symbol, exchange, market_data.slice_period(df, SCAN_PERIOD), days.get(symbol.upper()))
                     if result:
                         results.append(result)
             return results
@@ -645,13 +582,10 @@ class NewsFetcher:
         except:
             pass
         
-        # Add some default market news placeholders
+        # Yahoo often has nothing: use the newspapers' own market feeds. If those fail too the
+        # report simply has no news section - never made-up headlines.
         if not news_items:
-            news_items = [
-                {'title': 'Indian markets open for trading', 'publisher': 'Market Watch', 'source': 'Auto', 'published': datetime.now().strftime('%Y-%m-%d')},
-                {'title': 'US markets update', 'publisher': 'Financial Times', 'source': 'Auto', 'published': datetime.now().strftime('%Y-%m-%d')},
-                {'title': 'Global economic indicators', 'publisher': 'Reuters', 'source': 'Auto', 'published': datetime.now().strftime('%Y-%m-%d')},
-            ]
+            news_items = self._fetch_rss()
         
         # Remove duplicates
         seen = set()
@@ -663,6 +597,35 @@ class NewsFetcher:
                 unique_news.append(item)
         
         return unique_news[:max_articles]
+
+    RSS_FEEDS = [
+        ("The Economic Times", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
+        ("Mint", "https://www.livemint.com/rss/markets"),
+    ]
+
+    def _fetch_rss(self, per_feed=6):
+        """Latest headlines from Indian market news feeds."""
+        import html
+        import requests
+        import xml.etree.ElementTree as ET
+        from email.utils import parsedate_to_datetime
+        items = []
+        for publisher, url in self.RSS_FEEDS:
+            try:
+                resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+                for entry in ET.fromstring(resp.content).findall('.//item')[:per_feed]:
+                    title = html.unescape((entry.findtext('title') or '').strip())
+                    if not title:
+                        continue
+                    try:
+                        published = parsedate_to_datetime(entry.findtext('pubDate')).strftime('%Y-%m-%d %H:%M')
+                    except Exception:
+                        published = 'N/A'
+                    items.append({'title': title, 'publisher': publisher, 'published': published,
+                                  'link': (entry.findtext('link') or '').strip(), 'source': 'RSS'})
+            except Exception as e:
+                print(f"   News feed {publisher} failed: {e}")
+        return items
 
     @staticmethod
     def _parse_yf_news(item):
@@ -746,7 +709,7 @@ class DailyReportGenerator:
         # 1. Nifty 50 Analysis
         if include_india:
             print("\n[1/5] Analyzing Nifty 50 stocks...")
-            nifty_results = self.analyzer.analyze_batch(NIFTY50_STOCKS, 'NSE', 50)
+            nifty_results = self.analyzer.analyze_batch(nifty50_stocks(), 'NSE', 55)
             report['sections']['nifty50'] = {
                 'title': 'Nifty 50',
                 'stocks': sorted(nifty_results, key=lambda x: x['score'], reverse=True),
@@ -801,10 +764,16 @@ class DailyReportGenerator:
         
         # 5. Summary
         print("\n[5/5] Creating Summary...")
-        all_stocks = []
+        all_stocks, seen = [], set()
         for key, section in report['sections'].items():
-            if key != 'watchlist':  # summary/top picks are market-wide; watchlist has its own section
-                all_stocks.extend(section.get('stocks', []))
+            if key == 'watchlist':  # summary/top picks are market-wide; watchlist has its own section
+                continue
+            for stock in section.get('stocks', []):
+                # Sensex stocks are in the Nifty too: count each company once (its NSE entry),
+                # or the totals double up and the top picks list the same stock twice
+                if stock['symbol'] not in seen:
+                    seen.add(stock['symbol'])
+                    all_stocks.append(stock)
         
         total_stocks = len(all_stocks)
         total_sb = sum(1 for s in all_stocks if s['recommendation'] == 'STRONG BUY')
@@ -865,13 +834,14 @@ class DailyReportGenerator:
             
             elements = []
             styles = getSampleStyleSheet()
-            
+            logo = pdf_logo(self.logo_path) if self.logo_path.exists() else None
+
             def add_header(canvas_obj, doc):
                 canvas_obj.saveState()
-                
-                if self.logo_path.exists():
+
+                if logo:
                     try:
-                        canvas_obj.drawImage(str(self.logo_path), 25, A4[1] - 75, 
+                        canvas_obj.drawImage(logo, 25, A4[1] - 75,
                                            width=45, height=45, preserveAspectRatio=True, mask='auto')
                     except: pass
                 
@@ -944,7 +914,7 @@ class DailyReportGenerator:
                 for s in wl.get('stocks', []):
                     liq = s.get('avg_value_cr', 0)
                     data.append([
-                        s['symbol'], f"{s['price']:.2f}", f"{s['change_pct']:+.1f}%",
+                        s['symbol'] + ('*' if s.get('hourly') else ''), f"{s['price']:.2f}", f"{s['change_pct']:+.1f}%",
                         f"{s['rsi']:.0f}", s['supertrend'], f"{s['score']:.0f}",
                         s['recommendation'], f"{s['stop_loss']:.2f}", f"{s['target1']:.2f}",
                         f"{liq:.2f}" + (" LOW" if liq < MIN_LIQUIDITY_CR else "")
@@ -961,6 +931,8 @@ class DailyReportGenerator:
                     ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#d1d5db')),
                 ]))
                 elements.append(t)
+                if any(s.get('hourly') for s in wl.get('stocks', [])):
+                    elements.append(Paragraph(market_data.HOURLY_NOTE, subtitle_style))
                 elements.append(Spacer(1, 10))
 
             # Top Picks
@@ -1076,9 +1048,10 @@ class DailyReportGenerator:
             if news:
                 elements.append(Paragraph("MARKET NEWS", section_style))
                 
+                from xml.sax.saxutils import escape   # a headline with & or < would break the PDF paragraph
                 for item in news[:10]:
-                    title = item.get('title', 'N/A')
-                    publisher = item.get('publisher', 'Unknown')
+                    title = escape(str(item.get('title', 'N/A')))
+                    publisher = escape(str(item.get('publisher', 'Unknown')))
                     published = item.get('published', '')
                     
                     news_text = f"<b>{title}</b><br/><font size='8' color='gray'>{publisher} | {published}</font>"
@@ -1157,9 +1130,12 @@ class DailyReportGenerator:
             html += f'<div class="section"><h2>Your Watchlist ({wl["total"]} stocks)</h2><table><tr><th>#</th><th>Symbol</th><th>Price</th><th>Chg%</th><th>RSI</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>Rs Cr/day</th></tr>'
             for i, s in enumerate(wl['stocks'], 1):
                 rec_class = self._rec_class(s['recommendation'])
-                html += f'<tr><td>{i}</td><td><b>{s["symbol"]}</b></td><td>{s["price"]:.2f}</td><td>{s["change_pct"]:+.2f}%</td><td>{s["rsi"]:.0f}</td><td>{s["score"]:.0f}</td><td class="{rec_class}">{s["recommendation"]}</td><td>{s["stop_loss"]:.2f}</td><td>{s["target1"]:.2f}</td><td>{s.get("avg_value_cr", 0):.2f}{" LOW" if s.get("avg_value_cr", 0) < MIN_LIQUIDITY_CR else ""}</td></tr>'
+                html += f'<tr><td>{i}</td><td><b>{s["symbol"]}{"*" if s.get("hourly") else ""}</b></td><td>{s["price"]:.2f}</td><td>{s["change_pct"]:+.2f}%</td><td>{s["rsi"]:.0f}</td><td>{s["score"]:.0f}</td><td class="{rec_class}">{s["recommendation"]}</td><td>{s["stop_loss"]:.2f}</td><td>{s["target1"]:.2f}</td><td>{s.get("avg_value_cr", 0):.2f}{" LOW" if s.get("avg_value_cr", 0) < MIN_LIQUIDITY_CR else ""}</td></tr>'
             html += (f'</table><p style="font-size:11px;color:#666">LOW = average traded value below Rs {MIN_LIQUIDITY_CR:g} crore/day: '
-                     'stop-loss and targets are less reliable for these stocks.</p></div>')
+                     'stop-loss and targets are less reliable for these stocks.</p>')
+            if any(s.get('hourly') for s in wl['stocks']):
+                html += f'<p style="font-size:11px;color:#666">{market_data.HOURLY_NOTE}</p>'
+            html += '</div>'
 
         # Top Picks
         top_picks = report.get('top_picks', [])
@@ -1174,9 +1150,11 @@ class DailyReportGenerator:
         # News
         news = report.get('news', [])
         if news:
+            from xml.sax.saxutils import escape
             html += '<div class="section"><h2>Market News</h2><ul>'
             for item in news[:8]:
-                html += f'<li><b>{item.get("title", "")}</b> <small>({item.get("publisher", "")})</small></li>'
+                html += (f'<li><b>{escape(str(item.get("title", "")))}</b> '
+                         f'<small>({escape(str(item.get("publisher", "")))})</small></li>')
             html += '</ul></div>'
         
         html += '<div class="footer">DR. NILESH SHAH\'S MARKET ANALYSIS | For educational purposes only</div></div></body></html>'

@@ -17,7 +17,7 @@ if errorlevel 1 (
 echo [1/4] Installing required packages...
 echo.
 
-python -m pip install yfinance pandas numpy ta scikit-learn openpyxl pdfplumber reportlab schedule Pillow matplotlib requests keyring --quiet
+python -m pip install yfinance pandas numpy ta openpyxl pdfplumber reportlab schedule Pillow matplotlib requests keyring --quiet
 
 echo.
 echo [2/4] Verifying installation...
@@ -28,7 +28,6 @@ import yfinance; print('[OK] yfinance')
 import pandas; print('[OK] pandas')
 import numpy; print('[OK] numpy')
 import ta; print('[OK] ta (technical analysis)')
-import sklearn; print('[OK] scikit-learn')
 import openpyxl; print('[OK] openpyxl')
 import reportlab; print('[OK] reportlab')
 import schedule; print('[OK] schedule')
@@ -58,22 +57,28 @@ if exist daily_report.py (
     exit /b 1
 )
 
-if exist ai_engine.py (
-    echo [OK] ai_engine.py found
+if exist scoring.py (
+    echo [OK] scoring.py found
 ) else (
-    echo [WARNING] ai_engine.py not found - AI features disabled
+    echo [ERROR] scoring.py NOT found!
+    echo Please make sure all files are in the same folder.
+    pause
+    exit /b 1
+)
+
+if exist ui_theme.py (
+    echo [OK] ui_theme.py found
+) else (
+    echo [ERROR] ui_theme.py NOT found!
+    echo Please make sure all files are in the same folder.
+    pause
+    exit /b 1
 )
 
 if exist pattern_recognition.py (
     echo [OK] pattern_recognition.py found
 ) else (
     echo [WARNING] pattern_recognition.py not found - Pattern features disabled
-)
-
-if exist live_trading.py (
-    echo [OK] live_trading.py found
-) else (
-    echo [WARNING] live_trading.py not found - Live trading disabled
 )
 
 if exist logo_new.png (

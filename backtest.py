@@ -23,7 +23,9 @@ import numpy as np
 import pandas as pd
 import ta
 
-WARMUP = 200                 # rows needed before the first score (so the 200-day SMA exists, as in live scans)
+from scoring import supertrend
+
+WARMUP = 200                # rows needed before the first score (so the 200-day SMA exists, as in live scans)
 HORIZONS = (5, 10, 20)       # forward return horizons, in trading days
 TRAIN_FRACTION = 0.6         # older 60% of dates = "train", newer 40% = "test"
 MIN_STOCKS_FOR_EXCESS = 5    # with fewer stocks, raw returns are used instead of returns vs. the group
@@ -45,30 +47,6 @@ def rec_from_total(total: float) -> str:
 # ------------------------------------------------------------
 # Indicators (vectorised versions of Analyzer.analyze)
 # ------------------------------------------------------------
-
-def _supertrend_direction(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> np.ndarray:
-    """+1 bullish / -1 bearish for every row - same algorithm as Analyzer.analyze."""
-    high, low, close = df['High'].values, df['Low'].values, df['Close'].values
-    tr1 = high - low
-    tr2 = np.abs(high - np.roll(close, 1))
-    tr3 = np.abs(low - np.roll(close, 1))
-    tr = np.maximum(tr1, np.maximum(tr2, tr3))
-    tr[0] = tr1[0]
-    atr_st = pd.Series(tr).ewm(span=period, adjust=False).mean().values
-    hl2 = (high + low) / 2
-    basic_ub = hl2 + multiplier * atr_st
-    basic_lb = hl2 - multiplier * atr_st
-    final_ub, final_lb = basic_ub.copy(), basic_lb.copy()
-    direction = np.ones(len(close))
-    for i in range(1, len(close)):
-        final_ub[i] = basic_ub[i] if (basic_ub[i] < final_ub[i-1] or close[i-1] > final_ub[i-1]) else final_ub[i-1]
-        final_lb[i] = basic_lb[i] if (basic_lb[i] > final_lb[i-1] or close[i-1] < final_lb[i-1]) else final_lb[i-1]
-        if direction[i-1] == 1:
-            direction[i] = -1 if close[i] < final_lb[i] else 1
-        else:
-            direction[i] = 1 if close[i] > final_ub[i] else -1
-    return direction
-
 
 def indicator_frame(df: pd.DataFrame) -> pd.DataFrame:
     """All indicator values for every row, with the same NaN fallbacks the live scan uses."""
@@ -101,7 +79,7 @@ def indicator_frame(df: pd.DataFrame) -> pd.DataFrame:
     out['obv_trend'] = trend.where(obv_prev != 0, 0).replace([np.inf, -np.inf], 0).fillna(0)
     out['wr'] = ta.momentum.WilliamsRIndicator(high, low, close).williams_r().fillna(-50)
     out['cci'] = ta.trend.CCIIndicator(high, low, close).cci().fillna(0)
-    out['st_dir'] = _supertrend_direction(df)
+    out['st_dir'] = supertrend(high.values, low.values, close.values)[1]   # the scan's own SuperTrend
     tp = (high + low + close) / 3
     vwap = (tp * vol).rolling(20).sum() / vol.rolling(20).sum()
     vwap = vwap.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -261,8 +239,12 @@ def run_backtest(data: dict, scorer, weights: dict, horizon: int = 10, progress=
                     'skipped': skipped or []}
     usable = _add_excess_returns(usable, horizon).dropna(subset=[target])
     dates = np.sort(usable['date'].unique())
-    split_date = dates[int(len(dates) * TRAIN_FRACTION)]
-    train, test = usable[usable['date'] < split_date], usable[usable['date'] >= split_date]
+    split = int(len(dates) * TRAIN_FRACTION)
+    split_date = dates[split]
+    # The last `horizon` days before the split aren't learned from: their forward returns run
+    # into the test period, which would let the test results leak into the suggested weights
+    train_end = dates[max(split - horizon, 0)]
+    train, test = usable[usable['date'] < train_end], usable[usable['date'] >= split_date]
 
     ics_train = {k: _ic(train[k], train[target]) for k in COMPONENT_NAMES}
     ics_test = {k: _ic(test[k], test[target]) for k in COMPONENT_NAMES}

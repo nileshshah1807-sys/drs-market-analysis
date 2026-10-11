@@ -22,13 +22,16 @@ FIELDS = ['date', 'time', 'symbol', 'price', 'score', 'rec', 'rsi', 'rs_3m']
 _lock = threading.Lock()
 
 
-def _read() -> list:
+def _read(strict: bool = False) -> list:
+    """All saved rows. A file that can't be read gives [] - or, with strict, the error."""
     if not HISTORY_FILE.exists():
         return []
     try:
         with open(HISTORY_FILE, newline='', encoding='utf-8') as f:
             return [row for row in csv.DictReader(f) if row.get('date') and row.get('symbol')]
     except Exception:
+        if strict:
+            raise
         return []
 
 
@@ -47,7 +50,9 @@ def record(results, when: datetime = None):
             'rsi': f"{r['rsi']:.1f}", 'rs_3m': '' if rs3 is None else f"{rs3:.2f}",
         }
     with _lock:
-        rows = [row for row in _read() if not (row['date'] == day and row['symbol'] in new)]
+        # strict: if the history can't be read right now (e.g. locked by another program), fail
+        # this save rather than write today's rows over the whole history
+        rows = [row for row in _read(strict=True) if not (row['date'] == day and row['symbol'] in new)]
         rows.extend(new.values())
         rows.sort(key=lambda row: (row['date'], row['symbol']))
         tmp = HISTORY_FILE.with_suffix('.tmp')

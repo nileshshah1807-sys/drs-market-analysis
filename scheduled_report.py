@@ -107,15 +107,36 @@ def _release_lock():
 # Trading-day check
 # ------------------------------------------------------------
 
-def _nse_holidays(year: int) -> set:
-    """NSE equity trading holidays for a year (cached in nse_holidays.json). Empty set if unavailable."""
-    cache = {}
+HOLIDAY_REFRESH_DAYS = 7   # NSE declares extra holidays during the year (elections, mourning...)
+
+
+def _read_holiday_file() -> dict:
     try:
-        cache = json.loads(HOLIDAY_FILE.read_text())
-        if str(year) in cache:
-            return set(cache[str(year)])
+        data = json.loads(HOLIDAY_FILE.read_text())
+        return data if isinstance(data, dict) else {}
     except Exception:
-        pass
+        return {}
+
+
+def cached_holidays(year: int):
+    """The saved NSE holiday list for a year, without going online (safe to call from the
+    window's own thread): a set of 'YYYY-MM-DD', or None if it was never downloaded."""
+    days = _read_holiday_file().get(str(year))
+    return set(days) if isinstance(days, list) else None
+
+
+def _nse_holidays(year: int) -> set:
+    """NSE equity trading holidays for a year. Kept in nse_holidays.json and downloaded again
+    every HOLIDAY_REFRESH_DAYS days; the saved list is used when NSE can't be reached.
+    Empty set if there is neither."""
+    cache = _read_holiday_file()
+    saved = cache.get(str(year)) if isinstance(cache.get(str(year)), list) else None
+    try:
+        age = (date.today() - date.fromisoformat((cache.get('fetched') or {}).get(str(year), ''))).days
+    except (ValueError, TypeError, AttributeError):
+        age = None   # downloaded before the date was recorded, or never
+    if saved is not None and age is not None and 0 <= age < HOLIDAY_REFRESH_DAYS:
+        return set(saved)
     try:
         import requests
         headers = {
@@ -132,11 +153,17 @@ def _nse_holidays(year: int) -> set:
                 days.append(d.isoformat())
         if days:
             cache[str(year)] = days
-            HOLIDAY_FILE.write_text(json.dumps(cache, indent=2))
-        return set(days)
+            fetched = cache.get('fetched') if isinstance(cache.get('fetched'), dict) else {}
+            fetched[str(year)] = date.today().isoformat()
+            cache['fetched'] = fetched
+            tmp = HOLIDAY_FILE.with_suffix('.tmp')
+            tmp.write_text(json.dumps(cache, indent=2))
+            os.replace(tmp, HOLIDAY_FILE)
+            return set(days)
     except Exception as e:
-        logger.warning(f"Could not fetch NSE holidays ({e}); only skipping weekends")
-        return set()
+        logger.warning(f"Could not fetch NSE holidays ({e}); "
+                       + ("using the saved list" if saved is not None else "only skipping weekends"))
+    return set(saved or [])
 
 
 def is_trading_day(day: date = None, india: bool = True):

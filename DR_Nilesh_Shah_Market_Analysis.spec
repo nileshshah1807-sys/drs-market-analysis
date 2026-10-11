@@ -12,8 +12,9 @@ from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 
 hiddenimports = (
     # local modules imported inside try/except or functions
-    ['pattern_recognition', 'ai_engine', 'daily_report', 'corporate_actions',
+    ['pattern_recognition', 'daily_report', 'corporate_actions',
      'corporate_actions_engine', 'market_data', 'backtest', 'scheduled_report', 'app_paths', 'score_history',
+     'scoring', 'ui_theme', 'mpl_toolkits.mplot3d',
      'tkinter.simpledialog']
     # Windows Credential Manager backend for the email password
     + collect_submodules('keyring.backends')
@@ -28,9 +29,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # Not needed by the app: the AI engine (scikit-learn/SciPy) output isn't shown anywhere,
-    # and the rest are tools installed for other projects. Leaving them out makes the .exe
-    # much smaller and faster to start.
+    # Not needed by the app: tools installed on this PC for other projects. Leaving them out
+    # makes the .exe much smaller and faster to start.
     excludes=['sklearn', 'scipy', 'joblib', 'IPython', 'jupyter', 'notebook', 'pytest',
               'streamlit', 'flask', 'altair', 'pyarrow', 'torch', 'tensorflow', 'PyQt5', 'PyQt6',
               'PySide2', 'PySide6', 'ruff', 'uvicorn'],

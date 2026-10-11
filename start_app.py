@@ -31,7 +31,6 @@ def check_and_install():
         'pandas': 'pandas',
         'numpy': 'numpy',
         'ta': 'ta',
-        'sklearn': 'scikit-learn',
         'openpyxl': 'openpyxl',
         'reportlab': 'reportlab',
         'pdfplumber': 'pdfplumber',
@@ -92,10 +91,11 @@ except ImportError as e:
     print()
     print("Make sure these files are in the same folder:")
     print("  - dr_shah_analysis.py")
+    print("  - scoring.py")
+    print("  - ui_theme.py")
+    print("  - market_data.py")
     print("  - daily_report.py")
-    print("  - ai_engine.py")
     print("  - pattern_recognition.py")
-    print("  - live_trading.py")
     print("  - logo_new.png")
     input("\nPress Enter to exit...")
 except Exception as e:
