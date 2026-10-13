@@ -40,14 +40,17 @@ Double-click **`run_web_locally.bat`** (opens <http://localhost:8000>; invite co
 - **Prices come from Yahoo Finance**, like the desktop app. If Yahoo ever refuses Vercel's
   servers, scans come back as "No data"; trying again later usually works.
 - **Adding a stock:** type the first letters of the company's name and pick it from the list,
-  which shows its NSE and BSE symbols. The list (about 5,500 companies, from the exchanges' own
+  which shows its NSE and BSE symbols. The list (about 5,500 companies and 350 ETFs, from the exchanges' own
   files) is refreshed each time you publish; a company listed since then is still found through
   a live look-up on Yahoo Finance.
 - A scan runs in batches of 8 stocks (a free Vercel request may run 60 seconds at most).
 - Market open/closed is worked out from Indian time (weekdays 09:15-15:30); NSE holidays aren't
   known to the website.
-- Not in the web version: corporate actions, backtest, sector tab, PDF/Excel export, email
-  reports. Use the desktop app for those.
+- **PDF reports:** Scan Results has a "PDF report" button (the stocks shown in the table, in the
+  same order, with stop-loss and targets); each stock's details page has its own "PDF" button.
+  The file is made in the browser, so it downloads at once and costs the server nothing.
+- Not in the web version: corporate actions, backtest, sector tab, Excel export, email reports.
+  Use the desktop app for those.
 
 ## Files
 

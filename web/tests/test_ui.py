@@ -38,6 +38,16 @@ def check(label, ok, detail=''):
     (passed if ok else problems).append(f"{'PASS' if ok else 'FAIL'} {label} {detail}".strip())
 
 
+def pdf_text(data_uri, save_as):
+    """(number of pages, all the text) of a PDF the page made (given as a data: URI); also keeps the file."""
+    import io
+    import pdfplumber
+    raw = base64.b64decode(data_uri.split(',', 1)[1])
+    (SHOTS / save_as).write_bytes(raw)
+    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+        return len(pdf.pages), "\n".join(page.extract_text() or '' for page in pdf.pages), raw[:5]
+
+
 class Page:
     def __init__(self, ws):
         self.ws, self.n, self.pending = ws, 0, {}
@@ -159,6 +169,38 @@ async def run():
         await asyncio.sleep(1.2)
         await p.shot('03_results_light')
 
+        # PDF report of the scan: made in the browser, read back here
+        uri = await p.js("(async () => (await buildScanPdf()).output('datauristring'))()")
+        pages, text, magic = pdf_text(uri, 'scan_report.pdf')
+        check('PDF report: a real PDF with the letterhead', magic == b'%PDF-' and "DR. NILESH SHAH'S MARKET ANALYSIS" in text
+              and 'Stock technical analysis report' in text and f'Page 1 of {pages}' in text, f"{pages} page(s), {len(uri) // 1024} KB")
+        check('PDF report: every scanned stock with its company name, signal, stop-loss and targets',
+              all(sym in text for sym in ('RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ITC', 'SBIN', 'LT')) and 'Reliance Industries' in text
+              and all(h in text for h in ('Stop-loss', 'Target 1', 'Target 2', 'Risk : reward', 'Signal', 'Average score')))
+        check('PDF report: says what was not scored, and carries the disclaimer', 'ZZNOTREAL1' in text and 'not financial advice' in text)
+        await p.js("document.querySelector('#f-rec').value = 'HOLD'; document.querySelector('#f-rec').dispatchEvent(new Event('input', {bubbles: true})); true")
+        shown = await p.js("[...document.querySelectorAll('#results-box tr[data-sym]')].map(r => r.dataset.sym)")
+        uri = await p.js("(async () => (await buildScanPdf()).output('datauristring'))()")
+        _, text, _ = pdf_text(uri, 'scan_report_hold_only.pdf')
+        body = text.split('Scan results', 1)[-1].split('Score: 75-100', 1)[0]
+        hidden = [x for x in ('RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ITC', 'SBIN', 'LT') if x not in shown]
+        check('PDF report follows the table filters', bool(shown) and all(x in body for x in shown) and not any(f"\n{x} " in body for x in hidden)
+              and 'Showing only: signal HOLD' in text, f"shown {shown}")
+        await p.js("document.querySelector('#f-rec').value = 'All'; document.querySelector('#f-rec').dispatchEvent(new Event('input', {bubbles: true})); true")
+        try:
+            await p.send('Browser.setDownloadBehavior', behavior='allow', downloadPath=str(SHOTS))
+        except RuntimeError:
+            await p.send('Page.setDownloadBehavior', behavior='allow', downloadPath=str(SHOTS))
+        await p.js("document.querySelector('#pdf-btn').click(); true")
+        check('PDF report button downloads the file', await p.wait("[...document.querySelectorAll('.toast b')].some(b => b.textContent === 'PDF downloaded')", 30))
+        files = []
+        for _ in range(40):                      # the browser writes the file a moment after the click
+            files = [f.name for f in SHOTS.glob('Market_Analysis_scan_*.pdf')]
+            if files and (SHOTS / files[0]).stat().st_size > 1000:
+                break
+            await asyncio.sleep(0.5)
+        check('the downloaded file is named after the scan date', bool(files) and (SHOTS / files[0]).read_bytes()[:5] == b'%PDF-', str(files))
+
         # sorting
         await p.js("document.querySelector('th[data-sort=score]').click(); true")
         scores = await p.js("[...document.querySelectorAll('#results-box tr[data-sym]')].map(r => parseFloat(r.children[6].textContent))")
@@ -172,6 +214,13 @@ async def run():
         bars = await p.js("[...document.querySelectorAll('#p-details .track i')].map(i => i.style.width)")
         check('score ring and bars animated to their values', ring not in ('0.0', '') and len(bars) == 10 and all(b.endswith('%') for b in bars), f"{ring} {bars[:3]}")
         check('price ladder drawn', await p.js("document.querySelectorAll('#ladder circle').length") == 4)
+        sym = await p.js("state.selected")
+        uri = await p.js("(async () => (await buildStockPdf(state.results.find(r => r.symbol === state.selected))).output('datauristring'))()")
+        pages, text, magic = pdf_text(uri, 'stock_report.pdf')
+        check('stock PDF: score, stop-loss and targets, score parts, patterns', magic == b'%PDF-' and sym in text
+              and all(h in text for h in ('Stop-loss and targets', 'Target 3 (aggressive)', 'Risk : reward', 'What makes up the score', 'SuperTrend', 'Patterns', 'vs Nifty 3M')),
+              f"{sym}, {pages} page(s)")
+        check('stock PDF button is on the details page', await p.js("!!document.querySelector('#d-pdf')"))
         await p.shot('04_details_light')
         await p.js("window.scrollTo(0, document.body.scrollHeight); true")
         await asyncio.sleep(0.4)

@@ -506,6 +506,21 @@ const COLS = [
 const colValue = (c, r) => (c.get ? c.get(r) : r[c.key]);
 const illiquid = (r) => (r.liquidity_cr ?? 0) < (Number(state.settings.liq) || 0);
 
+/** The stocks the table shows - Find / Show / Hide illiquid applied, in the chosen order. */
+function visibleRows() {
+  const q = $('#f-q').value.trim().toUpperCase(), rec = $('#f-rec').value, hideLow = $('#f-liq').checked;
+  const rows = state.results.filter((r) => (!q || r.symbol.includes(q)) && (rec === 'All' || r.rec === rec) && (!hideLow || !illiquid(r)));
+  const col = COLS.find((c) => c.key === state.sort.key) || COLS[1];
+  const dir = state.sort.asc ? 1 : -1;
+  return rows.sort((a, b) => {
+    const x = colValue(col, a), y = colValue(col, b);
+    if (x == null && y == null) return 0;
+    if (x == null) return 1;
+    if (y == null) return -1;
+    return (col.text ? String(x).localeCompare(String(y)) : x - y) * dir;
+  });
+}
+
 function renderResults() {
   const box = $('#results-box');
   $('#f-liq-text').textContent = `Hide illiquid (under Rs ${Number(state.settings.liq) || 0} Cr/day)`;
@@ -513,17 +528,8 @@ function renderResults() {
     box.innerHTML = `<div class="empty">${state.scanning ? 'Scanning...' : 'No scan yet. Click "Scan all stocks".'}</div>`;
     return;
   }
-  const q = $('#f-q').value.trim().toUpperCase(), rec = $('#f-rec').value, hideLow = $('#f-liq').checked;
-  let rows = state.results.filter((r) => (!q || r.symbol.includes(q)) && (rec === 'All' || r.rec === rec) && (!hideLow || !illiquid(r)));
-  const col = COLS.find((c) => c.key === state.sort.key) || COLS[1];
-  const dir = state.sort.asc ? 1 : -1;
-  rows = rows.slice().sort((a, b) => {
-    const x = colValue(col, a), y = colValue(col, b);
-    if (x == null && y == null) return 0;
-    if (x == null) return 1;
-    if (y == null) return -1;
-    return (col.text ? String(x).localeCompare(String(y)) : x - y) * dir;
-  });
+  const q = $('#f-q').value.trim().toUpperCase();
+  const rows = visibleRows();
   const head = COLS.map((c) => `<th class="${c.cls || ''}" ${c.nosort ? '' : `data-sort="${c.key}"`} scope="col">${esc(c.label)}${state.sort.key === c.key ? `<span class="arrow">${state.sort.asc ? '&#9650;' : '&#9660;'}</span>` : ''}</th>`).join('');
   const body = rows.map((r, i) => {
     const tint = r.rec.includes('BUY') ? 'tb' : r.rec.includes('SELL') ? 'ts' : i % 2 ? 'zebra' : '';
@@ -588,6 +594,7 @@ function showDetails(symbol) {
   $('#p-details').innerHTML = `<div class="detail">
     <h2>${esc(r.symbol)} <span class="pill">${marker(r.rec, 12)} ${esc(SIG_LABEL[r.rec])}</span>
       <button class="btn small" type="button" id="d-chart">Price chart</button>
+      <button class="btn small" type="button" id="d-pdf" title="Download this stock's analysis as a PDF file">PDF</button>
       ${companyName(r.symbol) ? `<span class="co">${esc(companyName(r.symbol))}</span>` : ''}</h2>
     ${r.hourly ? `<div class="note info">New listing (${esc(r.days)} trading days of history): analysed on 1-hour candles, so the stop-loss and targets sit closer to the price.</div>` : ''}
     ${illiquid(r) ? `<div class="note warn">Low liquidity: only about Rs ${Number(r.liquidity_cr || 0).toFixed(2)} crore traded per day. Price can gap past the stop-loss and orders may not fill.</div>` : ''}
@@ -626,6 +633,7 @@ function showDetails(symbol) {
   selectTab('details');
   window.scrollTo({ top: $('#tabs').offsetTop - 10, behavior: motionOn() ? 'smooth' : 'auto' });
   $('#d-chart').addEventListener('click', () => { selectTab('charts'); $('#c-sym').value = r.symbol; showPriceChart(); });
+  $('#d-pdf').addEventListener('click', (e) => downloadPdf(e.currentTarget, () => buildStockPdf(r), `${r.symbol}_analysis`));
 
   // grow the bars, sweep the ring, slide the ladder out
   requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -844,6 +852,221 @@ function redrawChart() {
   if (state.chart.type === 'map') showMarketMap(false); else showPriceChart(false);
 }
 
+// ============================================================ PDF reports (made in the browser, loaded only when asked for)
+
+const PDF_LIBS = ['https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
+                  'https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js'];
+const PDF = { accent: [26, 79, 230], fg: [10, 16, 28], fg2: [52, 62, 80], fg3: [74, 85, 104], line: [205, 213, 224],
+              rec: { 'STRONG BUY': [0, 112, 79], BUY: [0, 147, 106], HOLD: [115, 126, 144], SELL: [229, 64, 46], 'STRONG SELL': [184, 33, 15] },
+              tintB: [220, 243, 234], tintS: [253, 231, 229], zebra: [246, 248, 251], left: 30, top: 84, bottom: 56 };
+let pdfLoading = null, pdfLogo;
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = resolve;
+    s.onerror = () => reject(new Error("Couldn't load the PDF tool - check your internet."));
+    document.head.appendChild(s);
+  });
+}
+function loadPdfLib() {
+  if (!pdfLoading) {
+    pdfLoading = loadScript(PDF_LIBS[0]).then(() => loadScript(PDF_LIBS[1])).then(() => window.jspdf.jsPDF)
+      .catch((e) => { pdfLoading = null; throw e; });
+  }
+  return pdfLoading;
+}
+async function logoForPdf() {
+  if (pdfLogo === undefined) {
+    try {
+      const blob = await (await fetch('logo.png')).blob();
+      pdfLogo = await new Promise((resolve, reject) => { const f = new FileReader(); f.onload = () => resolve(f.result); f.onerror = reject; f.readAsDataURL(blob); });
+    } catch (e) { pdfLogo = null; }
+  }
+  return pdfLogo;
+}
+/** The standard PDF fonts only have Western letters: anything else is dropped. */
+const pdfText = (v) => String(v ?? '').replace(/[\u2013\u2014]/g, '-').replace(/[^\x20-\x7E\xA0-\xFF]/g, '');
+const pdfMoney = (v) => (v == null ? 'N/A' : Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+const pdfStamp = (d) => d.toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+async function newPdf() {
+  const JsPDF = await loadPdfLib();
+  const [logo] = await Promise.all([logoForPdf(), loadCompanies()]);
+  const doc = new JsPDF({ unit: 'pt', format: 'a4' });
+  doc.drs = { logo, y: PDF.top, W: doc.internal.pageSize.getWidth(), H: doc.internal.pageSize.getHeight() };
+  return doc;
+}
+/** A paragraph, wrapped; starts a new page when it wouldn't fit. */
+function pdfPara(doc, text, { size = 9, bold = false, color = PDF.fg2, gap = 6 } = {}) {
+  doc.setFont('helvetica', bold ? 'bold' : 'normal'); doc.setFontSize(size); doc.setTextColor(...color);
+  const lines = doc.splitTextToSize(pdfText(text), doc.drs.W - 2 * PDF.left);
+  const height = lines.length * size * 1.3;
+  if (doc.drs.y + height > doc.drs.H - PDF.bottom) { doc.addPage(); doc.drs.y = PDF.top; }
+  doc.text(lines, PDF.left, doc.drs.y + size);
+  doc.drs.y += height + gap;
+}
+function pdfTable(doc, head, body, opts = {}) {
+  doc.autoTable(Object.assign({
+    head: [head], body, startY: doc.drs.y, theme: 'grid',
+    margin: { top: PDF.top, bottom: PDF.bottom, left: PDF.left, right: PDF.left },
+    styles: { font: 'helvetica', fontSize: 8, cellPadding: 3.5, lineColor: PDF.line, lineWidth: 0.4, textColor: PDF.fg, overflow: 'linebreak' },
+    headStyles: { fillColor: PDF.accent, textColor: 255, fontStyle: 'bold' },
+  }, opts));
+  doc.drs.y = doc.lastAutoTable.finalY + 14;
+}
+/** The letterhead and the footer, on every page (drawn last, when the page count is known). */
+function pdfFinish(doc) {
+  const { W, H, logo } = doc.drs;
+  const n = doc.getNumberOfPages(), x = logo ? 106 : PDF.left;
+  for (let i = 1; i <= n; i++) {
+    doc.setPage(i);
+    if (logo) { try { doc.addImage(logo, 'PNG', PDF.left, 22, 66, 36); } catch (e) { /* no logo then */ } }
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.setTextColor(...PDF.accent);
+    doc.text("DR. NILESH SHAH'S MARKET ANALYSIS", x, 40);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); doc.setTextColor(...PDF.fg3);
+    doc.text('Technical scanner for NSE and BSE stocks', x, 53);
+    doc.setDrawColor(...PDF.accent); doc.setLineWidth(1.5); doc.line(PDF.left, 66, W - PDF.left, 66);
+    doc.setDrawColor(...PDF.line); doc.setLineWidth(0.6); doc.line(PDF.left, H - 42, W - PDF.left, H - 42);
+    doc.setFontSize(7.5); doc.setTextColor(...PDF.fg3);
+    doc.text(pdfText(`Generated ${pdfStamp(new Date())}${state.user ? ` for ${state.user}` : ''}`), PDF.left, H - 30);
+    doc.text(`Page ${i} of ${n}`, W - PDF.left, H - 30, { align: 'right' });
+    doc.text('For education and information only - not financial advice. Prices from Yahoo Finance and can be delayed.', W / 2, H - 18, { align: 'center' });
+  }
+  return doc;
+}
+
+/** The scan: summary, then every stock the table shows (same filters, same order) with its stop-loss and targets. */
+async function buildScanPdf() {
+  const rows = visibleRows();
+  const doc = await newPdf();
+  pdfPara(doc, 'Stock technical analysis report', { size: 15, bold: true, color: PDF.fg, gap: 4 });
+  const filters = [];
+  if ($('#f-q').value.trim()) filters.push(`symbol contains "${$('#f-q').value.trim().toUpperCase()}"`);
+  if ($('#f-rec').value !== 'All') filters.push(`signal ${$('#f-rec').value}`);
+  if ($('#f-liq').checked) filters.push(`illiquid stocks (under Rs ${Number(state.settings.liq) || 0} Cr/day) hidden`);
+  pdfPara(doc, `Scan of ${state.when ? pdfStamp(state.when) : 'today'}  |  ${rows.length} of ${state.results.length} stocks`
+    + (filters.length ? `  |  Showing only: ${filters.join(', ')}` : ''), { size: 9, color: PDF.fg3, gap: 12 });
+
+  const count = (k) => rows.filter((r) => r.rec === k).length;
+  const avg = rows.length ? rows.reduce((a, r) => a + r.score, 0) / rows.length : 0;
+  pdfTable(doc, ['Stocks', 'Strong buy', 'Buy', 'Hold', 'Sell', 'Strong sell', 'Average score'],
+    [[rows.length, ...SIGNALS.map(count), avg.toFixed(1)]],
+    { styles: { font: 'helvetica', fontSize: 9, halign: 'center', cellPadding: 5, lineColor: PDF.line, lineWidth: 0.4, textColor: PDF.fg },
+      bodyStyles: { fontSize: 14, fontStyle: 'bold' },
+      didParseCell: (d) => { if (d.section === 'body' && d.column.index >= 1 && d.column.index <= 5) d.cell.styles.textColor = PDF.rec[SIGNALS[d.column.index - 1]]; } });
+
+  pdfPara(doc, 'Scan results', { size: 11, bold: true, color: PDF.fg, gap: 4 });
+  const body = rows.map((r) => {
+    const t = r.targets || {};
+    return [r.symbol + (r.hourly ? '*' : ''), pdfText(companyName(r.symbol)), pdfMoney(r.price), signed(r.change, 2, '%'), n1(r.rsi), n1(r.score),
+            SIG_LABEL[r.rec] || r.rec, pdfMoney(t.sl), pdfMoney(t.t1), pdfMoney(t.t2), t.rr ? `1 : ${Number(t.rr).toFixed(2)}` : 'N/A'];
+  });
+  pdfTable(doc, ['Symbol', 'Company', 'Price', 'Chg %', 'RSI', 'Score', 'Signal', 'Stop-loss', 'Target 1', 'Target 2', 'Risk : reward'], body, {
+    rowPageBreak: 'avoid',
+    styles: { font: 'helvetica', fontSize: 7.2, cellPadding: 3, lineColor: PDF.line, lineWidth: 0.4, textColor: PDF.fg, overflow: 'ellipsize', halign: 'right' },
+    headStyles: { fillColor: PDF.accent, textColor: 255, fontStyle: 'bold', halign: 'center', valign: 'middle', overflow: 'linebreak' },
+    columnStyles: { 0: { halign: 'left', fontStyle: 'bold', cellWidth: 62 }, 1: { halign: 'left', cellWidth: 118 }, 2: { cellWidth: 46 }, 3: { cellWidth: 36 },
+                    4: { cellWidth: 27 }, 5: { cellWidth: 31 }, 6: { halign: 'left', fontStyle: 'bold', cellWidth: 52 }, 7: { cellWidth: 43 },
+                    8: { cellWidth: 43 }, 9: { cellWidth: 43 }, 10: { cellWidth: 34 } },
+    didParseCell: (d) => {
+      if (d.section !== 'body') return;
+      const r = rows[d.row.index];
+      d.cell.styles.fillColor = r.rec.includes('BUY') ? PDF.tintB : r.rec.includes('SELL') ? PDF.tintS : d.row.index % 2 ? PDF.zebra : [255, 255, 255];
+      if (d.column.index === 6) d.cell.styles.textColor = PDF.rec[r.rec] || PDF.fg;
+    },
+  });
+
+  if (rows.some((r) => r.hourly)) pdfPara(doc, '* New listing (under a month of history): analysed on 1-hour candles, so its stop-loss and targets sit closer to the price.', { size: 8, color: PDF.fg3 });
+  const changes = rows.filter((r) => r.prev_rec && r.prev_rec !== r.rec);
+  if (changes.length) {
+    pdfPara(doc, `Signal changes since the previous scan (${changes.length})`, { size: 10, bold: true, color: PDF.fg, gap: 3 });
+    pdfPara(doc, changes.map((r) => `${r.symbol}: ${SIG_LABEL[r.prev_rec] || r.prev_rec} to ${SIG_LABEL[r.rec]} (since ${r.prev_date})`).join(';  '), { size: 8.5 });
+  }
+  if (state.failed.length || state.tooNew.length) {
+    pdfPara(doc, 'Not scored: ' + [state.failed.length ? `${state.failed.join(', ')} (no price data)` : '', state.tooNew.length ? `${state.tooNew.join(', ')} (listed under 3 trading days ago)` : '']
+      .filter(Boolean).join(';  '), { size: 8.5, color: PDF.fg3 });
+  }
+  pdfPara(doc, 'Score: 75-100 strong buy, 60-74 buy, 45-59 hold, 30-44 sell, 0-29 strong sell. The stop-loss sits just beyond the nearest support '
+    + '(resistance, for a sell) and the targets at the next resistance levels (supports, for a sell); where a stock has no level within reach, a multiple '
+    + 'of its ATR is used. Risk : reward compares the distance to target 2 (target 1 for a hold) with the distance to the stop-loss.', { size: 8, color: PDF.fg3 });
+  return pdfFinish(doc);
+}
+
+/** One stock: its score and what makes it up, stop-loss and targets, risk-reward, patterns. */
+async function buildStockPdf(r) {
+  const doc = await newPdf();
+  const t = r.targets || {}, name = companyName(r.symbol);
+  pdfPara(doc, name ? `${r.symbol}  -  ${name}` : r.symbol, { size: 15, bold: true, color: PDF.fg, gap: 4 });
+  pdfPara(doc, `Scan of ${state.when ? pdfStamp(state.when) : 'today'}${r.hourly ? `  |  New listing (${r.days} trading days): analysed on 1-hour candles` : ''}`, { size: 9, color: PDF.fg3, gap: 12 });
+
+  const rs = r.rs || {};
+  pdfTable(doc, ['Signal', 'Score', 'Price', 'Change today', 'RSI', 'vs Nifty 1M', 'vs Nifty 3M', 'vs Nifty 6M'],
+    [[SIG_LABEL[r.rec] || r.rec, n1(r.score), pdfMoney(r.price), signed(r.change, 2, '%'), n1(r.rsi), ...['1M', '3M', '6M'].map((k) => signed(rs[k], 1, '%'))]],
+    { styles: { font: 'helvetica', fontSize: 9, halign: 'center', cellPadding: 5, lineColor: PDF.line, lineWidth: 0.4, textColor: PDF.fg },
+      bodyStyles: { fontSize: 12, fontStyle: 'bold' },
+      didParseCell: (d) => { if (d.section === 'body' && d.column.index === 0) d.cell.styles.textColor = PDF.rec[r.rec] || PDF.fg; } });
+  if (illiquid(r)) pdfPara(doc, `Low liquidity: only about Rs ${Number(r.liquidity_cr || 0).toFixed(2)} crore traded per day. Price can gap past the stop-loss and orders may not fill.`, { size: 8.5, bold: true, color: PDF.rec['STRONG SELL'] });
+
+  pdfPara(doc, 'Stop-loss and targets', { size: 11, bold: true, color: PDF.fg, gap: 4 });
+  const basis = t.basis || {};
+  const why = (k) => (basis[k] ? basis[k].charAt(0).toUpperCase() + basis[k].slice(1) : '');
+  pdfTable(doc, ['Level', 'Price', 'What to do', 'Where it comes from'], [
+    ['Stop-loss', pdfMoney(t.sl), t.pos === 'SHORT' ? 'Exit if the price rises above' : 'Exit if the price falls below', pdfText(why('sl'))],
+    ['Target 1 (conservative)', pdfMoney(t.t1), 'Book partial profits', pdfText(why('t1'))],
+    ['Target 2 (moderate)', pdfMoney(t.t2), 'Main target - book 50%', pdfText(why('t2'))],
+    ['Target 3 (aggressive)', pdfMoney(t.t3), 'Trail the stop-loss', pdfText(why('t3'))],
+  ], { columnStyles: { 0: { fontStyle: 'bold', cellWidth: 118 }, 1: { halign: 'right', fontStyle: 'bold', cellWidth: 66 }, 2: { cellWidth: 138 } },
+       didParseCell: (d) => { if (d.section === 'body' && d.column.index === 0) d.cell.styles.textColor = [PDF.rec.SELL, PDF.rec.BUY, PDF.rec['STRONG BUY'], PDF.accent][d.row.index]; } });
+  const rr = t.rr || 0, pct = (a) => (t.price > 0 && a != null ? ` (${((a / t.price) * 100).toFixed(1)}% of the price)` : '');
+  pdfPara(doc, `Risk ${pdfMoney(t.risk)}${pct(t.risk)}   |   Reward ${pdfMoney(t.reward)}${pct(t.reward)}   |   Risk : reward ${rr > 0 ? `1 : ${rr.toFixed(2)}` : 'N/A'}`
+    + `  -  ${rr >= 2 ? 'excellent' : rr >= 1.5 ? 'good' : rr >= 1 ? 'acceptable' : 'poor'}`, { size: 9.5, bold: true, color: PDF.fg, gap: 3 });
+  pdfPara(doc, `Risk = from the price to the stop-loss. Reward = from the price to ${t.pos === 'HOLD' ? 'target 1' : 'target 2'}.`, { size: 8, color: PDF.fg3, gap: 12 });
+
+  pdfPara(doc, 'What makes up the score (each part 0 to 100)', { size: 11, bold: true, color: PDF.fg, gap: 4 });
+  const bd = r.breakdown || {};
+  pdfTable(doc, ['Indicator', 'Score', 'Reading'], Object.keys(NAMES).filter((k) => k in bd).map((k) => [NAMES[k], bd[k], bd[k] >= 70 ? 'Strong' : bd[k] >= 50 ? 'Good' : bd[k] >= 30 ? 'Weak' : 'Bearish']), {
+    tableWidth: 300, columnStyles: { 0: { cellWidth: 130 }, 1: { halign: 'right', fontStyle: 'bold', cellWidth: 60 } },
+    didParseCell: (d) => {
+      if (d.section !== 'body' || d.column.index !== 2) return;
+      const v = d.row.raw[1];
+      d.cell.styles.textColor = v >= 70 ? PDF.rec['STRONG BUY'] : v >= 50 ? PDF.rec.BUY : v >= 30 ? PDF.rec.HOLD : PDF.rec.SELL;
+      d.cell.styles.fontStyle = 'bold';
+    },
+  });
+
+  const p = r.patterns || {}, sum = p.summary || {};
+  const pats = [['Chart', p.chart], ['Candlestick', p.candlestick], ['Harmonic', p.harmonic]]
+    .flatMap(([kind, items]) => (items || []).map((x) => [pdfText(x.name), kind, String(x.signal || '').charAt(0) + String(x.signal || '').slice(1).toLowerCase(), pdfText(x.description || '')]));
+  pdfPara(doc, 'Patterns', { size: 11, bold: true, color: PDF.fg, gap: 4 });
+  if (pats.length) {
+    pdfTable(doc, ['Pattern', 'Type', 'Signal', 'Description'], pats, {
+      columnStyles: { 0: { fontStyle: 'bold', cellWidth: 140 }, 1: { cellWidth: 66 }, 2: { cellWidth: 52, fontStyle: 'bold' } },
+      didParseCell: (d) => { if (d.section === 'body' && d.column.index === 2) d.cell.styles.textColor = d.cell.raw === 'Bullish' ? PDF.rec.BUY : d.cell.raw === 'Bearish' ? PDF.rec.SELL : PDF.rec.HOLD; },
+    });
+    pdfPara(doc, `${sum.total_patterns || pats.length} found: ${sum.bullish_count || 0} bullish, ${sum.bearish_count || 0} bearish. Overall: ${sum.overall_signal || 'N/A'}.`, { size: 8.5 });
+  } else {
+    pdfPara(doc, 'No chart or candlestick patterns detected.', { size: 9 });
+  }
+  return pdfFinish(doc);
+}
+
+/** Make the report and hand it to the browser as a file to save. */
+async function downloadPdf(button, build, name) {
+  const label = button.textContent;
+  button.disabled = true; button.textContent = 'Making PDF...';
+  try {
+    const doc = await build();
+    const day = (state.when || new Date()).toLocaleDateString('en-CA');       // YYYY-MM-DD
+    doc.save(`${name}_${day}.pdf`);
+    toast('PDF downloaded', `${name}_${day}.pdf is in your Downloads.`, 'good', 5000);
+  } catch (err) {
+    toast("Couldn't make the PDF", err.message, 'bad');
+  } finally {
+    button.disabled = false; button.textContent = label;
+  }
+}
+
 // ============================================================ wiring
 
 function wire() {
@@ -909,6 +1132,11 @@ function wire() {
   });
 
   $('#scan-btn').addEventListener('click', scanAll);
+  $('#pdf-btn').addEventListener('click', (e) => {
+    if (!state.results.length) { toast('Scan first', 'The PDF report is made from your scan results.', 'warn'); return; }
+    if (!visibleRows().length) { toast('No stocks to report', 'Your Find / Show filters hide every stock - clear them first.', 'warn'); return; }
+    downloadPdf(e.currentTarget, buildScanPdf, 'Market_Analysis_scan');
+  });
   ['#f-q', '#f-rec', '#f-liq'].forEach((s) => $(s).addEventListener('input', renderResults));
   $('#results-box').addEventListener('click', (e) => {
     const th = e.target.closest('th[data-sort]');

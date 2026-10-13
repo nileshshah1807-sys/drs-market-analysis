@@ -39,6 +39,7 @@ REFRESH_DAYS = 7
 SYMBOL_RE = re.compile(r'^[A-Z0-9][A-Z0-9&_.-]{0,19}$')
 NSE_MAIN = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 NSE_SME = "https://nsearchives.nseindia.com/emerge/corporates/content/SME_EQUITY_L.csv"
+NSE_ETF = "https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv"
 BSE_LIST = ("https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w"
             "?Group=&Scripcode=&industry=&segment=Equity&status=Active")
 NAME, NSE, BSE, CODE, MCAP, ADD = range(6)
@@ -98,8 +99,24 @@ def _nice(name):
     return text[:1].upper() + text[1:]
 
 
+def _etf_rows():
+    """NSE's exchange-traded funds: (symbol, a readable name, ISIN). The exchange's own name
+    for one is a code (NIPINDETFNIFTYBEES), so it is named after what it tracks: 'Nifty 50 ETF'."""
+    text = _get(NSE_ETF, 'https://www.nseindia.com/').content.decode('utf-8', 'replace')
+    rows = list(csv.reader(io.StringIO(text)))
+    col = {h.strip().upper().replace(' ', ''): i for i, h in enumerate(rows[0])}
+    for row in rows[1:]:
+        if len(row) <= col['ISINNUMBER'] or not row[col['SYMBOL']].strip():
+            continue
+        tracks = (row[col['UNDERLYINGKEY']] if len(row) > col.get('UNDERLYINGKEY', 99) else '').strip() or row[col['UNDERLYINGASSET']].strip()
+        tracks = re.sub(r'\s+', ' ', tracks)[:48].strip(' -')
+        if tracks.isupper() and len(tracks) > 4:
+            tracks = tracks.title()
+        yield row[col['SYMBOL']].strip().upper(), f"{tracks} ETF" if tracks else 'ETF', row[col['ISINNUMBER']].strip()
+
+
 def fetch_master():
-    """Download and join the three lists. Raises if any of them can't be fetched or looks wrong."""
+    """Download and join the lists. Raises if a main one can't be fetched or looks wrong."""
     main = list(_nse_rows(NSE_MAIN))
     sme = list(_nse_rows(NSE_SME))
     bse = _get(BSE_LIST, 'https://www.bseindia.com/').json()
@@ -112,12 +129,19 @@ def fetch_master():
     for symbol, name, isin in sme:
         # Yahoo Finance lists NSE's SME stocks with -SM on the end (EVENTIONS-SM.NS)
         by_isin.setdefault(isin, [_tidy(name), symbol, '', '', 0, f"{symbol}-SM"])
+    try:
+        for symbol, name, isin in _etf_rows():        # a bonus: the lists are complete without it
+            by_isin.setdefault(isin, [name, symbol, '', '', 0, symbol])
+    except Exception as e:
+        logger.warning(f"ETF list not added: {e}")
     nse_symbols = {e[NSE] for e in by_isin.values()}
 
     for row in bse:
         isin, code = (row.get('ISIN_NUMBER') or '').strip(), str(row.get('SCRIP_CD') or '').strip()
         symbol = (row.get('scrip_id') or '').strip().upper()
-        if not code or not isin.startswith('INE'):       # INE... = a company's shares (not funds, bonds, ETFs)
+        # INE... = a company's shares. Other things on BSE (funds, bonds) are left out, except
+        # the BSE listing of an ETF that is already in the list from NSE.
+        if not code or not (isin.startswith('INE') or isin in by_isin):
             continue
         try:
             mcap = int(float(row.get('Mktcap') or 0))
@@ -165,14 +189,15 @@ def _read(path):
 
 
 def load(force=False):
-    """The list: the refreshed copy if there is one, otherwise the one shipped with the app."""
+    """The list: whichever is newer of the copy this app refreshed and the one it shipped with
+    (after an update of the app, the shipped one is the newer until the next weekly refresh)."""
     global _entries
     if _entries is None or force:
-        for path in (CACHE_FILE, MASTER_FILE):
+        paths = sorted((p for p in (CACHE_FILE, MASTER_FILE) if p.exists()), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in paths:
             try:
-                if path.exists():
-                    _entries = _read(path)
-                    break
+                _entries = _read(path)
+                break
             except Exception as e:
                 logger.warning(f"Company list {path.name} unreadable: {e}")
         else:
