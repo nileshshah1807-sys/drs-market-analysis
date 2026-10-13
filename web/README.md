@@ -46,6 +46,10 @@ Double-click **`run_web_locally.bat`** (opens <http://localhost:8000>; invite co
 - A scan runs in batches of 8 stocks (a free Vercel request may run 60 seconds at most).
 - Market open/closed is worked out from Indian time (weekdays 09:15-15:30); NSE holidays aren't
   known to the website.
+- **Watchlist file:** the Watchlist tab's "Save watchlist" downloads your list as JSON (the desktop
+  app's own format, so its Import reads it), CSV (with company names, for Excel) or text; "Load from
+  file" adds the stocks from such a file, including one saved by the desktop app. The watchlist
+  itself is always kept in your account automatically.
 - **PDF reports:** Scan Results has a "PDF report" button (the stocks shown in the table, in the
   same order, with stop-loss and targets); each stock's details page has its own "PDF" button.
   The file is made in the browser, so it downloads at once and costs the server nothing.

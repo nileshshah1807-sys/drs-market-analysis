@@ -179,6 +179,10 @@ main { padding: 14px 0 40px; }
 .empty { color: var(--fg2); text-align: center; padding: 60px 16px; }
 
 /* ---------- watchlist ---------- */
+.wl-bar { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: flex-end; justify-content: space-between; margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+.wl-bar > div:first-child { flex: 1 1 280px; }
+.wl-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+.wl-tools select { max-width: 100%; }
 .chips { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
 .chips { grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); }
 .chip { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 7px 8px 7px 12px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; font-weight: 600; font-size: 14px; min-width: 0; }

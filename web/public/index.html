@@ -101,6 +101,24 @@
     </nav>
 
     <section class="panel" id="p-watchlist" role="tabpanel" hidden>
+      <div class="wl-bar">
+        <div>
+          <b id="wl-count">0 stocks</b>
+          <div class="small-note">Your watchlist is kept in your account automatically. Save it as a file to keep a copy or to use it in the desktop app.</div>
+        </div>
+        <div class="wl-tools">
+          <label class="field">Save as
+            <select id="wl-format">
+              <option value="json">JSON (the desktop app can import it)</option>
+              <option value="csv">CSV (opens in Excel, with company names)</option>
+              <option value="txt">Text (one symbol per line)</option>
+            </select>
+          </label>
+          <button class="btn primary" id="wl-save" type="button">Save watchlist</button>
+          <button class="btn" id="wl-load" type="button">Load from file</button>
+          <input type="file" id="wl-file" accept=".json,.csv,.txt,application/json,text/csv,text/plain" hidden>
+        </div>
+      </div>
       <div class="chips" id="chips"></div>
       <div class="row-actions">
         <textarea id="bulk" placeholder="Paste many stocks at once: RELIANCE, TCS, INFY ... (commas, spaces or new lines). A desktop watchlist.json works too."></textarea>
@@ -188,6 +206,7 @@
           <dt>2</dt><dd>Scan all stocks</dd>
           <dt>3</dt><dd>Tap a stock for its score, stop-loss, targets and patterns</dd>
           <dt>4</dt><dd>Charts: price chart, or the 3D market map of the whole scan</dd>
+          <dt>Save</dt><dd>Watchlist tab: "Save watchlist" downloads your list as a file (JSON, CSV or text); "Load from file" adds the stocks from such a file</dd>
           <dt>5</dt><dd>PDF report: Scan Results has a button for the whole scan (the stocks shown in the table, in the same order); each stock's details has its own</dd>
         </dl></div>
         <div class="card pad"><h3>Columns</h3><dl>

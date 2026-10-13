@@ -158,6 +158,52 @@ async def run():
         await asyncio.sleep(0.5)
         await p.shot('02_watchlist')
 
+        # save the watchlist as a file (the desktop app's formats) ...
+        chips = sorted(await p.js("[...document.querySelectorAll('#chips .chip')].map(c => c.querySelector('button').dataset.del)"))
+        check('watchlist tab shows the count', await p.js("document.querySelector('#wl-count').textContent") == f"{len(chips)} stocks")
+        made = {fmt: json.loads(await p.js("JSON.stringify(watchlistFile('%s'))" % fmt)) for fmt in ('json', 'csv', 'txt')}
+        saved = json.loads(made['json']['text'])
+        check('save as JSON: the desktop app\'s own format', saved['watchlist'] == chips and 'app' in saved and made['json']['name'].startswith('my_watchlist_20')
+              and made['json']['name'].endswith('.json'), made['json']['name'])
+        lines = made['csv']['text'].lstrip('\ufeff').strip().splitlines()
+        check('save as CSV: symbols with company names, for Excel', made['csv']['text'].startswith('\ufeff') and lines[0] == 'Symbol,Company'
+              and 'RELIANCE,Reliance Industries Limited' in lines and len(lines) == len(chips) + 1, str(lines[:3]))
+        check('save as text: one symbol per line', made['txt']['text'].split() == chips)
+        try:
+            await p.send('Browser.setDownloadBehavior', behavior='allow', downloadPath=str(SHOTS))
+        except RuntimeError:
+            await p.send('Page.setDownloadBehavior', behavior='allow', downloadPath=str(SHOTS))
+        await p.js("document.querySelector('#wl-save').click(); true")
+        check('Save watchlist button downloads the file', await p.wait("[...document.querySelectorAll('.toast b')].some(b => b.textContent === 'Watchlist saved')", 20))
+        got = []
+        for _ in range(40):
+            got = list(SHOTS.glob('my_watchlist_*.json'))
+            if got and got[0].stat().st_size > 20:
+                break
+            await asyncio.sleep(0.5)
+        check('the saved file holds the watchlist', bool(got) and json.loads(got[0].read_text(encoding='utf-8'))['watchlist'] == chips, str([g.name for g in got]))
+
+        # ... and load one back
+        load = "(async () => { await loadWatchlistFile(new File([%s], %s)); return [...document.querySelectorAll('.toast b')].pop().textContent; })()"
+        csv_text = 'Symbol,Company\r\nRELIANCE,Reliance Industries Limited\r\nwipro,"Wipro, Limited"\r\nnot a symbol!,x\r\n'
+        said = await p.js(load % (json.dumps(csv_text), json.dumps('list.csv')))
+        chips2 = await p.js("[...document.querySelectorAll('#chips .chip')].map(c => c.querySelector('button').dataset.del)")
+        check('load a CSV: only the new stock is added (names and junk ignored)', said == 'Added 1 stock from list.csv' and sorted(chips2) == sorted(chips + ['WIPRO']), f"{said} {chips2}")
+        await p.js("document.querySelector('#chips button[data-del=WIPRO]').click(); true")
+        await p.wait(f"document.querySelectorAll('#chips .chip').length === {len(chips)}", 10)
+        desktop_json = json.dumps({'watchlist': ['tcs', 'INFY.NS'], 'date': '2026-10-13', 'app': "DR. NILESH SHAH'S Analysis"})
+        check('load a desktop watchlist file with nothing new', await p.js(load % (json.dumps(desktop_json), json.dumps('my_watchlist.json'))) == 'Nothing new in that file')
+        check('a file with no symbols is refused politely', await p.js(load % (json.dumps('hello world!\nthis is not a list\n'), json.dumps('notes.txt'))) == 'No stocks found in that file')
+        check('a broken file is refused politely', await p.js(load % (json.dumps('{not json'), json.dumps('bad.json'))) == "Couldn't read that file")
+        pick = SHOTS / 'to_load.txt'
+        pick.write_text('HCLTECH\n', encoding='utf-8')
+        doc = await p.send('DOM.getDocument')
+        node = await p.send('DOM.querySelector', nodeId=doc['root']['nodeId'], selector='#wl-file')
+        await p.send('DOM.setFileInputFiles', nodeId=node['nodeId'], files=[str(pick)])
+        check('Load from file adds the stocks in the chosen file', await p.wait("!!document.querySelector('#chips button[data-del=HCLTECH]')", 15))
+        await p.js("document.querySelector('#chips button[data-del=HCLTECH]').click(); true")
+        check('watchlist back as it was', await p.wait(f"document.querySelectorAll('#chips .chip').length === {len(chips)}", 10))
+
         # scan
         await p.js("document.querySelector('#scan-btn').click(); true")
         ok = await p.wait("document.querySelector('#status').textContent === 'Complete'", 150, 0.5)

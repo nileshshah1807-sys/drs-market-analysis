@@ -388,6 +388,7 @@ async function submitAdd() {
 
 function renderWatchlist() {
   const box = $('#chips');
+  $('#wl-count').textContent = `${state.watchlist.length} ${state.watchlist.length === 1 ? 'stock' : 'stocks'}`;
   if (!state.watchlist.length) {
     box.innerHTML = '<div class="empty" style="grid-column:1/-1">Your watchlist is empty. Add a stock above, or paste many below.</div>';
     return;
@@ -403,6 +404,72 @@ async function saveWatchlist(list, message) {
   renderWatchlist();
   if (message) toast(message, `${state.watchlist.length} stocks in your watchlist.`, 'good', 3500);
 }
+// ---- the watchlist as a file: save a copy, load one back (the desktop app's own formats) ----
+
+const FILE_HEADINGS = new Set(['SYMBOL', 'SYMBOLS', 'STOCK', 'STOCKS', 'SCRIP', 'SCRIPS', 'TICKER', 'TICKERS', 'NAME', 'WATCHLIST', 'COMPANY']);
+
+/** What "Save watchlist" writes: {name, text, type}. */
+function watchlistFile(format) {
+  const day = new Date().toLocaleDateString('en-CA');
+  const list = [...state.watchlist].sort();
+  if (format === 'csv') {
+    const cell = (v) => (/[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
+    const rows = [['Symbol', 'Company'], ...list.map((s) => [s, companyName(s)])];
+    return { name: `my_watchlist_${day}.csv`, type: 'text/csv', text: '\uFEFF' + rows.map((r) => r.map(cell).join(',')).join('\r\n') + '\r\n' };
+  }
+  if (format === 'txt') return { name: `my_watchlist_${day}.txt`, type: 'text/plain', text: list.join('\r\n') + '\r\n' };
+  return { name: `my_watchlist_${day}.json`, type: 'application/json',
+           text: JSON.stringify({ watchlist: list, date: new Date().toISOString(), app: "DR. NILESH SHAH'S Analysis" }, null, 2) };
+}
+
+async function saveWatchlistFile() {
+  if (!state.watchlist.length) { toast('Nothing to save yet', 'Add stocks to your watchlist first.', 'warn'); return; }
+  await loadCompanies();                         // company names for the CSV
+  const file = watchlistFile($('#wl-format').value);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([file.text], { type: `${file.type};charset=utf-8` }));
+  a.download = file.name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  toast('Watchlist saved', `${file.name} (${state.watchlist.length} stocks) is in your Downloads.`, 'good', 5000);
+}
+
+/** The symbols in a saved watchlist file: JSON (the desktop app's or a plain list), CSV (first column) or text. */
+function symbolsInFile(name, text) {
+  text = text.replace(/^\uFEFF/, '');
+  const ext = name.split('.').pop().toLowerCase();
+  let items;
+  if (ext === 'json') {
+    const data = JSON.parse(text);
+    items = Array.isArray(data) ? data : (data && Array.isArray(data.watchlist) ? data.watchlist : []);
+  } else if (ext === 'csv') {
+    items = text.split(/\r?\n/).map((line) => { const m = line.match(/^\s*"((?:[^"]|"")*)"/); return m ? m[1].replace(/""/g, '"') : line.split(',')[0]; });
+  } else {
+    items = text.split(/\r?\n/);
+  }
+  const given = items.map((x) => String(x ?? '').trim()).filter(Boolean);
+  const symbols = [...new Set(given.map((x) => x.toUpperCase().replace(/\.(NS|BO)$/, '')).filter((s) => SYMBOL_RE.test(s) && !FILE_HEADINGS.has(s)))];
+  return { symbols, given: given.filter((x) => !FILE_HEADINGS.has(x.toUpperCase())).length };
+}
+
+async function loadWatchlistFile(file) {
+  if (file.size > 1024 * 1024) { toast('That file is too big', 'A watchlist file is a few kilobytes - pick the right file.', 'warn'); return; }
+  let found;
+  try { found = symbolsInFile(file.name, await file.text()); }
+  catch (err) { toast("Couldn't read that file", 'It should be a watchlist saved here or by the desktop app (JSON, CSV or text).', 'bad'); return; }
+  if (!found.symbols.length) { toast('No stocks found in that file', 'It should list one symbol per line, or be a watchlist saved here or by the desktop app.', 'warn'); return; }
+  const fresh = found.symbols.filter((s) => !state.watchlist.includes(s));
+  const already = found.symbols.length - fresh.length, skipped = found.given - found.symbols.length;
+  const notes = [already ? `${already} already in your watchlist` : '', skipped > 0 ? `${skipped} lines skipped (not symbols)` : ''].filter(Boolean);
+  if (!fresh.length) { toast('Nothing new in that file', notes.join('; ') + '.', 'info', 5000); return; }
+  const wanted = [...state.watchlist, ...fresh].sort();
+  try { await saveWatchlist(wanted); }
+  catch (err) { toast("Couldn't load the file", err.message, 'bad'); return; }
+  if (state.watchlist.length < wanted.length) notes.push(`${wanted.length - state.watchlist.length} left out: a watchlist holds up to ${state.watchlist.length} stocks`);
+  const added = fresh.length - (wanted.length - state.watchlist.length);
+  toast(`Added ${added} ${added === 1 ? 'stock' : 'stocks'} from ${file.name}`, notes.join('; ') || `${state.watchlist.length} stocks in your watchlist.`, 'good', 6000);
+}
+
 async function addSymbols(list) {
   const fresh = list.filter((s) => !state.watchlist.includes(s));
   if (!fresh.length) { toast('Already in your watchlist', list.join(', '), 'info', 3500); return; }
@@ -1131,6 +1198,15 @@ function wire() {
     catch (err) { toast("Couldn't remove", err.message, 'bad'); }
   });
 
+  $('#wl-save').addEventListener('click', saveWatchlistFile);
+  $('#wl-load').addEventListener('click', () => $('#wl-file').click());
+  $('#wl-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';                           // the same file can be picked again
+    if (file) await loadWatchlistFile(file);
+  });
+  try { $('#wl-format').value = localStorage.getItem('drs-wl-format') || 'json'; } catch (err) { /* private window */ }
+  $('#wl-format').addEventListener('change', (e) => { try { localStorage.setItem('drs-wl-format', e.target.value); } catch (err) { /* private window */ } });
   $('#scan-btn').addEventListener('click', scanAll);
   $('#pdf-btn').addEventListener('click', (e) => {
     if (!state.results.length) { toast('Scan first', 'The PDF report is made from your scan results.', 'warn'); return; }
