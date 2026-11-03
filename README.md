@@ -49,16 +49,16 @@ the Backtest tab shows which weights are in use; Settings > Reset Defaults resto
 
 | Indicator | Weight |
 |-----------|--------|
-| RSI (14) | 12% |
-| MACD | 12% |
-| Moving averages (SMA 20/50/200, EMA 12/26) | 15% |
-| SuperTrend | 11% |
-| VWAP | 10% |
-| Bollinger Bands | 8% |
-| Stochastic | 8% |
-| ADX | 8% |
-| Volume (OBV) | 8% |
-| Momentum (Williams %R, CCI) | 8% |
+| RSI (14) | 20% |
+| Bollinger Bands | 20% |
+| Stochastic | 15% |
+| Momentum (Williams %R, CCI) | 15% |
+| MACD | 5% |
+| Moving averages (SMA 20/50/200, EMA 12/26) | 5% |
+| ADX | 5% |
+| Volume (OBV) | 5% |
+| SuperTrend | 5% |
+| VWAP | 5% |
 
 | Score | Signal |
 |-------|--------|

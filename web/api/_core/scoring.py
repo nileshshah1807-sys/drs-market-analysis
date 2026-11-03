@@ -236,7 +236,7 @@ def support_resistance(df, atr):
 # ============================================================
 
 class Scorer:
-    WEIGHTS = {'rsi': 12, 'macd': 12, 'ma': 15, 'boll': 8, 'stoch': 8, 'adx': 8, 'vol': 8, 'mom': 8, 'st': 11, 'vwap': 10}
+    WEIGHTS = {'rsi': 20, 'macd': 5, 'ma': 5, 'boll': 20, 'stoch': 15, 'adx': 5, 'vol': 5, 'mom': 15, 'st': 5, 'vwap': 5}
     DEFAULT_WEIGHTS = dict(WEIGHTS)
 
     @classmethod
