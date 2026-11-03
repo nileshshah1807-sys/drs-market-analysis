@@ -12,7 +12,7 @@ const SYMBOL_RE = /^[A-Z0-9][A-Z0-9&_.-]{0,19}$/;
 const BATCH = 8;          // stocks per server call
 const PARALLEL = 3;       // server calls at once
 const PLOTLY_URL = 'https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js';
-const NAMES = { rsi: 'RSI', macd: 'MACD', ma: 'Moving Avg', boll: 'Bollinger', stoch: 'Stochastic', adx: 'ADX',
+const NAMES = { rs: 'RS Rating', macd: 'MACD', ma: 'Moving Avg', boll: 'Bollinger', stoch: 'Stochastic', adx: 'ADX',
                 vol: 'Volume', mom: 'Momentum', st: 'SuperTrend', vwap: 'VWAP' };
 
 const state = {
@@ -81,6 +81,7 @@ function countUp(el, to, decimals = 0, ms = 1000) {
 const money = (v) => (v == null ? 'N/A' : Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 const signed = (v, d = 2, suffix = '') => (v == null ? 'N/A' : `${v > 0 ? '+' : ''}${Number(v).toFixed(d)}${suffix}`);
 const n1 = (v) => (v == null ? 'N/A' : Number(v).toFixed(1));
+const n0 = (v) => (v == null ? 'N/A' : String(Math.round(v)));
 
 function marker(rec, size = 14) {
   const c = `var(${SIG_VAR[rec] || '--hold'})`;
@@ -559,7 +560,7 @@ const COLS = [
   { key: 'price', label: 'Price', fmt: money },
   { key: 'change', label: 'Change %', fmt: (v) => signed(v, 2, '%') },
   { key: 'rs3', label: 'vs Nifty 3M', get: (r) => (r.rs ? r.rs['3M'] : null), fmt: (v) => signed(v, 1, '%') },
-  { key: 'rsi', label: 'RSI', fmt: n1 },
+  { key: 'rs_rating', label: 'RS', fmt: n0 },
   { key: 'score', label: 'Score', fmt: n1 },
   { key: 'chg', label: 'Score Chg', get: (r) => (r.prev_score == null ? null : r.score - r.prev_score), fmt: (v) => (v == null ? 'new' : signed(v, 1)) },
   { key: 'rec', label: 'Signal', cls: 'text', text: true },
@@ -670,6 +671,7 @@ function showDetails(symbol) {
       <div class="facts">
         <div class="rec">${esc(r.rec)}</div>
         <div class="line">Price ${money(r.price)}, ${signed(r.change, 2, '%')} on the day</div>
+        <div class="rs"><span>RS rating:</span><span class="${r.rs_rating == null ? '' : r.rs_rating >= 90 ? 'up' : r.rs_rating < 50 ? 'down' : ''}">${n0(r.rs_rating)}${r.rs_rating >= 90 ? ' (best: 90 and above)' : ''}</span></div>
         <div class="rs"><span>vs Nifty 50:</span>${rsHtml}</div>
         ${rs3 != null ? `<div class="small-note" style="margin-top:6px">Over 3 months the stock is ${rs3 > 0 ? 'beating' : 'lagging'} the market by ${Math.abs(rs3).toFixed(1)} percentage points.</div>` : ''}
       </div>
@@ -865,33 +867,34 @@ async function showMarketMap(animate = true) {
   const sym = { 'STRONG BUY': 'diamond', BUY: 'circle', HOLD: 'square', SELL: 'x', 'STRONG SELL': 'cross' };
   const col = { 'STRONG BUY': C.sb, BUY: C.buy, HOLD: C.hold, SELL: C.sell, 'STRONG SELL': C.ss };
   const rs3 = (r) => (r.rs && r.rs['3M'] != null ? r.rs['3M'] : 0);
+  const rating = (r) => (r.rs_rating != null ? r.rs_rating : 50);
   const traces = [];
   SIGNALS.forEach((rec) => {
     const pts = state.results.filter((r) => r.rec === rec);
     if (!pts.length) return;
     const sx = [], sy = [], sz = [];
-    pts.forEach((r) => { sx.push(r.rsi, r.rsi, null); sy.push(rs3(r), rs3(r), null); sz.push(0, r.score, null); });
+    pts.forEach((r) => { sx.push(rating(r), rating(r), null); sy.push(rs3(r), rs3(r), null); sz.push(0, r.score, null); });
     traces.push({ type: 'scatter3d', mode: 'lines', x: sx, y: sy, z: sz, line: { color: col[rec], width: 3 }, hoverinfo: 'skip', showlegend: false });
-    traces.push({ type: 'scatter3d', mode: 'markers', name: `${SIG_LABEL[rec]} (${pts.length})`, x: pts.map((r) => r.rsi), y: pts.map(rs3), z: pts.map((r) => r.score),
+    traces.push({ type: 'scatter3d', mode: 'markers', name: `${SIG_LABEL[rec]} (${pts.length})`, x: pts.map(rating), y: pts.map(rs3), z: pts.map((r) => r.score),
       text: pts.map((r) => r.symbol), marker: { size: rec.startsWith('STRONG') ? 7 : 5, color: col[rec], symbol: sym[rec], line: { color: C.surface, width: 1 } },
-      hovertemplate: '<b>%{text}</b><br>Score %{z:.1f}<br>RSI %{x:.1f}<br>vs Nifty 3M %{y:+.1f}%<extra></extra>' });
+      hovertemplate: '<b>%{text}</b><br>Score %{z:.1f}<br>RS rating %{x:.0f}<br>vs Nifty 3M %{y:+.1f}%<extra></extra>' });
   });
   const ranked = [...state.results].sort((a, b) => a.score - b.score);
   const named = [...ranked.slice(-4), ...ranked.slice(0, 2)];
-  traces.push({ type: 'scatter3d', mode: 'text', x: named.map((r) => r.rsi), y: named.map(rs3), z: named.map((r) => r.score + 4), text: named.map((r) => r.symbol),
+  traces.push({ type: 'scatter3d', mode: 'text', x: named.map(rating), y: named.map(rs3), z: named.map((r) => r.score + 4), text: named.map((r) => r.symbol),
     textfont: { color: C.fg, size: 11 }, hoverinfo: 'skip', showlegend: false });
   const axis = (title, extra = {}) => Object.assign({ title: { text: title }, gridcolor: C.grid, backgroundcolor: rgba(C['surface-2'], 0.7), showbackground: true, zerolinecolor: C.line, color: C['chart-fg'] }, extra);
   const layout = Object.assign(baseLayout(C), {
     title: { text: `<b>3D market map</b>  ${state.results.length} stocks`, x: 0.01, font: { color: C.fg, size: 15 } },
     margin: { l: 0, r: 0, t: 40, b: 0 }, showlegend: true, legend: { x: 0.01, y: 0.92, font: { color: C['chart-fg'] } },
     scene: {
-      xaxis: axis('RSI', { range: [0, 100] }), yaxis: axis('vs Nifty 50, 3M (%)'), zaxis: axis('Score', { range: [0, 100] }),
+      xaxis: axis('RS rating', { range: [0, 100] }), yaxis: axis('vs Nifty 50, 3M (%)'), zaxis: axis('Score', { range: [0, 100] }),
       aspectmode: 'manual', aspectratio: { x: 1.5, y: 1.1, z: 0.9 }, dragmode: 'turntable',
       camera: { eye: { x: -1.25, y: -1.1, z: 0.2 } },
     },
   });
   await P.react(el, traces, layout, PLOT_CONFIG);
-  $('#c-note').textContent = 'Higher = better score. Right = higher RSI. Further back = beating the Nifty 50 over 3 months. It turns by itself - touch or drag it to take over.';
+  $('#c-note').textContent = 'Higher = better score. Right = higher RS rating. Further back = beating the Nifty 50 over 3 months. It turns by itself - touch or drag it to take over.';
   if (!motionOn()) { P.relayout(el, { 'scene.camera.eye': { x: -1.25, y: -1.1, z: 0.7 } }); return; }
   // the camera rises over the map, then the map turns slowly until it's touched
   const spin = { stop: false, angle: Math.atan2(-1.1, -1.25), z: 0.2, last: 0 };
@@ -1026,10 +1029,10 @@ async function buildScanPdf() {
   pdfPara(doc, 'Scan results', { size: 11, bold: true, color: PDF.fg, gap: 4 });
   const body = rows.map((r) => {
     const t = r.targets || {};
-    return [r.symbol + (r.hourly ? '*' : ''), pdfText(companyName(r.symbol)), pdfMoney(r.price), signed(r.change, 2, '%'), n1(r.rsi), n1(r.score),
+    return [r.symbol + (r.hourly ? '*' : ''), pdfText(companyName(r.symbol)), pdfMoney(r.price), signed(r.change, 2, '%'), n0(r.rs_rating), n1(r.score),
             SIG_LABEL[r.rec] || r.rec, pdfMoney(t.sl), pdfMoney(t.t1), pdfMoney(t.t2), t.rr ? `1 : ${Number(t.rr).toFixed(2)}` : 'N/A'];
   });
-  pdfTable(doc, ['Symbol', 'Company', 'Price', 'Chg %', 'RSI', 'Score', 'Signal', 'Stop-loss', 'Target 1', 'Target 2', 'Risk : reward'], body, {
+  pdfTable(doc, ['Symbol', 'Company', 'Price', 'Chg %', 'RS', 'Score', 'Signal', 'Stop-loss', 'Target 1', 'Target 2', 'Risk : reward'], body, {
     rowPageBreak: 'avoid',
     styles: { font: 'helvetica', fontSize: 7.2, cellPadding: 3, lineColor: PDF.line, lineWidth: 0.4, textColor: PDF.fg, overflow: 'ellipsize', halign: 'right' },
     headStyles: { fillColor: PDF.accent, textColor: 255, fontStyle: 'bold', halign: 'center', valign: 'middle', overflow: 'linebreak' },
@@ -1068,8 +1071,8 @@ async function buildStockPdf(r) {
   pdfPara(doc, `Scan of ${state.when ? pdfStamp(state.when) : 'today'}${r.hourly ? `  |  New listing (${r.days} trading days): analysed on 1-hour candles` : ''}`, { size: 9, color: PDF.fg3, gap: 12 });
 
   const rs = r.rs || {};
-  pdfTable(doc, ['Signal', 'Score', 'Price', 'Change today', 'RSI', 'vs Nifty 1M', 'vs Nifty 3M', 'vs Nifty 6M'],
-    [[SIG_LABEL[r.rec] || r.rec, n1(r.score), pdfMoney(r.price), signed(r.change, 2, '%'), n1(r.rsi), ...['1M', '3M', '6M'].map((k) => signed(rs[k], 1, '%'))]],
+  pdfTable(doc, ['Signal', 'Score', 'Price', 'Change today', 'RS rating', 'vs Nifty 1M', 'vs Nifty 3M', 'vs Nifty 6M'],
+    [[SIG_LABEL[r.rec] || r.rec, n1(r.score), pdfMoney(r.price), signed(r.change, 2, '%'), n0(r.rs_rating), ...['1M', '3M', '6M'].map((k) => signed(rs[k], 1, '%'))]],
     { styles: { font: 'helvetica', fontSize: 9, halign: 'center', cellPadding: 5, lineColor: PDF.line, lineWidth: 0.4, textColor: PDF.fg },
       bodyStyles: { fontSize: 12, fontStyle: 'bold' },
       didParseCell: (d) => { if (d.section === 'body' && d.column.index === 0) d.cell.styles.textColor = PDF.rec[r.rec] || PDF.fg; } });

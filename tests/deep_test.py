@@ -400,7 +400,7 @@ def s_settings():
     app.min_liquidity_var.set('1')
     app.save_liquidity_setting()
     expected_warnings.append(1)                # weights not totalling 100 must be refused
-    app.weight_vars['rsi'].set(99)
+    app.weight_vars['rs'].set(99)
     app.apply_weights()
     app.reset_weights()
     check('weights reset after invalid', m.Scorer.WEIGHTS == m.Scorer.DEFAULT_WEIGHTS)

@@ -5,7 +5,7 @@ Strategy Backtester for DR. NILESH SHAH'S MARKET ANALYSIS
 Answers: "Does the 0-100 score actually predict returns?"
 
 For every stock and every past trading day it rebuilds the app's indicator scores
-(RSI, MACD, MAs, Bollinger, Stochastic, ADX, OBV, Momentum, SuperTrend, VWAP) using
+(RS rating, MACD, MAs, Bollinger, Stochastic, ADX, OBV, Momentum, SuperTrend, VWAP) using
 only data available on that day, then measures what the stock did over the next
 5 / 10 / 20 trading days.
 
@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import ta
 
-from scoring import supertrend
+from scoring import supertrend, rs_rating_series
 
 WARMUP = 200                # rows needed before the first score (so the 200-day SMA exists, as in live scans)
 HORIZONS = (5, 10, 20)       # forward return horizons, in trading days
@@ -31,7 +31,7 @@ TRAIN_FRACTION = 0.6         # older 60% of dates = "train", newer 40% = "test"
 MIN_STOCKS_FOR_EXCESS = 5    # with fewer stocks, raw returns are used instead of returns vs. the group
 
 COMPONENT_NAMES = {
-    'rsi': 'RSI', 'macd': 'MACD', 'ma': 'Moving Avg', 'boll': 'Bollinger',
+    'rs': 'RS Rating', 'macd': 'MACD', 'ma': 'Moving Avg', 'boll': 'Bollinger',
     'stoch': 'Stochastic', 'adx': 'ADX', 'vol': 'Volume (OBV)', 'mom': 'Momentum',
     'st': 'SuperTrend', 'vwap': 'VWAP',
 }
@@ -48,14 +48,16 @@ def rec_from_total(total: float) -> str:
 # Indicators (vectorised versions of Analyzer.analyze)
 # ------------------------------------------------------------
 
-def indicator_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """All indicator values for every row, with the same NaN fallbacks the live scan uses."""
+def indicator_frame(df: pd.DataFrame, index_df: pd.DataFrame = None) -> pd.DataFrame:
+    """All indicator values for every row, with the same NaN fallbacks the live scan uses.
+    `index_df`: Nifty 50 history, for the RS rating (without it the RS rating scores neutral)."""
     close, high, low, vol = df['Close'], df['High'], df['Low'], df['Volume'].fillna(0)
     price = close
     out = pd.DataFrame(index=df.index)
     out['price'] = price
     out['liquidity_cr'] = (close * vol).rolling(20).mean() / 1e7   # avg daily traded value, Rs crore
-    out['rsi'] = ta.momentum.RSIIndicator(close, 14).rsi().fillna(50)
+    out['rs_rating'] = (rs_rating_series(close, index_df['Close']) if index_df is not None and len(index_df)
+                        else pd.Series(np.nan, index=df.index))
     # MACD and moving averages stay NaN while there isn't enough history; the scorer skips them
     m = ta.trend.MACD(close)
     out['macd'] = m.macd()
@@ -98,7 +100,7 @@ def component_scores(ind: pd.DataFrame, scorer) -> pd.DataFrame:
         vwap_sig = 'BULLISH' if p > r.vwap * 1.02 else 'BEARISH' if p < r.vwap * 0.98 else 'NEUTRAL'
         st = {'sig': 'BUY', 'dir': 'BULLISH'} if r.st_dir == 1 else {'sig': 'SELL', 'dir': 'BEARISH'}
         rows.append((
-            scorer._rsi(r.rsi),
+            scorer._rs(opt(r.rs_rating)),
             scorer._macd({'macd': opt(r.macd), 'signal': opt(r.macd_signal), 'hist': opt(r.macd_hist)}),
             scorer._ma(p, {'sma20': opt(r.sma20), 'sma50': opt(r.sma50), 'sma200': opt(r.sma200),
                            'ema12': opt(r.ema12), 'ema26': opt(r.ema26)}),
@@ -171,8 +173,9 @@ def suggest_weights(ics: dict) -> dict:
 # Main entry point
 # ------------------------------------------------------------
 
-def build_samples(data: dict, scorer, progress=None) -> tuple:
-    """One row per (stock, day): indicator scores + forward returns."""
+def build_samples(data: dict, scorer, progress=None, index_df: pd.DataFrame = None) -> tuple:
+    """One row per (stock, day): indicator scores + forward returns.
+    `index_df`: Nifty 50 history, for the RS rating."""
     frames, skipped = [], []
     need = WARMUP + max(HORIZONS) + 30
     for i, (sym, df) in enumerate(data.items()):
@@ -182,7 +185,7 @@ def build_samples(data: dict, scorer, progress=None) -> tuple:
             skipped.append(sym)
             continue
         try:
-            ind = indicator_frame(df)
+            ind = indicator_frame(df, index_df)
             comp = component_scores(ind, scorer)
             comp['liquidity_cr'] = ind['liquidity_cr']
             for h in HORIZONS:
@@ -210,7 +213,8 @@ def _add_excess_returns(samples: pd.DataFrame, horizon: int) -> pd.DataFrame:
 
 
 def run_backtest(data: dict, scorer, weights: dict, horizon: int = 10, progress=None,
-                 samples: pd.DataFrame = None, skipped=None, min_liquidity_cr: float = 0) -> dict:
+                 samples: pd.DataFrame = None, skipped=None, min_liquidity_cr: float = 0,
+                 index_df: pd.DataFrame = None) -> dict:
     """Backtest the scoring system on {symbol: price DataFrame}.
 
     scorer:  the app's Scorer class (provides the per-indicator scoring rules)
@@ -218,9 +222,10 @@ def run_backtest(data: dict, scorer, weights: dict, horizon: int = 10, progress=
     samples: pass the result of build_samples() to re-run with another horizon without rescoring
     min_liquidity_cr: only count days when the stock's 20-day average traded value was at least
                       this many Rs crore (0 = all days)
+    index_df: Nifty 50 history, for the RS rating
     """
     if samples is None:
-        samples, skipped = build_samples(data, scorer, progress)
+        samples, skipped = build_samples(data, scorer, progress, index_df)
     if samples.empty:
         return {'error': 'Not enough price history to backtest '
                          f'(need at least {WARMUP + max(HORIZONS) + 30} trading days per stock).',

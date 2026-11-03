@@ -99,7 +99,7 @@ NEW FEATURES
 
 11. NEW LISTINGS ARE SCANNED ON 1-HOUR CANDLES
    A stock listed less than a month ago doesn't have enough daily candles,
-   so the scan uses its 1-hour candles for every indicator (RSI, MACD,
+   so the scan uses its 1-hour candles for every indicator (MACD,
    averages, SuperTrend, VWAP, ATR, patterns ...). Scan Results marks it
    "1 Hour" in the "Candle" column; reports mark it with a *.
    - It gets a score from its 3rd trading day (20 hourly candles). Before
@@ -170,7 +170,7 @@ NEW FEATURES
      grow, price charts that draw themselves in, and a pulsing market light.
    - After a scan, the result slides in at the bottom right instead of a
      box you had to close; rows whose signal changed glow for a moment.
-   - Charts tab > "3D market map": every scanned stock in 3D (score, RSI,
+   - Charts tab > "3D market map": every scanned stock in 3D (score, RS rating,
      strength vs the Nifty 50). It turns by itself; click it to stop and
      drag to turn it.
    - Sector tab: a 3D chart of buy, hold and sell stocks in each sector.

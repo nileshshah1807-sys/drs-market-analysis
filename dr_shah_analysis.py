@@ -102,7 +102,7 @@ except ImportError:
 
 # Indicators, the 0-100 score and stop-loss/targets (shared with the backtest and the daily report)
 import scoring
-from scoring import safe_float, Scorer, TargetCalc, relative_strength, NIFTY_SYMBOL, RS_PERIODS
+from scoring import safe_float, Scorer, TargetCalc, relative_strength, NIFTY_SYMBOL, RS_PERIODS, RS_RATING_BEST
 
 try:
     import symbols          # every NSE + BSE company, for the "Add a stock" search
@@ -319,10 +319,10 @@ class Analyzer:
                     out[s] = df   # listed a day or two ago: too few candles yet (the scan says so)
         return out
 
-    def analyze(self, df, days=None):
+    def analyze(self, df, days=None, index_df=None):
         """`days`: a new listing's daily candles, when `df` holds its 1-hour candles (worked
-        out from `df` if not given)."""
-        data = scoring.indicators(df, days)
+        out from `df` if not given). `index_df`: Nifty 50 history, for the RS rating."""
+        data = scoring.indicators(df, days, index_df)
 
         # Pattern Detection
         patterns = {}
@@ -337,6 +337,12 @@ class Analyzer:
 
 
 # Relative strength vs the Nifty 50 lives in scoring.py (shared with the web version)
+
+
+def rs_rating_text(r):
+    """A result's RS rating (1-99) for tables, 'N/A' when there isn't one."""
+    v = r.get('rs_rating')
+    return str(int(v)) if v is not None else "N/A"
 
 
 ROTATION_DAYS = 7     # a sector's score is compared with its stocks' scans from about this many days earlier
@@ -738,9 +744,9 @@ class App:
         tab = tk.Frame(self.nb, bg=T['bg'])
         self.nb.add(tab, text="  Scan Results  ")
         
-        cols = ('Symbol', 'Price', 'Change%', 'vs Nifty 3M', 'RSI', 'SuperTrend', 'VWAP', 'Score', 'Score Chg',
+        cols = ('Symbol', 'Price', 'Change%', 'vs Nifty 3M', 'RS', 'SuperTrend', 'VWAP', 'Score', 'Score Chg',
                 'Recommendation', '52W High', '52W Low', 'ATR', 'Traded/day (Cr)', 'Candle')
-        col_widths = {'Symbol': 110, 'Price': 90, 'Change%': 80, 'vs Nifty 3M': 95, 'RSI': 60, 'SuperTrend': 90,
+        col_widths = {'Symbol': 110, 'Price': 90, 'Change%': 80, 'vs Nifty 3M': 95, 'RS': 50, 'SuperTrend': 90,
                       'VWAP': 85, 'Score': 65, 'Score Chg': 80, 'Recommendation': 120, '52W High': 90,
                       '52W Low': 90, 'ATR': 70, 'Traded/day (Cr)': 115, 'Candle': 70}
         text_cols = ('Symbol', 'SuperTrend', 'VWAP', 'Recommendation', 'Candle')   # left-aligned; numbers right-aligned
@@ -1546,7 +1552,7 @@ class App:
 
         map_btn = self.btn(header, "3D market map", None, self.show_market_map)
         map_btn.pack(side=tk.RIGHT, padx=(6, 16))
-        Tooltip(map_btn, "Every scanned stock in 3D: score, RSI and strength against the Nifty")
+        Tooltip(map_btn, "Every scanned stock in 3D: score, RS rating and strength against the Nifty")
         self.btn(header, "Show chart", T['accent'], self.show_stock_chart).pack(side=tk.RIGHT, padx=6)
 
         self.chart_period_var = tk.StringVar(value="6mo")
@@ -1689,7 +1695,7 @@ class App:
         ui.tween(widget, 900, step, frame=30)
 
     def show_market_map(self):
-        """3D market map: every scanned stock as a point - score up, RSI across, strength
+        """3D market map: every scanned stock as a point - score up, RS rating across, strength
         against the Nifty 50 (3 months) into the screen. It turns slowly until you click it;
         drag to turn it yourself."""
         if not MATPLOTLIB_OK:
@@ -1721,12 +1727,16 @@ class App:
         def rs3(r):
             v = (r.get('rs') or {}).get('3M')
             return v if v is not None else 0.0
+
+        def rating(r):
+            v = r.get('rs_rating')
+            return v if v is not None else 50
         markers = {'STRONG BUY': '^', 'BUY': '^', 'HOLD': 's', 'SELL': 'v', 'STRONG SELL': 'v'}
         for rec, label in (('STRONG BUY', 'Strong buy'), ('BUY', 'Buy'), ('HOLD', 'Hold'), ('SELL', 'Sell'), ('STRONG SELL', 'Strong sell')):
             pts = [r for r in results if r['rec'] == rec]
             if not pts:
                 continue
-            xs, ys, zs = [r['rsi'] for r in pts], [rs3(r) for r in pts], [r['score'] for r in pts]
+            xs, ys, zs = [rating(r) for r in pts], [rs3(r) for r in pts], [r['score'] for r in pts]
             c = ui.signal_color(T, rec)
             for x, y, z in zip(xs, ys, zs):      # a thin stem down to the floor helps judge height
                 ax.plot([x, x], [y, y], [0, z], color=c, linewidth=0.9, alpha=0.55)
@@ -1734,8 +1744,8 @@ class App:
                        edgecolors=T['card'], linewidths=0.8, depthshade=True, label=f"{label} ({len(pts)})")
         ranked = sorted(results, key=lambda r: r['score'])
         for r in ranked[-4:] + ranked[:2]:      # the best and the weakest, named
-            ax.text(r['rsi'], rs3(r), r['score'] + 3, r['symbol'], fontsize=8, color=T['fg'], ha='center')
-        ax.set_xlabel('RSI', labelpad=8)
+            ax.text(rating(r), rs3(r), r['score'] + 3, r['symbol'], fontsize=8, color=T['fg'], ha='center')
+        ax.set_xlabel('RS rating', labelpad=8)
         ax.set_ylabel('vs Nifty 50, 3 months (%)', labelpad=8)
         ax.set_zlabel('Score', labelpad=6)
         ax.set_xlim(0, 100)
@@ -1749,7 +1759,7 @@ class App:
         widget = canvas.get_tk_widget()
         widget.configure(highlightthickness=1, highlightbackground=T['line'])
         widget.pack(fill=tk.BOTH, expand=True)
-        tk.Label(self.chart_frame, text="Higher = better score. Right = higher RSI. Further back = beating the Nifty 50 over 3 months. "
+        tk.Label(self.chart_frame, text="Higher = better score. Right = higher RS rating. Further back = beating the Nifty 50 over 3 months. "
                                         "The map turns by itself - click it to stop, drag to turn it.",
                  bg=T['bg'], fg=T['fg2'], font=(ui.FONT, 9)).pack(anchor=tk.W, pady=(6, 0))
 
@@ -2099,7 +2109,9 @@ class App:
                     data = market_data.load_history(watchlist, years=HISTORY_YEARS, progress=progress)
                     data = {s: market_data.slice_period(df, f"{years}y") for s, df in data.items()}
                     missing = [s for s in watchlist if s.upper() not in data]
-                    result = backtest.run_backtest(data, Scorer, weights, horizon, progress, min_liquidity_cr=min_liq)
+                    nifty = scoring.load_index(years=HISTORY_YEARS)     # for the RS rating
+                    result = backtest.run_backtest(data, Scorer, weights, horizon, progress, min_liquidity_cr=min_liq,
+                                                   index_df=nifty)
                     result['skipped'] = sorted(set(result.get('skipped', []) + missing))
                     if 'samples' in result:
                         self._bt_cache = (key, result['samples'], result['skipped'])
@@ -2401,7 +2413,7 @@ class App:
         weights_frame.pack(fill=tk.X, padx=20, pady=10)
         
         self.weight_vars = {}
-        weights = [('rsi', 'RSI', 12), ('macd', 'MACD', 12), ('ma', 'Moving Avg', 15),
+        weights = [('rs', 'RS Rating', 12), ('macd', 'MACD', 12), ('ma', 'Moving Avg', 15),
                    ('boll', 'Bollinger', 8), ('stoch', 'Stochastic', 8), ('adx', 'ADX', 8),
                    ('vol', 'Volume', 8), ('mom', 'Momentum', 8), ('st', 'SuperTrend', 11),
                    ('vwap', 'VWAP', 10)]
@@ -3036,7 +3048,7 @@ class App:
             try:
                 data = market_data.load_history(watchlist, years=HISTORY_YEARS)
                 data = {s: market_data.slice_period(df, f"{years}y") for s, df in data.items()}
-                samples, _ = backtest.build_samples(data, Scorer)
+                samples, _ = backtest.build_samples(data, Scorer, index_df=scoring.load_index(years=HISTORY_YEARS))
                 result = backtest.compare_weights(samples, current, dict(Scorer.DEFAULT_WEIGHTS), horizon,
                                                   min_liquidity_cr=min_liq)
             except Exception as e:
@@ -3243,7 +3255,7 @@ class App:
                 ("Escape", "Close/Cancel"), ("Double-click", "View details"),
             ]),
             ("INDICATORS", [
-                ("RSI", "Overbought >70, Oversold <30"), ("MACD", "Trend momentum"),
+                ("RS rating", f"1-99 vs the whole market; {RS_RATING_BEST}+ is best"), ("MACD", "Trend momentum"),
                 ("SuperTrend", "Trend following"), ("VWAP", "Volume weighted price"),
                 ("Bollinger", "Volatility bands"), ("ADX", "Trend strength")
             ]),
@@ -3273,6 +3285,8 @@ class App:
                 ("Custom", "Create your own groups (Ctrl+G)"),
             ]),
             ("MARKET COMPARISON & HISTORY", [
+                ("RS", f"RS rating 1-99: 3/6/9/12-month performance vs the Nifty 50 (last 3 months count double). "
+                       f"{RS_RATING_BEST} and above is best"),
                 ("vs Nifty 3M", "Stock's 3-month return minus the Nifty 50's (+5% = beat the market by 5 points)"),
                 ("Score Chg", "Change in score since the previous scan day ('new' = first scan)"),
                 ("Signal changes", "Listed after each scan and in the watchlist email"),
@@ -3294,7 +3308,7 @@ class App:
             ("APPEARANCE & 3D", [
                 ("Light / Dark", "Settings > Appearance switches between the light Daylight look and dark mode"),
                 ("Animations", "Settings > Appearance turns the motion on or off (Windows' own setting is respected too)"),
-                ("3D market map", "Charts tab: every scanned stock by score, RSI and strength vs the Nifty - drag to turn it"),
+                ("3D market map", "Charts tab: every scanned stock by score, RS rating and strength vs the Nifty - drag to turn it"),
                 ("3D sectors", "Sector tab: buy, hold and sell stocks in each sector, after Analyze"),
                 ("Signal markers", "Scan Results: double up = strong buy, up = buy, bar = hold, down = sell, double down = strong sell"),
             ]),
@@ -3730,7 +3744,7 @@ class App:
                 wb = Workbook()
                 ws = wb.active
                 ws.title = "DR. NILESH SHAH ANALYSIS"
-                headers = ['Symbol', 'Price', 'Change%', 'RSI', 'Score', 'Recommendation', 'Stop Loss', 'Target 1', 'Target 2', 'Risk:Reward',
+                headers = ['Symbol', 'Price', 'Change%', 'RS Rating', 'Score', 'Recommendation', 'Stop Loss', 'Target 1', 'Target 2', 'Risk:Reward',
                            'Traded/day (Rs Cr)', 'Liquidity', 'vs Nifty 1M (%)', 'vs Nifty 3M (%)', 'vs Nifty 6M (%)',
                            'Score Chg', 'Previous Signal', 'Candle']
                 for i, h in enumerate(headers, 1):
@@ -3742,7 +3756,7 @@ class App:
                     ws.cell(row=row, column=1, value=r['symbol'])
                     ws.cell(row=row, column=2, value=round(r['price'], 2))
                     ws.cell(row=row, column=3, value=round(r['change'], 2))
-                    ws.cell(row=row, column=4, value=round(r['rsi'], 2))
+                    ws.cell(row=row, column=4, value=r.get('rs_rating'))
                     ws.cell(row=row, column=5, value=r['score'])
                     ws.cell(row=row, column=6, value=r['rec'])
                     ws.cell(row=row, column=7, value=t.get('sl', ''))
@@ -3846,7 +3860,7 @@ class App:
             
             elements.append(Paragraph("Detailed Scan Results", ParagraphStyle('H', parent=styles['Heading2'], fontSize=12, spaceAfter=10)))
             
-            table_data = [['Symbol', 'Price', 'Chg%', 'RSI', 'Score', 'Recommendation', 'SL', 'T1', 'T2', 'R:R']]
+            table_data = [['Symbol', 'Price', 'Chg%', 'RS', 'Score', 'Recommendation', 'SL', 'T1', 'T2', 'R:R']]
             
             for r in self.results:
                 t = r.get('targets', {})
@@ -3861,7 +3875,7 @@ class App:
                 
                 table_data.append([
                     r['symbol'] + ('*' if r.get('hourly') else ''), f"{r['price']:.2f}", f"{r['change']:+.2f}%",
-                    f"{r['rsi']:.1f}", f"{r['score']:.1f}",
+                    rs_rating_text(r), f"{r['score']:.1f}",
                     Paragraph(rec_text, styles['Normal']),
                     f"{t.get('sl', 'N/A')}", f"{t.get('t1', 'N/A')}", f"{t.get('t2', 'N/A')}",
                     f"1:{t.get('rr', 0)}"
@@ -4070,7 +4084,7 @@ class App:
             try:
                 nifty = market_data.load_history([NIFTY_SYMBOL], years=HISTORY_YEARS, exchange='INDEX').get(NIFTY_SYMBOL)
             except Exception as e:
-                logger.warning(f"Nifty 50 download failed (relative strength not shown): {e}")
+                logger.warning(f"Nifty 50 download failed (relative strength and RS rating not shown): {e}")
 
         # 2. Analyse each stock (CPU only - no network)
         for i, sym in enumerate(watchlist):
@@ -4086,7 +4100,7 @@ class App:
                 continue
             try:
                 days = self.analyzer.listing_days.get(sym)   # None unless it's a new listing
-                data = self.analyzer.analyze(df, days=days)
+                data = self.analyzer.analyze(df, days=days, index_df=nifty)
                 score = self.scorer.score(data)
                 change = ((data['price'] - data['prev']) / data['prev'] * 100) if data['prev'] > 0 else 0
                 targets = TargetCalc.calc(data, score['rec'])
@@ -4098,7 +4112,7 @@ class App:
 
                 result = {
                     'symbol': sym, 'price': data['price'], 'change': change,
-                    'rsi': data['rsi'], 'score': score['total'], 'rec': score['rec'],
+                    'rsi': data['rsi'], 'rs_rating': data.get('rs_rating'), 'score': score['total'], 'rec': score['rec'],
                     'breakdown': score['breakdown'], 'data': data, 'targets': targets,
                     'st_sig': data['supertrend']['sig'], 'st_dir': data['supertrend']['dir'],
                     'vwap_sig': data['vwap']['sig'],
@@ -4159,7 +4173,7 @@ class App:
         index = len(self.tree.get_children())
         self.tree.insert('', tk.END, text='', image=self.markers.get(r['rec'], self.markers['ERROR']), values=(
             r['symbol'], f"{r['price']:,.2f}", f"{r['change']:+.2f}%", rs_text,
-            f"{r['rsi']:.1f}", r.get('st_sig', ''), r.get('vwap_sig', ''),
+            rs_rating_text(r), r.get('st_sig', ''), r.get('vwap_sig', ''),
             f"{r['score']:.1f}", chg_text, r['rec'],
             f"{high52:,.2f}", f"{low52:,.2f}", f"{atr:.2f}", liq,
             '1 Hour' if r.get('hourly') else 'Daily'
@@ -4336,7 +4350,7 @@ class App:
                      anchor=tk.W).pack(fill=tk.X, padx=100, pady=(0, 10))
 
         # What makes up the score: bars that grow one after another
-        names = {'rsi': 'RSI', 'macd': 'MACD', 'ma': 'Moving Avg', 'boll': 'Bollinger',
+        names = {'rs': 'RS Rating', 'macd': 'MACD', 'ma': 'Moving Avg', 'boll': 'Bollinger',
                  'stoch': 'Stochastic', 'adx': 'ADX', 'vol': 'Volume', 'mom': 'Momentum',
                  'st': 'SuperTrend', 'vwap': 'VWAP'}
         card = tk.Frame(self.bd_frame, bg=T['card'], highlightbackground=T['line'], highlightthickness=1)
@@ -4837,15 +4851,15 @@ class App:
         top_picks = [r for r in sorted_results if r['rec'] in ['STRONG BUY', 'BUY']][:5]
         if top_picks:
             html += '<div class="section"><h2>Top Picks</h2><table>'
-            html += '<tr><th>Symbol</th><th>Price</th><th>Change%</th><th>RSI</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>R:R</th></tr>'
+            html += '<tr><th>Symbol</th><th>Price</th><th>Change%</th><th>RS</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>R:R</th></tr>'
             for r in top_picks:
                 t = r.get('targets', {})
-                html += f'<tr class="top-pick"><td><b>{r["symbol"]}{"*" if r.get("hourly") else ""}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{r["rsi"]:.0f}</td><td><b>{r["score"]:.0f}</b></td><td><span class="{r["rec"].lower().replace(" ", "-")}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>1:{t.get("rr", 0)}</td></tr>'
+                html += f'<tr class="top-pick"><td><b>{r["symbol"]}{"*" if r.get("hourly") else ""}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{rs_rating_text(r)}</td><td><b>{r["score"]:.0f}</b></td><td><span class="{r["rec"].lower().replace(" ", "-")}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>1:{t.get("rr", 0)}</td></tr>'
             html += '</table></div>'
         
         # All results table
         html += '<div class="section"><h2>All Watchlist Results</h2><table>'
-        html += '<tr><th>#</th><th>Symbol</th><th>Price</th><th>Change%</th><th>vs Nifty 3M</th><th>RSI</th><th>SuperTrend</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>Traded/day (Cr)</th></tr>'
+        html += '<tr><th>#</th><th>Symbol</th><th>Price</th><th>Change%</th><th>vs Nifty 3M</th><th>RS</th><th>SuperTrend</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>Traded/day (Cr)</th></tr>'
 
         for i, r in enumerate(sorted_results, 1):
             t = r.get('targets', {})
@@ -4853,7 +4867,7 @@ class App:
             row_class = 'top-pick' if r['rec'] in ['STRONG BUY', 'BUY'] else 'avoid' if r['rec'] in ['SELL', 'STRONG SELL'] else ''
             rs3 = (r.get('rs') or {}).get('3M')
             rs_cell = f"{rs3:+.1f}%" if rs3 is not None else "N/A"
-            html += f'<tr class="{row_class}"><td>{i}</td><td><b>{r["symbol"]}{"*" if r.get("hourly") else ""}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{rs_cell}</td><td>{r["rsi"]:.0f}</td><td>{r.get("st_sig", "")}</td><td>{r["score"]:.0f}</td><td><span class="{rec_class}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>{self._liquidity_text(r)}</td></tr>'
+            html += f'<tr class="{row_class}"><td>{i}</td><td><b>{r["symbol"]}{"*" if r.get("hourly") else ""}</b></td><td>{r["price"]:.2f}</td><td>{r["change"]:+.2f}%</td><td>{rs_cell}</td><td>{rs_rating_text(r)}</td><td>{r.get("st_sig", "")}</td><td>{r["score"]:.0f}</td><td><span class="{rec_class}">{r["rec"]}</span></td><td>{t.get("sl", "N/A")}</td><td>{t.get("t1", "N/A")}</td><td>{self._liquidity_text(r)}</td></tr>'
         
         html += '</table>'
         html += (f'<p style="font-size:11px;color:#666">LOW = average traded value below Rs {self.min_liquidity_cr:g} crore/day: '
@@ -4955,12 +4969,12 @@ class App:
         elements.append(Paragraph("Detailed Results", ParagraphStyle('H', parent=styles['Heading2'], fontSize=12)))
         elements.append(Spacer(1, 10))
         
-        data = [['#', 'Symbol', 'Price', 'Chg%', 'RSI', 'ST', 'Score', 'Signal', 'SL', 'T1', 'R:R']]
+        data = [['#', 'Symbol', 'Price', 'Chg%', 'RS', 'ST', 'Score', 'Signal', 'SL', 'T1', 'R:R']]
         for i, r in enumerate(sorted_results, 1):
             t_data = r.get('targets', {})
             data.append([
                 str(i), r['symbol'] + ('*' if r.get('hourly') else ''), f"{r['price']:.2f}", f"{r['change']:+.1f}%",
-                f"{r['rsi']:.0f}", r.get('st_sig', ''), f"{r['score']:.0f}", r['rec'],
+                rs_rating_text(r), r.get('st_sig', ''), f"{r['score']:.0f}", r['rec'],
                 f"{t_data.get('sl', 'N/A')}", f"{t_data.get('t1', 'N/A')}", f"1:{t_data.get('rr', 0)}"
             ])
         
@@ -5065,8 +5079,10 @@ def _self_test():
         data.update(market_data.load_history(['RELIANCE', 'CREATIVE'], years=2))
         return {s: len(df) for s, df in data.items()}
     check("price download (NSE + BSE fallback)", prices)
-    check("analysis + score", lambda: (lambda d: f"{Scorer.score(d)['total']} / patterns {d['patterns']['summary']['total_patterns']}")(
-        Analyzer().analyze(data['RELIANCE'])))
+    nifty = scoring.load_index(years=2)
+    check("analysis + score", lambda: (lambda d: f"{Scorer.score(d)['total']} / RS rating {d['rs_rating']} / "
+                                                 f"patterns {d['patterns']['summary']['total_patterns']}")(
+        Analyzer().analyze(data['RELIANCE'], index_df=nifty)))
 
     def targets():
         d = Analyzer().analyze(data['RELIANCE'])
@@ -5097,8 +5113,8 @@ def _self_test():
 
     def report_parts():   # the daily report must score a stock exactly as the scan does
         import daily_report
-        r = daily_report.StockAnalyzer().analyze('RELIANCE', 'NSE', data['RELIANCE'])
-        scan = Scorer.score(Analyzer().analyze(data['RELIANCE']))
+        r = daily_report.StockAnalyzer().analyze('RELIANCE', 'NSE', data['RELIANCE'], index_df=nifty)
+        scan = Scorer.score(Analyzer().analyze(data['RELIANCE'], index_df=nifty))
         if r is None or abs(r['score'] - scan['total']) > 0.05 or r['recommendation'] != scan['rec']:
             raise RuntimeError(f"report {r and r['score']} vs scan {scan['total']}")
         if isinstance(pdf_logo(LOGO_PATH), str):
@@ -5107,7 +5123,7 @@ def _self_test():
                 f"{len(daily_report.NewsFetcher().fetch_news(max_articles=5))} news headlines")
     check("daily report (same score as the scan)", report_parts)
     def full_backtest():   # the whole thing incl. statistics (SciPy-free since 1 Oct fix)
-        r = backtest.run_backtest(data, Scorer, dict(Scorer.WEIGHTS), 10)
+        r = backtest.run_backtest(data, Scorer, dict(Scorer.WEIGHTS), 10, index_df=nifty)
         if 'error' in r:
             raise RuntimeError(r['error'])
         return f"{r['n_samples']} stock-days, power {r['current']['ic']:+.3f}"

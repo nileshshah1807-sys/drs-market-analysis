@@ -90,16 +90,18 @@ frames = market_data.load_scan_history(['RELIANCE', 'TCS', 'INFY'], years=2)
 same = []
 for res in data['results']:
     df = market_data.slice_period(frames[res['symbol']], '2y')
-    d = scoring.indicators(df)
+    d = scoring.indicators(df, None, index.nifty())   # the Nifty 50 too, for the RS rating
     s = scoring.Scorer.score(d)
     tg = scoring.TargetCalc.calc(d, s['rec'])
     same.append(abs(s['total'] - res['score']) < 1e-9 and s['rec'] == res['rec'] and tg['sl'] == res['targets']['sl'] and tg['t2'] == res['targets']['t2'])
 check('scores, signals and targets match the desktop calculation', all(same), str(same))
 rel = data['results'][0]
 check('previous scan compared', rel.get('prev_score') == 12.0 and rel.get('prev_rec') == 'STRONG SELL' and rel.get('prev_date') == yesterday)
-check('result has everything the page shows', all(k in rel for k in ('price', 'change', 'rsi', 'breakdown', 'targets', 'st_sig', 'vwap_sig', 'high52',
+check('result has everything the page shows', all(k in rel for k in ('price', 'change', 'rsi', 'rs_rating', 'breakdown', 'targets', 'st_sig', 'vwap_sig', 'high52',
                                                                     'low52', 'liquidity_cr', 'rs', 'hourly', 'patterns')) and len(rel['breakdown']) == 10)
 check('vs Nifty 50 worked out', rel['rs'].get('3M') is not None, str(rel['rs']))
+check('RS rating worked out (1-99) and in the score', 1 <= (rel.get('rs_rating') or 0) <= 99 and 'rs' in rel['breakdown'],
+      str(rel.get('rs_rating')))
 r = c.post('/api/scan', json={'symbols': [f'ZZFAKE{i}' for i in range(15)]})
 d2 = r.get_json()
 check('at most 10 stocks per call', len(d2['results']) + len(d2['failed']) + len(d2['too_new']) == index.SCAN_BATCH)

@@ -27,7 +27,7 @@ Use `python -m pip`, not plain `pip`: if you have more than one Python installed
 | Scan Results | Score, signal (shown as a marker: double up = strong buy, up = buy, bar = hold, down = sell, double down = strong sell), **change since the last scan**, **performance vs the Nifty 50**, 52-week range, ATR and daily traded value (F5 to scan). Signal changes slide in at the bottom right after each scan, and the rows that changed glow briefly |
 | Score Breakdown / Stop-Loss & Targets / Pattern Analysis | Double-click a stock for details |
 | Corporate Actions | Live dividends, splits, bonus, buybacks from NSE and BSE |
-| Charts | Price with 20/50-day averages and volume (the lines draw themselves in), and the **3D market map**: every scanned stock by score, RSI and strength against the Nifty, turning slowly - click to stop, drag to turn |
+| Charts | Price with 20/50-day averages and volume (the lines draw themselves in), and the **3D market map**: every scanned stock by score, RS rating and strength against the Nifty, turning slowly - click to stop, drag to turn |
 | Sector | Sector averages and rotation, with a **3D chart** of buy, hold and sell stocks per sector |
 | Backtest | Checks whether the score predicted returns on your stocks' history; suggests weights and re-checks applied weights every 30 days |
 | Settings | **Appearance (Light or Dark, animations on or off)**, email, scheduled report, liquidity threshold, scoring weights |
@@ -49,7 +49,7 @@ the Backtest tab shows which weights are in use; Settings > Reset Defaults resto
 
 | Indicator | Weight |
 |-----------|--------|
-| RSI (14) | 12% |
+| RS rating (vs the Nifty 50) | 12% |
 | MACD | 12% |
 | Moving averages (SMA 20/50/200, EMA 12/26) | 15% |
 | SuperTrend | 11% |
@@ -67,6 +67,14 @@ the Backtest tab shows which weights are in use; Settings > Reset Defaults resto
 | 45-59 | HOLD |
 | 30-44 | SELL |
 | 0-29 | STRONG SELL |
+
+**RS rating** (1-99, replaces RSI in the score): the stock's price performance over the last 3, 6, 9 and
+12 months - the last 3 months counting double - compared with the Nifty 50's, on a 1-99 scale in the style of
+IBD's Relative Strength rating. **90 and above is the best** (scores 90 of 100); a stock that has done exactly
+as well as the Nifty rates 50. The scale is set by `RS_RATING_TABLE` in `scoring.py` (performance vs the
+Nifty -> rating): a scan can't rank a stock against every listed stock the way IBD does, so the table stands
+in for that. A stock with under 3 months of history, or a scan without Nifty data, scores RS as neutral (50).
+Weights saved before this change are kept: the old RSI weight becomes the RS weight.
 
 Stocks trading less than Rs 1 crore a day (adjustable) are marked **LOW** liquidity: their stop-loss and targets are less reliable.
 

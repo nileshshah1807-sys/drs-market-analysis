@@ -451,17 +451,32 @@ def _delete_password(email: str):
 SCAN_PERIOD = '2y'
 
 
+def rs_text(s):
+    """A stock's RS rating (1-99) for the report tables, 'N/A' when there isn't one."""
+    v = s.get('rs_rating')
+    return str(int(v)) if v is not None else "N/A"
+
+
 class StockAnalyzer:
     """Analyze stocks for daily report - with the same scoring (and weights) as the app's scan."""
 
     def __init__(self):
         self.cache = {}
+        self._index = None       # Nifty 50 history, for the RS rating (downloaded once, when first needed)
         if DATA_OK:
             scoring.load_weights()   # the scheduled report runs without the app: pick up its saved weights
-    
-    def analyze(self, symbol, exchange='NSE', df=None, days=None):
+
+    def index(self):
+        if self._index is None:
+            self._index = scoring.load_index(years=2)
+            if self._index is None:
+                self._index = False      # not available - don't try again for every stock
+        return self._index if self._index is not False else None
+
+    def analyze(self, symbol, exchange='NSE', df=None, days=None, index_df=None):
         """Analyze a single stock. Fetches its history unless df is given.
-        `days`: a new listing's daily candles, when df holds its 1-hour candles."""
+        `days`: a new listing's daily candles, when df holds its 1-hour candles.
+        `index_df`: Nifty 50 history for the RS rating (downloaded if not given)."""
         if not DATA_OK:
             return None
 
@@ -478,7 +493,7 @@ class StockAnalyzer:
                 return None
             
             # The same indicators, score and stop-loss/targets as the app's scan (scoring.py)
-            data = scoring.indicators(df, days)
+            data = scoring.indicators(df, days, index_df if index_df is not None else self.index())
             result = scoring.Scorer.score(data)
             rec = result['rec']
             targets = scoring.TargetCalc.calc(data, rec)
@@ -504,6 +519,7 @@ class StockAnalyzer:
                 'avg_volume': int(avg_volume) if avg_volume == avg_volume else 0,
                 'volume_ratio': round(volume[-1] / avg_volume, 2) if avg_volume > 0 else 1.0,
                 'rsi': round(data['rsi'], 1),
+                'rs_rating': data.get('rs_rating'),
                 'macd_hist': round(hist, 4) if hist is not None else 0,
                 'macd_signal': 'Neutral' if hist is None else 'Bullish' if hist > 0 else 'Bearish',
                 'sma20': r2(ma['sma20']),
@@ -910,12 +926,12 @@ class DailyReportGenerator:
                 elements.append(Paragraph(f"YOUR WATCHLIST ({wl.get('total', 0)} Stocks)", section_style))
                 elements.append(Paragraph(f"Avg Score: {wl.get('avg_score', 0)} | Buy: {wl.get('strong_buy', 0) + wl.get('buy', 0)} | Hold: {wl.get('hold', 0)} | Sell: {wl.get('sell', 0) + wl.get('strong_sell', 0)}", subtitle_style))
 
-                data = [['Symbol', 'Price', 'Chg%', 'RSI', 'ST', 'Score', 'Signal', 'SL', 'T1', 'Rs Cr/day']]
+                data = [['Symbol', 'Price', 'Chg%', 'RS', 'ST', 'Score', 'Signal', 'SL', 'T1', 'Rs Cr/day']]
                 for s in wl.get('stocks', []):
                     liq = s.get('avg_value_cr', 0)
                     data.append([
                         s['symbol'] + ('*' if s.get('hourly') else ''), f"{s['price']:.2f}", f"{s['change_pct']:+.1f}%",
-                        f"{s['rsi']:.0f}", s['supertrend'], f"{s['score']:.0f}",
+                        rs_text(s), s['supertrend'], f"{s['score']:.0f}",
                         s['recommendation'], f"{s['stop_loss']:.2f}", f"{s['target1']:.2f}",
                         f"{liq:.2f}" + (" LOW" if liq < MIN_LIQUIDITY_CR else "")
                     ])
@@ -940,13 +956,13 @@ class DailyReportGenerator:
             if top_picks:
                 elements.append(Paragraph("TOP 15 STOCK PICKS (All Markets)", section_style))
                 
-                picks_data = [['#', 'Symbol', 'Exchange', 'Price', 'Change%', 'RSI', 'Score', 'Signal']]
+                picks_data = [['#', 'Symbol', 'Exchange', 'Price', 'Change%', 'RS', 'Score', 'Signal']]
                 for i, stock in enumerate(top_picks[:15], 1):
                     currency = '$' if stock.get('exchange') in ['NYSE', 'NASDAQ'] else ''
                     picks_data.append([
                         str(i), stock['symbol'], stock.get('exchange', ''),
                         f"{currency}{stock['price']:.2f}", f"{stock['change_pct']:+.2f}%",
-                        f"{stock['rsi']:.0f}", f"{stock['score']:.0f}", stock['recommendation']
+                        rs_text(stock), f"{stock['score']:.0f}", stock['recommendation']
                     ])
                 
                 t = Table(picks_data, colWidths=[25, 65, 45, 60, 50, 35, 35, 80])
@@ -969,11 +985,11 @@ class DailyReportGenerator:
                 elements.append(Paragraph(f"NIFTY 50 ANALYSIS ({nifty.get('total', 0)} Stocks)", section_style))
                 elements.append(Paragraph(f"Avg Score: {nifty.get('avg_score', 0)} | Buy: {nifty.get('strong_buy', 0) + nifty.get('buy', 0)} | Hold: {nifty.get('hold', 0)} | Sell: {nifty.get('sell', 0) + nifty.get('strong_sell', 0)}", subtitle_style))
                 
-                data = [['Symbol', 'Price', 'Chg%', 'RSI', 'ST', 'Score', 'Signal', 'SL', 'T1']]
+                data = [['Symbol', 'Price', 'Chg%', 'RS', 'ST', 'Score', 'Signal', 'SL', 'T1']]
                 for s in nifty.get('stocks', []):
                     data.append([
                         s['symbol'], f"{s['price']:.2f}", f"{s['change_pct']:+.1f}%",
-                        f"{s['rsi']:.0f}", s['supertrend'], f"{s['score']:.0f}",
+                        rs_text(s), s['supertrend'], f"{s['score']:.0f}",
                         s['recommendation'], f"{s['stop_loss']:.0f}", f"{s['target1']:.0f}"
                     ])
                 
@@ -995,11 +1011,11 @@ class DailyReportGenerator:
             if sensex:
                 elements.append(Paragraph(f"SENSEX 30 ANALYSIS ({sensex.get('total', 0)} Stocks)", section_style))
                 
-                data = [['Symbol', 'Price', 'Chg%', 'RSI', 'ST', 'Score', 'Signal', 'SL', 'T1']]
+                data = [['Symbol', 'Price', 'Chg%', 'RS', 'ST', 'Score', 'Signal', 'SL', 'T1']]
                 for s in sensex.get('stocks', []):
                     data.append([
                         s['symbol'], f"{s['price']:.2f}", f"{s['change_pct']:+.1f}%",
-                        f"{s['rsi']:.0f}", s['supertrend'], f"{s['score']:.0f}",
+                        rs_text(s), s['supertrend'], f"{s['score']:.0f}",
                         s['recommendation'], f"{s['stop_loss']:.0f}", f"{s['target1']:.0f}"
                     ])
                 
@@ -1022,11 +1038,11 @@ class DailyReportGenerator:
                 elements.append(Paragraph(f"US MARKET - S&P 500 TOP 50 ({sp500.get('total', 0)} Stocks)", section_style))
                 elements.append(Paragraph(f"Avg Score: {sp500.get('avg_score', 0)} | Buy: {sp500.get('strong_buy', 0) + sp500.get('buy', 0)} | Hold: {sp500.get('hold', 0)} | Sell: {sp500.get('sell', 0) + sp500.get('strong_sell', 0)}", subtitle_style))
                 
-                data = [['Symbol', 'Price', 'Chg%', 'RSI', 'Score', 'Signal', 'SL', 'T1', 'T2']]
+                data = [['Symbol', 'Price', 'Chg%', 'RS', 'Score', 'Signal', 'SL', 'T1', 'T2']]
                 for s in sp500.get('stocks', []):
                     data.append([
                         s['symbol'], f"${s['price']:.2f}", f"{s['change_pct']:+.1f}%",
-                        f"{s['rsi']:.0f}", f"{s['score']:.0f}", s['recommendation'],
+                        rs_text(s), f"{s['score']:.0f}", s['recommendation'],
                         f"${s['stop_loss']:.2f}", f"${s['target1']:.2f}", f"${s['target2']:.2f}"
                     ])
                 
@@ -1127,10 +1143,10 @@ class DailyReportGenerator:
         # Watchlist
         wl = report.get('sections', {}).get('watchlist', {})
         if wl.get('stocks'):
-            html += f'<div class="section"><h2>Your Watchlist ({wl["total"]} stocks)</h2><table><tr><th>#</th><th>Symbol</th><th>Price</th><th>Chg%</th><th>RSI</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>Rs Cr/day</th></tr>'
+            html += f'<div class="section"><h2>Your Watchlist ({wl["total"]} stocks)</h2><table><tr><th>#</th><th>Symbol</th><th>Price</th><th>Chg%</th><th>RS</th><th>Score</th><th>Signal</th><th>Stop Loss</th><th>Target 1</th><th>Rs Cr/day</th></tr>'
             for i, s in enumerate(wl['stocks'], 1):
                 rec_class = self._rec_class(s['recommendation'])
-                html += f'<tr><td>{i}</td><td><b>{s["symbol"]}{"*" if s.get("hourly") else ""}</b></td><td>{s["price"]:.2f}</td><td>{s["change_pct"]:+.2f}%</td><td>{s["rsi"]:.0f}</td><td>{s["score"]:.0f}</td><td class="{rec_class}">{s["recommendation"]}</td><td>{s["stop_loss"]:.2f}</td><td>{s["target1"]:.2f}</td><td>{s.get("avg_value_cr", 0):.2f}{" LOW" if s.get("avg_value_cr", 0) < MIN_LIQUIDITY_CR else ""}</td></tr>'
+                html += f'<tr><td>{i}</td><td><b>{s["symbol"]}{"*" if s.get("hourly") else ""}</b></td><td>{s["price"]:.2f}</td><td>{s["change_pct"]:+.2f}%</td><td>{rs_text(s)}</td><td>{s["score"]:.0f}</td><td class="{rec_class}">{s["recommendation"]}</td><td>{s["stop_loss"]:.2f}</td><td>{s["target1"]:.2f}</td><td>{s.get("avg_value_cr", 0):.2f}{" LOW" if s.get("avg_value_cr", 0) < MIN_LIQUIDITY_CR else ""}</td></tr>'
             html += (f'</table><p style="font-size:11px;color:#666">LOW = average traded value below Rs {MIN_LIQUIDITY_CR:g} crore/day: '
                      'stop-loss and targets are less reliable for these stocks.</p>')
             if any(s.get('hourly') for s in wl['stocks']):

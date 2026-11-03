@@ -406,7 +406,7 @@ def nifty():
 
 def analyse(symbol, df, days, index_df):
     """One stock's result - the same steps as the desktop app's scan."""
-    data = scoring.indicators(df, days)
+    data = scoring.indicators(df, days, index_df)
     try:
         patterns = _detector.detect_all_patterns(df)
     except Exception as e:
@@ -419,7 +419,7 @@ def analyse(symbol, df, days, index_df):
     high52 = float(last_year['High'].max()) if len(last_year) else data['price']
     low52 = float(last_year['Low'].min()) if len(last_year) else data['price']
     return jsonable({
-        'symbol': symbol, 'price': data['price'], 'change': change, 'rsi': data['rsi'],
+        'symbol': symbol, 'price': data['price'], 'change': change, 'rsi': data['rsi'], 'rs_rating': data.get('rs_rating'),
         'score': score['total'], 'rec': score['rec'], 'breakdown': score['breakdown'], 'targets': targets,
         'st_sig': data['supertrend']['sig'], 'vwap_sig': data['vwap']['sig'],
         'high52': high52, 'low52': low52, 'atr': data['atr'], 'liquidity_cr': data['liquidity_cr'],
