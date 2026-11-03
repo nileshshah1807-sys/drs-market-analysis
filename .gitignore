@@ -8,6 +8,7 @@ email_config.json
 # Your personal data - changes every time you use the app
 watchlist.json
 my_watchlist.json
+my_watchlist*.json
 watchlist_groups.json
 schedule_config.json
 weights_config.json
