@@ -12,6 +12,7 @@ const SYMBOL_RE = /^[A-Z0-9][A-Z0-9&_.-]{0,19}$/;
 const BATCH = 8;          // stocks per server call
 const PARALLEL = 3;       // server calls at once
 const PLOTLY_URL = 'https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js';
+const MARKS = { 'STRONG BUY': 'double up marker', BUY: 'up marker', HOLD: 'bar', SELL: 'down marker', 'STRONG SELL': 'double down marker' };
 const NAMES = { rsi: 'RSI', macd: 'MACD', ma: 'Moving Avg', boll: 'Bollinger', stoch: 'Stochastic', adx: 'ADX',
                 vol: 'Volume', mom: 'Momentum', st: 'SuperTrend', vwap: 'VWAP' };
 
@@ -19,6 +20,7 @@ const state = {
   user: null, watchlist: [], results: [], failed: [], tooNew: [], when: null, scanning: false,
   sort: { key: 'symbol', asc: true }, selected: null, flash: new Set(), tab: 'results',
   chart: null, spin: null, settings: loadSettings(),
+  cutoffs: [['STRONG BUY', 62, 100], ['BUY', 56, 61], ['HOLD', 44, 55], ['SELL', 37, 43], ['STRONG SELL', 0, 36]],
 };
 
 // ============================================================ settings, look, motion
@@ -170,6 +172,8 @@ async function boot() {
   try { me = await api('/api/me', { allow401: true }); }
   catch (err) { showLogin(err.status === 401 ? '' : err.message); return; }
   state.user = me.name;
+  state.cutoffs = me.cutoffs || state.cutoffs;
+  showScoring(me);
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
   $('#who').textContent = me.name;
@@ -183,6 +187,28 @@ async function boot() {
   loadCompanies();
   selectTab(state.watchlist.length ? 'results' : 'watchlist');
   if (!state.watchlist.length) toast('Welcome', "Add your stocks: type the first letters of a company's name above and pick it from the list.", 'info', 8000);
+}
+
+// ============================================================ how the score is set up, and the weekly check
+
+const cutoffText = () => state.cutoffs.map(([rec, lo, hi]) => `${lo}-${hi} ${SIG_LABEL[rec].toLowerCase()}`).join(', ');
+
+function showScoring(me) {
+  $('#help-signals').innerHTML = state.cutoffs.map(([rec, lo, hi]) => `<dt>${lo} to ${hi}</dt><dd>${esc(SIG_LABEL[rec])} (${MARKS[rec]})</dd>`).join('');
+  const c = me.check, share = me.oversold;
+  let text = `${share}% of the score comes from four indicators that all measure "oversold" (RSI, Bollinger, Stochastic, Momentum). `
+    + 'That worked well on recent history, but it can stop working when the market trends strongly - so every Monday the '
+    + 'server checks whether higher scores are still followed by better returns, on the most-watched stocks.';
+  let warn = '';
+  if (!c) text += ' The first check runs next Monday.';
+  else if (c.verdict === 'ok') text += ` Last check (${c.date}): still working - over ${c.since} to ${c.until}, higher scores were followed by better 10-day returns (power ${signed(c.power, 3)}, ${c.stocks} stocks).`;
+  else {
+    text += ` Last check (${c.date}): NOT working lately - over ${c.since} to ${c.until}, higher scores were not followed by better returns (power ${signed(c.power, 3)}).`;
+    warn = `Scoring check (${c.date}): lately the scores have not predicted returns. Treat the signals with extra caution; the weights may need re-tuning (desktop app > Backtest).`;
+  }
+  $('#score-check').textContent = text;
+  $('#check-warn').textContent = warn;
+  $('#check-warn').classList.toggle('hidden', !warn);
 }
 
 // ============================================================ market light (NSE 09:15-15:30, Mon-Fri, Indian time)
@@ -759,7 +785,7 @@ async function loadSpark(symbol) {
   const w = box.clientWidth || 400, h = 150, l = 30, r = 10, top = 10, bot = 24;
   const x = (i) => l + (i / (pts.length - 1)) * (w - l - r);
   const y = (v) => top + (1 - v / 100) * (h - top - bot);
-  const ref = [[75, '--sb'], [60, '--buy'], [45, '--hold'], [30, '--sell']]
+  const ref = state.cutoffs.slice(0, 4).map(([, lo], i) => [lo, ['--sb', '--buy', '--hold', '--sell'][i]])
     .map(([v, c]) => `<line x1="${l}" x2="${w - r}" y1="${y(v)}" y2="${y(v)}" style="stroke:var(${c})" stroke-dasharray="4 4" stroke-width="1"></line><text x="${l - 6}" y="${y(v) + 4}" text-anchor="end" font-size="10" style="fill:var(--fg3)">${v}</text>`).join('');
   const line = pts.map((p, i) => `${x(i)},${y(p.score)}`).join(' ');
   box.innerHTML = `<svg class="spark" viewBox="0 0 ${w} ${h}" role="img" aria-label="Score history">${ref}
@@ -767,7 +793,7 @@ async function loadSpark(symbol) {
     ${pts.map((p, i) => `<circle cx="${x(i)}" cy="${y(p.score)}" r="3.5" style="fill:var(--series0)"><title>${esc(p.date)}: ${p.score} (${esc(p.rec)})</title></circle>`).join('')}
     <text x="${l}" y="${h - 6}" font-size="10" style="fill:var(--fg3)">${esc(pts[0].date)}</text>
     <text x="${w - r}" y="${h - 6}" font-size="10" text-anchor="end" style="fill:var(--fg3)">${esc(pts[pts.length - 1].date)}</text></svg>
-    <p class="small-note">${pts.length} scan days. Dashed lines: 75 strong buy, 60 buy, 45 hold, 30 sell.</p>`;
+    <p class="small-note">${pts.length} scan days. Dashed lines: ${state.cutoffs.slice(0, 4).map(([rec, lo]) => `${lo} ${SIG_LABEL[rec].toLowerCase()}`).join(', ')}.</p>`;
 }
 
 // ============================================================ charts (Plotly, loaded only when needed)
@@ -1054,7 +1080,7 @@ async function buildScanPdf() {
     pdfPara(doc, 'Not scored: ' + [state.failed.length ? `${state.failed.join(', ')} (no price data)` : '', state.tooNew.length ? `${state.tooNew.join(', ')} (listed under 3 trading days ago)` : '']
       .filter(Boolean).join(';  '), { size: 8.5, color: PDF.fg3 });
   }
-  pdfPara(doc, 'Score: 75-100 strong buy, 60-74 buy, 45-59 hold, 30-44 sell, 0-29 strong sell. The stop-loss sits just beyond the nearest support '
+  pdfPara(doc, `Score: ${cutoffText()}. The stop-loss sits just beyond the nearest support `
     + '(resistance, for a sell) and the targets at the next resistance levels (supports, for a sell); where a stock has no level within reach, a multiple '
     + 'of its ATR is used. Risk : reward compares the distance to target 2 (target 1 for a hold) with the distance to the stop-loss.', { size: 8, color: PDF.fg3 });
   return pdfFinish(doc);

@@ -378,10 +378,33 @@ def s_backtest():
         app.recheck_weights()
         yield wait(lambda: not getattr(app, '_recheck_running', False), 300)
         meta = app._weights_meta()
-        check('re-check weights', (meta.get('last_result') or {}).get('verdict') in ('ok', 'worse')
+        check('re-check weights', (meta.get('last_result') or {}).get('verdict') in ('ok', 'worse', 'stopped')
               and 'Re-check' in app.bt_weights_lbl.cget('text'), app.bt_weights_lbl.cget('text')[:120])
         app.reset_weights()
         check('reset weights', m.Scorer.WEIGHTS == m.Scorer.DEFAULT_WEIGHTS and app._weights_meta().get('source') == 'default')
+        expected_warnings.append(1)            # a 'stopped' verdict warns - allowed, the market decides
+        app.recheck_weights()                  # the defaults are checked too now
+        yield wait(lambda: not getattr(app, '_recheck_running', False), 300)
+        meta, label = app._weights_meta(), app.bt_weights_lbl.cget('text')
+        verdict = (meta.get('last_result') or {}).get('verdict')
+        if verdict != 'stopped' and expected_warnings:
+            expected_warnings.pop()
+        check('the check covers the default weights too', verdict in ('ok', 'stopped') and 'Check ' in label
+              and "70% of the score comes from 'oversold' indicators" in label, f"{verdict}: {label[:140]}")
+
+
+def s_scoring_rules():
+    import scoring as S
+    check('signal cut-offs: one set, used by scan and backtest', S.CUTOFFS == (('STRONG BUY', 62), ('BUY', 56), ('HOLD', 44), ('SELL', 37))
+          and [S.rec_for(x) for x in (62, 61.9, 56, 55.9, 44, 43.9, 37, 36.9)] == ['STRONG BUY', 'BUY', 'BUY', 'HOLD', 'HOLD', 'SELL', 'SELL', 'STRONG SELL']
+          and m.backtest.rec_from_total is S.rec_for and S.cutoff_ranges()[0] == ('STRONG BUY', 62, 100) and S.cutoff_ranges()[-1] == ('STRONG SELL', 0, 36))
+    check('ADX follows the trend direction (a steep fall no longer scores high)',
+          (S.Scorer._adx(45, 30, 10), S.Scorer._adx(45, 10, 30), S.Scorer._adx(15, 30, 10), S.Scorer._adx(45, None, None)) == (80, 20, 50, 50))
+    r = app.results[0] if app.results else None
+    check('scan results carry the ADX direction', r is not None and r['data'].get('adx_pos') is not None and r['data'].get('adx_neg') is not None)
+    check('Settings shows how much of the score is "oversold"', app.weights_share_lbl.cget('text').startswith('70% of the score'),
+          app.weights_share_lbl.cget('text')[:80])
+    yield None
 
 
 def s_settings():
@@ -969,7 +992,7 @@ def s_appearance():
 
 STEPS = [('startup', s_startup), ('one copy at a time', s_single_instance), ('watchlist', s_watchlist),
          ('company search', s_company_search),
-         ('import/save lists', s_import_save_lists), ('scan', s_scan), ('score history', s_history_compare),
+         ('import/save lists', s_import_save_lists), ('scan', s_scan), ('scoring rules', s_scoring_rules), ('score history', s_history_compare),
          ('results table', s_results_table), ('details', s_details_every_stock), ('exports', s_exports),
          ('sector', s_sector), ('charts', s_charts), ('corporate', s_corporate), ('backtest', s_backtest),
          ('settings', s_settings), ('reports + email', s_reports), ('auto report', s_auto_report), ('misc', s_misc),

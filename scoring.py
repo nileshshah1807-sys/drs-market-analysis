@@ -134,9 +134,11 @@ def indicators(df, days=None):
         stoch = {'k': safe_float(s.stoch().iloc[-1], 50), 'd': safe_float(s.stoch_signal().iloc[-1], 50)}
     except: stoch = {'k': 50, 'd': 50}
 
-    # ADX
-    try: adx = safe_float(ta.trend.ADXIndicator(df['High'], df['Low'], df['Close']).adx().iloc[-1], 25)
-    except: adx = 25.0
+    # ADX: how strong the trend is; +DI above -DI means the trend is up
+    try:
+        a = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close'])
+        adx, adx_pos, adx_neg = safe_float(a.adx().iloc[-1], 25), safe_float(a.adx_pos().iloc[-1], None), safe_float(a.adx_neg().iloc[-1], None)
+    except: adx, adx_pos, adx_neg = 25.0, None, None
 
     # OBV
     try:
@@ -186,7 +188,7 @@ def indicators(df, days=None):
 
     return {
         'price': price, 'prev': prev, 'liquidity_cr': liquidity_cr, 'rsi': rsi, 'macd': macd, 'ma': ma,
-        'boll': boll, 'stoch': stoch, 'adx': adx, 'obv_trend': obv_trend,
+        'boll': boll, 'stoch': stoch, 'adx': adx, 'adx_pos': adx_pos, 'adx_neg': adx_neg, 'obv_trend': obv_trend,
         'wr': wr, 'cci': cci, 'atr': atr,
         'supertrend': {'val': st_val, 'sig': st_sig, 'dir': st_dir},
         'vwap': {'val': vwap, 'sig': vwap_sig},
@@ -235,6 +237,35 @@ def support_resistance(df, atr):
 # SCORER
 # ============================================================
 
+# The score a stock needs for each signal, checked from the top down; below the last one: STRONG SELL.
+# Chosen with the backtest (5 years of the user's watchlist, set on the older 60% of dates and checked
+# on the newer 40%): the only set tried where strong buy > buy > hold > sell > strong sell on both
+# 10- and 20-day holds. The old 75/60/45/30 gave no strong buys at all with the current weights.
+CUTOFFS = (('STRONG BUY', 62), ('BUY', 56), ('HOLD', 44), ('SELL', 37))
+
+
+def rec_for(total):
+    """The signal for a 0-100 score."""
+    return next((rec for rec, cut in CUTOFFS if total >= cut), 'STRONG SELL')
+
+
+# Four indicators that all measure the same thing - a price stretched low (oversold) - so their
+# weights add up to how much the score leans on that one idea
+OVERSOLD = ('rsi', 'boll', 'stoch', 'mom')
+
+
+def oversold_share(weights):
+    """Percent of the score that comes from the "oversold" indicators."""
+    return sum(weights.get(k, 0) for k in OVERSOLD)
+
+
+def cutoff_ranges():
+    """[(signal, lowest score, highest score)] for showing the cut-offs: STRONG BUY 62-100 ... STRONG SELL 0-36."""
+    lows = [c for _, c in CUTOFFS] + [0]
+    highs = [100] + [c - 1 for _, c in CUTOFFS]
+    return list(zip([r for r, _ in CUTOFFS] + ['STRONG SELL'], lows, highs))
+
+
 class Scorer:
     WEIGHTS = {'rsi': 20, 'macd': 5, 'ma': 5, 'boll': 20, 'stoch': 15, 'adx': 5, 'vol': 5, 'mom': 15, 'st': 5, 'vwap': 5}
     DEFAULT_WEIGHTS = dict(WEIGHTS)
@@ -247,15 +278,14 @@ class Scorer:
             'ma': cls._ma(data['price'], data['ma']),
             'boll': cls._boll(data['price'], data['boll']),
             'stoch': cls._stoch(data['stoch']),
-            'adx': cls._adx(data['adx']),
+            'adx': cls._adx(data['adx'], data.get('adx_pos'), data.get('adx_neg')),
             'vol': cls._vol(data['obv_trend']),
             'mom': cls._mom(data['wr'], data['cci']),
             'st': cls._st(data['supertrend']),
             'vwap': cls._vwap(data['vwap'])
         }
         total = sum(scores[k] * cls.WEIGHTS[k] / 100 for k in scores)
-        rec = 'STRONG BUY' if total >= 75 else 'BUY' if total >= 60 else 'HOLD' if total >= 45 else 'SELL' if total >= 30 else 'STRONG SELL'
-        return {'total': round(total, 1), 'breakdown': scores, 'rec': rec}
+        return {'total': round(total, 1), 'breakdown': scores, 'rec': rec_for(total)}
 
     @staticmethod
     def _rsi(v):
@@ -295,9 +325,14 @@ class Scorer:
         return max(0, min(100, sc + (10 if k > d else -10)))
 
     @staticmethod
-    def _adx(v):
+    def _adx(v, di_pos=None, di_neg=None):
+        # A strong trend scores high only when it is UP (+DI above -DI); a strong fall scores low.
+        # (It used to score any strong trend high - a steep fall included.) No direction known: neutral.
+        if di_pos is None or di_neg is None or di_pos != di_pos or di_neg != di_neg:
+            return 50
         v = safe_float(v, 25)
-        return 80 if v > 50 else 70 if v > 40 else 60 if v > 30 else 50 if v > 20 else 30
+        strength = 0 if v <= 20 else 10 if v <= 30 else 20 if v <= 40 else 30
+        return 50 + strength if di_pos >= di_neg else 50 - strength
 
     @staticmethod
     def _vol(v):

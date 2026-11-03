@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import ta
 
-from scoring import supertrend
+from scoring import rec_for, supertrend
 
 WARMUP = 200                # rows needed before the first score (so the 200-day SMA exists, as in live scans)
 HORIZONS = (5, 10, 20)       # forward return horizons, in trading days
@@ -38,10 +38,7 @@ COMPONENT_NAMES = {
 REC_ORDER = ['STRONG BUY', 'BUY', 'HOLD', 'SELL', 'STRONG SELL']
 
 
-def rec_from_total(total: float) -> str:
-    """Same thresholds as Scorer.score()."""
-    return ('STRONG BUY' if total >= 75 else 'BUY' if total >= 60 else 'HOLD' if total >= 45
-            else 'SELL' if total >= 30 else 'STRONG SELL')
+rec_from_total = rec_for      # the scan's own cut-offs (scoring.CUTOFFS)
 
 
 # ------------------------------------------------------------
@@ -72,7 +69,9 @@ def indicator_frame(df: pd.DataFrame) -> pd.DataFrame:
     s = ta.momentum.StochasticOscillator(high, low, close)
     out['stoch_k'] = s.stoch().fillna(50)
     out['stoch_d'] = s.stoch_signal().fillna(50)
-    out['adx'] = ta.trend.ADXIndicator(high, low, close).adx().fillna(25)
+    a = ta.trend.ADXIndicator(high, low, close)
+    out['adx'] = a.adx().fillna(25)
+    out['adx_pos'], out['adx_neg'] = a.adx_pos(), a.adx_neg()       # trend direction (NaN: unknown)
     obv = ta.volume.OnBalanceVolumeIndicator(close, vol).on_balance_volume()
     obv_prev = obv.shift(4)   # live scan compares with obv.iloc[-5]
     trend = (obv - obv_prev) / obv_prev.abs() * 100
@@ -104,7 +103,7 @@ def component_scores(ind: pd.DataFrame, scorer) -> pd.DataFrame:
                            'ema12': opt(r.ema12), 'ema26': opt(r.ema26)}),
             scorer._boll(p, {'upper': r.bb_upper, 'lower': r.bb_lower}),
             scorer._stoch({'k': r.stoch_k, 'd': r.stoch_d}),
-            scorer._adx(r.adx),
+            scorer._adx(r.adx, opt(r.adx_pos), opt(r.adx_neg)),
             scorer._vol(r.obv_trend),
             scorer._mom(r.wr, r.cci),
             scorer._st(st),

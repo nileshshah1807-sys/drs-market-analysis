@@ -2425,6 +2425,9 @@ class App:
         weight_btns.pack(fill=tk.X, padx=10, pady=10)
         self.btn(weight_btns, "Apply Weights", T['accent'], self.apply_weights).pack(side=tk.LEFT, padx=(0, 5))
         self.btn(weight_btns, "Reset Defaults", T['bg3'], self.reset_weights).pack(side=tk.LEFT, padx=5)
+        self.weights_share_lbl = tk.Label(weights_frame, text="", bg=T['bg'], font=(ui.FONT, 9), justify=tk.LEFT, anchor=tk.W)
+        self.weights_share_lbl.pack(fill=tk.X, padx=15, pady=(0, 8))
+        self._update_weights_status()
         tk.Label(weight_btns, text="Tip: the Backtest tab can suggest weights based on your stocks' history",
                  bg=T['bg'], fg=T['fg3'], font=(ui.FONT, 9)).pack(side=tk.LEFT, padx=10)
         
@@ -2872,6 +2875,13 @@ class App:
         self._save_app_setting(appearance=mode)
 
         def swap():
+            try:
+                rebuild()
+            except tk.TclError as e:     # the animation helper ignores TclErrors - don't let a failed rebuild pass silently
+                logger.exception("Light/dark switch failed")
+                raise RuntimeError(f"Light/dark switch failed: {e}") from e
+
+        def rebuild():
             state = self._capture_ui_state()
             THEME.clear()
             THEME.update(ui.palette(mode))
@@ -3008,19 +3018,36 @@ class App:
                 pass
         elif source == 'manual':
             when = f" on {meta['applied']}" if meta.get('applied') else ""
-            text = f"Scoring weights: set manually{when}. 'Re-check Weights' compares them with the defaults on recent history."
+            text = f"Scoring weights: set manually{when}. 'Re-check Weights' tests them on recent history."
         else:
             text = "Scoring weights: DEFAULT. Run a backtest, then 'Apply Suggested Weights' to tune them to your stocks."
+        last = meta.get('last_result') or {}
+        if source != 'backtest' and last.get('verdict') in ('ok', 'stopped'):
+            if last['verdict'] == 'stopped':
+                text += (f"  Check {meta.get('last_check')}: over {last.get('since')} to {last.get('until')} the scores did NOT "
+                         f"predict returns (power {last.get('current_ic', 0):+.3f}) - run the backtest and re-tune.")
+                color = T['warning']
+            else:
+                text += (f"  Check {meta.get('last_check')}: still predicting returns "
+                         f"(power {last.get('current_ic', 0):+.3f} over {last.get('since')} to {last.get('until')}).")
+                color = T['success']
+        elif source == 'backtest' and last.get('verdict') == 'stopped':
+            text += f"  Check {meta.get('last_check')}: the scores did NOT predict returns lately - run the backtest again."
+            color = T['warning']
+        text += f"  {scoring.oversold_share(Scorer.WEIGHTS)}% of the score comes from 'oversold' indicators."
         self.bt_weights_lbl.configure(text=text, fg=color)
+        share_lbl = getattr(self, 'weights_share_lbl', None)
+        if share_lbl is not None and share_lbl.winfo_exists():      # not yet rebuilt after a light/dark switch
+            share = scoring.oversold_share(Scorer.WEIGHTS)
+            share_lbl.configure(
+                text=f"{share}% of the score comes from the four 'oversold' indicators (RSI, Bollinger, Stochastic, Momentum). "
+                     "The app checks every month that the scores still predict returns (Backtest tab).",
+                fg=T['warning'] if share > 60 else T['fg3'])
 
     def recheck_weights(self, auto=False):
-        """Compare the weights in use with the defaults on the most recent ~6 months of history."""
+        """On the most recent ~6 months of history: do the weights in use still predict returns?
+        And, if they aren't the defaults, are they at least as good as the defaults?"""
         if not BACKTEST_OK or not MARKET_DATA_OK or not self.watchlist:
-            return
-        if Scorer.WEIGHTS == Scorer.DEFAULT_WEIGHTS:
-            if not auto:
-                messagebox.showinfo("Re-check Weights", "You're using the default weights - nothing to compare.\n\n"
-                                    "Run a backtest and click 'Apply Suggested Weights' to tune them to your stocks.")
             return
         if getattr(self, '_recheck_running', False):
             return
@@ -3052,7 +3079,10 @@ class App:
                 messagebox.showerror("Re-check Weights", f"Re-check failed: {result['error']}")
             return
         cur, dflt = result['a'], result['b']
-        verdict = 'worse' if cur['ic'] < dflt['ic'] - 0.01 else 'ok'
+        custom = Scorer.WEIGHTS != Scorer.DEFAULT_WEIGHTS
+        # 'stopped': higher scores were no longer followed by better returns - the market may have
+        # changed character (the score leans heavily on "oversold" indicators, see scoring.OVERSOLD)
+        verdict = 'stopped' if cur['ic'] <= 0 else 'worse' if custom and cur['ic'] < dflt['ic'] - 0.01 else 'ok'
         settings = load_app_settings()
         meta = settings.get('weights_meta') or self._weights_meta()
         meta['last_check'] = datetime.now().strftime('%Y-%m-%d')
@@ -3070,19 +3100,27 @@ class App:
         summary = (f"Recent history {result['since']} to {result['until']} ({result['n_samples']:,} stock-days, "
                    f"{result['horizon']}-day holding):\n\n"
                    f"Your weights:      power {cur['ic']:+.3f}, best-vs-worst {cur['spread']:+.2f}%\n"
-                   f"Default weights:  power {dflt['ic']:+.3f}, best-vs-worst {dflt['spread']:+.2f}%\n\n")
-        if verdict == 'worse':
+                   + (f"Default weights:  power {dflt['ic']:+.3f}, best-vs-worst {dflt['spread']:+.2f}%\n" if custom else "")
+                   + "\n(power above 0 = higher scores were followed by better returns)\n\n")
+        share = scoring.oversold_share(Scorer.WEIGHTS)
+        if verdict == 'stopped':
+            messagebox.showwarning("Scoring Weights Check", summary +
+                                   f"Lately the scores have NOT predicted returns. {share}% of the score comes from the four "
+                                   "'oversold' indicators (RSI, Bollinger, Stochastic, Momentum); when the market trends strongly "
+                                   "that approach can stop working.\n\nRun the Backtest and apply fresh suggestions - and treat "
+                                   "signals with extra caution until then.")
+        elif verdict == 'worse':
             messagebox.showwarning("Scoring Weights Re-check", summary +
                                    "The DEFAULT weights predicted better recently. Consider Settings > Reset Defaults, "
                                    "or re-run the backtest and apply fresh suggestions.")
         elif not auto:
-            messagebox.showinfo("Scoring Weights Re-check", summary + "Your weights are still at least as good as the defaults.")
+            messagebox.showinfo("Scoring Weights Re-check", summary + ("Your weights are still at least as good as the defaults."
+                                                                        if custom else "The scores are still predicting returns."))
 
     def _auto_recheck_weights(self):
-        """Runs after start-up: re-checks weights applied from the backtest every 30 days."""
+        """Runs after start-up: checks the weights in use every 30 days (defaults included - the
+        score leans on "oversold" indicators, which can stop working when markets trend)."""
         meta = self._weights_meta()
-        if meta.get('source') != 'backtest':
-            return
         try:
             last = datetime.strptime(meta.get('last_check') or meta.get('applied'), '%Y-%m-%d')
         except (TypeError, ValueError):
@@ -3246,10 +3284,7 @@ class App:
                 ("SuperTrend", "Trend following"), ("VWAP", "Volume weighted price"),
                 ("Bollinger", "Volatility bands"), ("ADX", "Trend strength")
             ]),
-            ("SCORING", [
-                ("75-100", "STRONG BUY"), ("60-74", "BUY"), ("45-59", "HOLD"),
-                ("30-44", "SELL"), ("0-29", "STRONG SELL")
-            ]),
+            ("SCORING", [(f"{lo}-{hi}", rec) for rec, lo, hi in scoring.cutoff_ranges()]),
             ("STOP-LOSS & TARGETS", [
                 ("Stop-loss", "Just beyond the nearest support (the nearest resistance, for a SELL)"),
                 ("Targets 1-3", "The next resistance levels above the price (supports below, for a SELL)"),
@@ -4390,7 +4425,7 @@ class App:
         fig = Figure(figsize=(9, 2.6), dpi=100, facecolor=T['card'], layout='constrained')
         ax = fig.add_subplot(111)
         self._style_axes(ax)
-        for level, col in ((75, T['sb']), (60, T['buy']), (45, T['hold']), (30, T['sell'])):
+        for (_, level), col in zip(scoring.CUTOFFS, (T['sb'], T['buy'], T['hold'], T['sell'])):
             ax.axhline(level, color=col, linewidth=0.9, linestyle='--', alpha=1.0)
         ax.plot(dates, scores, color=T['series0'], linewidth=2, marker='o', markersize=4)
         ax.set_ylim(0, 100)
@@ -4402,7 +4437,7 @@ class App:
         first, last = hist[0], hist[-1]
         tk.Label(box, text=f"{len(hist)} scan days | first {first['date']}: {safe_float(first['score']):.1f} ({first['rec']})  ->  "
                            f"latest {last['date']}: {safe_float(last['score']):.1f} ({last['rec']})   "
-                           f"(dashed lines: 75 Strong Buy, 60 Buy, 45 Hold, 30 Sell)",
+                           "(dashed lines: " + ", ".join(f"{c} {r.title()}" for r, c in scoring.CUTOFFS) + ")",
                  bg=T['card'], fg=T['fg3'], font=(ui.FONT, 9)).pack(pady=(0, 10))
 
     def _style_axes(self, ax):
