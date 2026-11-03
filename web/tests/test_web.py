@@ -54,7 +54,7 @@ check('short password refused', c.post('/api/signup', json={'name': 'alice', 'pa
 r = c.post('/api/signup', json={'name': 'alice', 'password': 'secret-pass-1', 'invite': 'dev'})
 cookie = r.headers.get('Set-Cookie', '')
 check('sign up', r.status_code == 200 and 'drs_session=' in cookie and 'HttpOnly' in cookie and 'SameSite=Lax' in cookie, cookie[:80])
-check('signed in after sign up', c.get('/api/me').get_json()['name'] == 'alice')
+check('signed in after sign up', c.get('/api/me').get_json() == {'name': 'alice'})
 check('user name taken', client().post('/api/signup', json={'name': 'ALICE', 'password': 'secret-pass-2', 'invite': 'dev'}).status_code == 409)
 t = client()
 t.set_cookie('drs_session', index._make_session('alice')[:-3] + 'abc')
@@ -75,27 +75,6 @@ bob = client()
 bob.post('/api/signup', json={'name': 'bob', 'password': 'bobs-password', 'invite': 'dev'})
 check("each person has their own watchlist", bob.get('/api/watchlist').get_json()['symbols'] == [])
 
-# ---- 3b. how the score is set up, and the weekly check ----
-d = c.get('/api/me').get_json()
-check('the page gets the same cut-offs and weights as the desktop app', d['cutoffs'] == [list(x) for x in scoring.cutoff_ranges()]
-      and d['weights'] == scoring.Scorer.WEIGHTS and d['oversold'] == 70 and d['check'] is None, str(d)[:120])
-r = client().get('/api/cron/weights-check')
-res = r.get_json()
-check('weekly scoring check runs (on the most-watched stocks)', r.status_code == 200 and res.get('verdict') in ('ok', 'stopped')
-      and res['stocks'] >= 3 and res['samples'] > 100, str(res)[:160])
-check('the page shows the latest check', c.get('/api/me').get_json()['check'] == res)
-check('checked today already: not run twice', client().get('/api/cron/weights-check').get_json()['at'] == res['at'])
-os.environ['CRON_SECRET'] = 'test-secret'
-check('only Vercel (with the secret) may run the check', client().get('/api/cron/weights-check').status_code == 401
-      and client().get('/api/cron/weights-check', headers={'Authorization': 'Bearer test-secret'}).status_code == 200)
-del os.environ['CRON_SECRET']
-index.ON_VERCEL = True
-os.environ['SECRET_KEY'] = 'x' * 32
-r = client().get('/api/cron/weights-check?force=1')
-check('on Vercel without a secret: anyone may start it, but only once a day', r.status_code == 200 and r.get_json()['at'] == res['at'])
-del os.environ['SECRET_KEY']
-index.ON_VERCEL = False
-
 # ---- 4. scan: the same scores as the desktop app ----
 yesterday = (datetime.now(index.IST) - timedelta(days=1)).strftime('%Y-%m-%d')
 index.set_json('hist:alice', {yesterday: {'RELIANCE': [12.0, 'STRONG SELL'], 'TCS': [50.0, 'HOLD']}})
@@ -111,16 +90,18 @@ frames = market_data.load_scan_history(['RELIANCE', 'TCS', 'INFY'], years=2)
 same = []
 for res in data['results']:
     df = market_data.slice_period(frames[res['symbol']], '2y')
-    d = scoring.indicators(df)
+    d = scoring.indicators(df, None, index.nifty())   # the Nifty 50 too, for the RS rating
     s = scoring.Scorer.score(d)
     tg = scoring.TargetCalc.calc(d, s['rec'])
     same.append(abs(s['total'] - res['score']) < 1e-9 and s['rec'] == res['rec'] and tg['sl'] == res['targets']['sl'] and tg['t2'] == res['targets']['t2'])
 check('scores, signals and targets match the desktop calculation', all(same), str(same))
 rel = data['results'][0]
 check('previous scan compared', rel.get('prev_score') == 12.0 and rel.get('prev_rec') == 'STRONG SELL' and rel.get('prev_date') == yesterday)
-check('result has everything the page shows', all(k in rel for k in ('price', 'change', 'rsi', 'breakdown', 'targets', 'st_sig', 'vwap_sig', 'high52',
+check('result has everything the page shows', all(k in rel for k in ('price', 'change', 'rsi', 'rs_rating', 'breakdown', 'targets', 'st_sig', 'vwap_sig', 'high52',
                                                                     'low52', 'liquidity_cr', 'rs', 'hourly', 'patterns')) and len(rel['breakdown']) == 10)
 check('vs Nifty 50 worked out', rel['rs'].get('3M') is not None, str(rel['rs']))
+check('RS rating worked out (1-99) and in the score', 1 <= (rel.get('rs_rating') or 0) <= 99 and 'rs' in rel['breakdown'],
+      str(rel.get('rs_rating')))
 r = c.post('/api/scan', json={'symbols': [f'ZZFAKE{i}' for i in range(15)]})
 d2 = r.get_json()
 check('at most 10 stocks per call', len(d2['results']) + len(d2['failed']) + len(d2['too_new']) == index.SCAN_BATCH)

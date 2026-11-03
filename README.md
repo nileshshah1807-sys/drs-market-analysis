@@ -27,7 +27,7 @@ Use `python -m pip`, not plain `pip`: if you have more than one Python installed
 | Scan Results | Score, signal (shown as a marker: double up = strong buy, up = buy, bar = hold, down = sell, double down = strong sell), **change since the last scan**, **performance vs the Nifty 50**, 52-week range, ATR and daily traded value (F5 to scan). Signal changes slide in at the bottom right after each scan, and the rows that changed glow briefly |
 | Score Breakdown / Stop-Loss & Targets / Pattern Analysis | Double-click a stock for details |
 | Corporate Actions | Live dividends, splits, bonus, buybacks from NSE and BSE |
-| Charts | Price with 20/50-day averages and volume (the lines draw themselves in), and the **3D market map**: every scanned stock by score, RSI and strength against the Nifty, turning slowly - click to stop, drag to turn |
+| Charts | Price with 20/50-day averages and volume (the lines draw themselves in), and the **3D market map**: every scanned stock by score, RS rating and strength against the Nifty, turning slowly - click to stop, drag to turn |
 | Sector | Sector averages and rotation, with a **3D chart** of buy, hold and sell stocks per sector |
 | Backtest | Checks whether the score predicted returns on your stocks' history; suggests weights and re-checks applied weights every 30 days |
 | Settings | **Appearance (Light or Dark, animations on or off)**, email, scheduled report, liquidity threshold, scoring weights |
@@ -49,31 +49,32 @@ the Backtest tab shows which weights are in use; Settings > Reset Defaults resto
 
 | Indicator | Weight |
 |-----------|--------|
-| RSI (14) | 20% |
-| Bollinger Bands | 20% |
-| Stochastic | 15% |
-| Momentum (Williams %R, CCI) | 15% |
-| MACD | 5% |
-| Moving averages (SMA 20/50/200, EMA 12/26) | 5% |
-| ADX | 5% |
-| Volume (OBV) | 5% |
-| SuperTrend | 5% |
-| VWAP | 5% |
+| RS rating (vs the Nifty 50) | 12% |
+| MACD | 12% |
+| Moving averages (SMA 20/50/200, EMA 12/26) | 15% |
+| SuperTrend | 11% |
+| VWAP | 10% |
+| Bollinger Bands | 8% |
+| Stochastic | 8% |
+| ADX | 8% |
+| Volume (OBV) | 8% |
+| Momentum (Williams %R, CCI) | 8% |
 
 | Score | Signal |
 |-------|--------|
-| 62-100 | STRONG BUY |
-| 56-61 | BUY |
-| 44-55 | HOLD |
-| 37-43 | SELL |
-| 0-36 | STRONG SELL |
+| 75-100 | STRONG BUY |
+| 60-74 | BUY |
+| 45-59 | HOLD |
+| 30-44 | SELL |
+| 0-29 | STRONG SELL |
 
-These cut-offs (in `scoring.CUTOFFS`) were chosen with the backtest on 5 years of the watchlist: set on the
-older 60% of dates and checked on the newer 40%, where strong buy > buy > hold > sell > strong sell on both
-10- and 20-day holds. ADX counts a strong trend in its own direction (a strong rise scores high, a steep fall
-low). 70% of the default score comes from four "oversold" indicators (RSI, Bollinger, Stochastic, Momentum),
-so the desktop app checks every month - and the web version every Monday - that higher scores are still
-followed by better returns, and warns when they aren't.
+**RS rating** (1-99, replaces RSI in the score): the stock's price performance over the last 3, 6, 9 and
+12 months - the last 3 months counting double - compared with the Nifty 50's, on a 1-99 scale in the style of
+IBD's Relative Strength rating. **90 and above is the best** (scores 90 of 100); a stock that has done exactly
+as well as the Nifty rates 50. The scale is set by `RS_RATING_TABLE` in `scoring.py` (performance vs the
+Nifty -> rating): a scan can't rank a stock against every listed stock the way IBD does, so the table stands
+in for that. A stock with under 3 months of history, or a scan without Nifty data, scores RS as neutral (50).
+Weights saved before this change are kept: the old RSI weight becomes the RS weight.
 
 Stocks trading less than Rs 1 crore a day (adjustable) are marked **LOW** liquidity: their stop-loss and targets are less reliable.
 

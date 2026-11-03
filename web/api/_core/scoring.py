@@ -76,11 +76,13 @@ def supertrend(high, low, close, period=10, multiplier=3.0):
     return line, direction
 
 
-def indicators(df, days=None):
+def indicators(df, days=None, index_df=None):
     """Every indicator the score uses, for the latest candle of `df`.
 
     `days`: a new listing's daily candles, when `df` holds its 1-hour candles (worked out
-    from `df` if not given)."""
+    from `df` if not given).
+    `index_df`: Nifty 50 history, for the RS rating (without it the RS rating is None and
+    scores neutral)."""
     if df is None or df.empty:
         raise ValueError("No data")
 
@@ -102,6 +104,12 @@ def indicators(df, days=None):
     # RSI
     try: rsi = safe_float(ta.momentum.RSIIndicator(df['Close'], 14).rsi().iloc[-1], 50)
     except: rsi = 50.0
+
+    # RS rating (1-99) against the Nifty 50, on daily candles
+    try: rs_rating = rs_rating_latest(days, index_df)
+    except Exception as e:
+        logger.warning(f"RS rating error: {e}")
+        rs_rating = None
 
     # MACD (None when there isn't enough history - ~35 days - so it scores neutral instead of bearish)
     try:
@@ -134,11 +142,9 @@ def indicators(df, days=None):
         stoch = {'k': safe_float(s.stoch().iloc[-1], 50), 'd': safe_float(s.stoch_signal().iloc[-1], 50)}
     except: stoch = {'k': 50, 'd': 50}
 
-    # ADX: how strong the trend is; +DI above -DI means the trend is up
-    try:
-        a = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close'])
-        adx, adx_pos, adx_neg = safe_float(a.adx().iloc[-1], 25), safe_float(a.adx_pos().iloc[-1], None), safe_float(a.adx_neg().iloc[-1], None)
-    except: adx, adx_pos, adx_neg = 25.0, None, None
+    # ADX
+    try: adx = safe_float(ta.trend.ADXIndicator(df['High'], df['Low'], df['Close']).adx().iloc[-1], 25)
+    except: adx = 25.0
 
     # OBV
     try:
@@ -187,8 +193,8 @@ def indicators(df, days=None):
         levels = {'support': [], 'resistance': []}
 
     return {
-        'price': price, 'prev': prev, 'liquidity_cr': liquidity_cr, 'rsi': rsi, 'macd': macd, 'ma': ma,
-        'boll': boll, 'stoch': stoch, 'adx': adx, 'adx_pos': adx_pos, 'adx_neg': adx_neg, 'obv_trend': obv_trend,
+        'price': price, 'prev': prev, 'liquidity_cr': liquidity_cr, 'rsi': rsi, 'rs_rating': rs_rating, 'macd': macd, 'ma': ma,
+        'boll': boll, 'stoch': stoch, 'adx': adx, 'obv_trend': obv_trend,
         'wr': wr, 'cci': cci, 'atr': atr,
         'supertrend': {'val': st_val, 'sig': st_sig, 'dir': st_dir},
         'vwap': {'val': vwap, 'sig': vwap_sig},
@@ -237,60 +243,36 @@ def support_resistance(df, atr):
 # SCORER
 # ============================================================
 
-# The score a stock needs for each signal, checked from the top down; below the last one: STRONG SELL.
-# Chosen with the backtest (5 years of the user's watchlist, set on the older 60% of dates and checked
-# on the newer 40%): the only set tried where strong buy > buy > hold > sell > strong sell on both
-# 10- and 20-day holds. The old 75/60/45/30 gave no strong buys at all with the current weights.
-CUTOFFS = (('STRONG BUY', 62), ('BUY', 56), ('HOLD', 44), ('SELL', 37))
-
-
-def rec_for(total):
-    """The signal for a 0-100 score."""
-    return next((rec for rec, cut in CUTOFFS if total >= cut), 'STRONG SELL')
-
-
-# Four indicators that all measure the same thing - a price stretched low (oversold) - so their
-# weights add up to how much the score leans on that one idea
-OVERSOLD = ('rsi', 'boll', 'stoch', 'mom')
-
-
-def oversold_share(weights):
-    """Percent of the score that comes from the "oversold" indicators."""
-    return sum(weights.get(k, 0) for k in OVERSOLD)
-
-
-def cutoff_ranges():
-    """[(signal, lowest score, highest score)] for showing the cut-offs: STRONG BUY 62-100 ... STRONG SELL 0-36."""
-    lows = [c for _, c in CUTOFFS] + [0]
-    highs = [100] + [c - 1 for _, c in CUTOFFS]
-    return list(zip([r for r, _ in CUTOFFS] + ['STRONG SELL'], lows, highs))
-
-
 class Scorer:
-    WEIGHTS = {'rsi': 20, 'macd': 5, 'ma': 5, 'boll': 20, 'stoch': 15, 'adx': 5, 'vol': 5, 'mom': 15, 'st': 5, 'vwap': 5}
+    WEIGHTS = {'rs': 12, 'macd': 12, 'ma': 15, 'boll': 8, 'stoch': 8, 'adx': 8, 'vol': 8, 'mom': 8, 'st': 11, 'vwap': 10}
     DEFAULT_WEIGHTS = dict(WEIGHTS)
 
     @classmethod
     def score(cls, data):
         scores = {
-            'rsi': cls._rsi(data['rsi']),
+            'rs': cls._rs(data.get('rs_rating')),
             'macd': cls._macd(data['macd']),
             'ma': cls._ma(data['price'], data['ma']),
             'boll': cls._boll(data['price'], data['boll']),
             'stoch': cls._stoch(data['stoch']),
-            'adx': cls._adx(data['adx'], data.get('adx_pos'), data.get('adx_neg')),
+            'adx': cls._adx(data['adx']),
             'vol': cls._vol(data['obv_trend']),
             'mom': cls._mom(data['wr'], data['cci']),
             'st': cls._st(data['supertrend']),
             'vwap': cls._vwap(data['vwap'])
         }
         total = sum(scores[k] * cls.WEIGHTS[k] / 100 for k in scores)
-        return {'total': round(total, 1), 'breakdown': scores, 'rec': rec_for(total)}
+        rec = 'STRONG BUY' if total >= 75 else 'BUY' if total >= 60 else 'HOLD' if total >= 45 else 'SELL' if total >= 30 else 'STRONG SELL'
+        return {'total': round(total, 1), 'breakdown': scores, 'rec': rec}
 
     @staticmethod
-    def _rsi(v):
+    def _rs(v):
+        """RS rating (1-99): 90 and above is the best - the stock is beating ~90% of the market."""
+        if v is None or v != v:
+            return 50   # under 3 months of history, or no Nifty data - neutral
         v = safe_float(v, 50)
-        return 90 if v < 20 else 75 if v < 30 else 60 if v < 40 else 50 if v < 50 else 45 if v < 60 else 35 if v < 70 else 20 if v < 80 else 10
+        return 90 if v >= 90 else 75 if v >= 80 else 65 if v >= 70 else 55 if v >= 60 else 50 if v >= 50 \
+            else 40 if v >= 40 else 30 if v >= 30 else 20 if v >= 20 else 10
 
     @staticmethod
     def _macd(m):
@@ -325,14 +307,9 @@ class Scorer:
         return max(0, min(100, sc + (10 if k > d else -10)))
 
     @staticmethod
-    def _adx(v, di_pos=None, di_neg=None):
-        # A strong trend scores high only when it is UP (+DI above -DI); a strong fall scores low.
-        # (It used to score any strong trend high - a steep fall included.) No direction known: neutral.
-        if di_pos is None or di_neg is None or di_pos != di_pos or di_neg != di_neg:
-            return 50
+    def _adx(v):
         v = safe_float(v, 25)
-        strength = 0 if v <= 20 else 10 if v <= 30 else 20 if v <= 40 else 30
-        return 50 + strength if di_pos >= di_neg else 50 - strength
+        return 80 if v > 50 else 70 if v > 40 else 60 if v > 30 else 50 if v > 20 else 30
 
     @staticmethod
     def _vol(v):
@@ -370,6 +347,8 @@ def load_weights():
         if WEIGHTS_FILE.exists():
             with open(WEIGHTS_FILE, 'r') as f:
                 data = json.load(f)
+            if 'rs' not in data and 'rsi' in data:     # saved before RS replaced RSI in the score
+                data['rs'] = data.pop('rsi')
             weights = {k: int(data[k]) for k in Scorer.DEFAULT_WEIGHTS}
             if sum(weights.values()) == 100 and min(weights.values()) >= 0:
                 Scorer.WEIGHTS.update(weights)
@@ -475,3 +454,67 @@ def relative_strength(df, index_df, periods=RS_PERIODS):
         if s0 > 0 and i0 > 0 and i1 > 0:
             out[label] = round((s1 / s0 - i1 / i0) * 100, 2)
     return out
+
+
+# ------------------------------------------------------------
+# RS rating (1-99), in the style of IBD's Relative Strength rating
+# ------------------------------------------------------------
+# The stock's price performance over the last 3, 6, 9 and 12 months - the latest 3 months
+# counting double - compared with the Nifty 50's over the same days, then put on a 1-99 scale.
+# 90 and above is the best: the stock is outperforming about 90% of the market. A stock that
+# has done exactly as well as the Nifty 50 rates 50.
+#
+# IBD ranks every listed stock against all the others; a scan can't download the whole market,
+# so the 1-99 scale comes from RS_RATING_TABLE instead: (performance vs the Nifty, rating),
+# shaped like the spread of a broad market's ratings. A new listing is rated on the quarters
+# it has (at least 3 months).
+
+RS_RATING_PERIODS = ((63, 0.4), (126, 0.2), (189, 0.2), (252, 0.2))      # (trading days, weight)
+RS_RATING_TABLE = ((25, 1), (60, 10), (88, 30), (100, 50), (108, 70), (128, 90), (200, 99))
+RS_RATING_BEST = 90
+
+
+def rs_rating_from_score(score):
+    """Performance vs the Nifty 50 (100 = the same, 128 = 28% better) -> RS rating 1-99."""
+    xs, ys = zip(*RS_RATING_TABLE)
+    return np.clip(np.rint(np.interp(score, xs, ys)), 1, 99)
+
+
+def rs_rating_series(close, index_close):
+    """RS rating for every day of `close` (NaN until there are 3 months of history)."""
+    close = pd.Series(close, dtype=float)
+    idx = pd.Series(index_close, dtype=float).sort_index()
+    idx = idx[~idx.index.duplicated(keep='last')]
+    idx = idx.reindex(idx.index.union(close.index)).ffill().reindex(close.index)   # the Nifty on each of the stock's days
+    stock_sum = pd.Series(0.0, index=close.index)
+    index_sum = pd.Series(0.0, index=close.index)
+    weight = pd.Series(0.0, index=close.index)
+    for n, w in RS_RATING_PERIODS:
+        s, i = close / close.shift(n), idx / idx.shift(n)
+        ok = s.notna() & i.notna() & np.isfinite(s) & np.isfinite(i) & (i > 0)
+        stock_sum += (s * w).where(ok, 0)
+        index_sum += (i * w).where(ok, 0)
+        weight += pd.Series(w, index=close.index).where(ok, 0)
+    have_3m = (close / close.shift(RS_RATING_PERIODS[0][0])).notna() & (weight > 0)
+    score = (stock_sum / index_sum * 100).where(have_3m & (index_sum > 0))
+    return pd.Series(np.where(score.notna(), rs_rating_from_score(score.fillna(100)), np.nan), index=close.index)
+
+
+def rs_rating_latest(days, index_df):
+    """Today's RS rating (int 1-99) from daily candles, or None (no Nifty data / under 3 months)."""
+    if index_df is None or len(index_df) == 0 or days is None or len(days) <= RS_RATING_PERIODS[0][0]:
+        return None
+    need = RS_RATING_PERIODS[-1][0] + 1
+    v = rs_rating_series(days['Close'].iloc[-need:], index_df['Close']).iloc[-1]
+    return None if v != v else int(v)
+
+
+def load_index(years=2):
+    """Nifty 50 history (for the RS rating and 'vs Nifty'), or None if it can't be downloaded."""
+    if not MARKET_DATA_OK:
+        return None
+    try:
+        return market_data.load_history([NIFTY_SYMBOL], years=years, exchange='INDEX').get(NIFTY_SYMBOL)
+    except Exception as e:
+        logger.warning(f"Nifty 50 download failed: {e}")
+        return None

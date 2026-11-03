@@ -138,7 +138,6 @@
         <label class="check"><input type="checkbox" id="f-liq"> <span id="f-liq-text">Hide illiquid</span></label>
         <button class="btn pdf-btn" id="pdf-btn" type="button" title="Download the scan as a PDF file">PDF report</button>
       </div>
-      <div class="note warn hidden" id="check-warn" style="margin-bottom:12px"></div>
       <div id="results-box"></div>
     </section>
 
@@ -183,10 +182,6 @@
           <p class="small-note">Thinly traded stocks can gap past a stop-loss and orders may not fill.</p>
         </div>
         <div class="card pad">
-          <h3>Scoring check</h3>
-          <div id="score-check" class="small-note"></div>
-        </div>
-        <div class="card pad">
           <h3>Password</h3>
           <form class="pw-form" id="pw-form">
             <label class="field">Current password <input type="password" id="pw-old" autocomplete="current-password" required></label>
@@ -199,7 +194,13 @@
 
     <section class="panel" id="p-help" role="tabpanel" hidden>
       <div class="help">
-        <div class="card pad"><h3>Signals</h3><dl id="help-signals"></dl></div>
+        <div class="card pad"><h3>Signals</h3><dl>
+          <dt>75 to 100</dt><dd>Strong buy (double up marker)</dd>
+          <dt>60 to 74</dt><dd>Buy (up marker)</dd>
+          <dt>45 to 59</dt><dd>Hold (bar)</dd>
+          <dt>30 to 44</dt><dd>Sell (down marker)</dd>
+          <dt>0 to 29</dt><dd>Strong sell (double down marker)</dd>
+        </dl></div>
         <div class="card pad"><h3>How to use</h3><dl>
           <dt>1</dt><dd>Add stocks: type the first letters of the company's name and pick it from the list (it shows the NSE and BSE symbols), or paste many symbols in Watchlist</dd>
           <dt>2</dt><dd>Scan all stocks</dd>
@@ -209,6 +210,7 @@
           <dt>5</dt><dd>PDF report: Scan Results has a button for the whole scan (the stocks shown in the table, in the same order); each stock's details has its own</dd>
         </dl></div>
         <div class="card pad"><h3>Columns</h3><dl>
+          <dt>RS</dt><dd>RS rating, 1 to 99: the stock's 3, 6, 9 and 12-month performance against the Nifty 50 (the last 3 months count double). 90 and above is the best - it scores highest</dd>
           <dt>vs Nifty 3M</dt><dd>3-month return minus the Nifty 50's</dd>
           <dt>Score Chg</dt><dd>Change since your previous scan day ("new" = first scan)</dd>
           <dt>Traded/day</dt><dd>Average daily traded value, last 20 sessions (Rs crore)</dd>

@@ -112,8 +112,6 @@ async def run():
             document.querySelector('#l-invite').value=%s; document.querySelector('#login-form').requestSubmit(); true""" % (json.dumps(USER), json.dumps(INVITE)))
         check('signed up and in', await p.wait("!document.querySelector('#app').classList.contains('hidden')", 20))
         check('starts in light mode', await p.js("document.documentElement.dataset.theme") == 'light')
-        check('help shows the new signal cut-offs', (await p.js("document.querySelector('#help-signals').textContent")).startswith('62 to 100Strong buy'))
-        check('Settings explains the scoring check', '70% of the score' in await p.js("document.querySelector('#score-check').textContent"))
 
         # the search box: type the first letters of a company's name, pick it from the list
         typing = "(() => { const i=document.querySelector('#add-input'); i.focus(); i.value=%s; i.dispatchEvent(new Event('input',{bubbles:true})); return true; })()"
@@ -230,7 +228,7 @@ async def run():
         shown = await p.js("[...document.querySelectorAll('#results-box tr[data-sym]')].map(r => r.dataset.sym)")
         uri = await p.js("(async () => (await buildScanPdf()).output('datauristring'))()")
         _, text, _ = pdf_text(uri, 'scan_report_hold_only.pdf')
-        body = text.split('Scan results', 1)[-1].split('Score: 62-100', 1)[0]
+        body = text.split('Scan results', 1)[-1].split('Score: 75-100', 1)[0]
         hidden = [x for x in ('RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ITC', 'SBIN', 'LT') if x not in shown]
         check('PDF report follows the table filters', bool(shown) and all(x in body for x in shown) and not any(f"\n{x} " in body for x in hidden)
               and 'Showing only: signal HOLD' in text, f"shown {shown}")
