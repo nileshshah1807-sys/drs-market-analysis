@@ -16,7 +16,6 @@ Keys:  user:<name>   account (salt + password hash)
 """
 
 import base64
-import fnmatch
 import hashlib
 import hmac
 import json
@@ -40,7 +39,6 @@ import pandas as pd
 import requests
 from flask import Flask, g, jsonify, request
 
-import backtest
 import market_data
 import scoring
 from pattern_recognition import PatternDetector
@@ -105,10 +103,6 @@ class MemoryStore:
             self.data.pop(key, None)
             self._save()
 
-    def keys(self, pattern):
-        with self.lock:
-            return [k for k in self.data if fnmatch.fnmatchcase(k, pattern)]
-
     def incr(self, key, ex):
         with self.lock:
             item = self.data.get(key)
@@ -146,9 +140,6 @@ class UpstashStore:
 
     def delete(self, key):
         self._cmd('DEL', key)
-
-    def keys(self, pattern):
-        return self._cmd('KEYS', pattern) or []
 
     def incr(self, key, ex):
         n = int(self._cmd('INCR', key))
@@ -329,8 +320,7 @@ def logout():
 @app.get('/api/me')
 @login_required
 def me():
-    return jsonify({'name': g.user, 'cutoffs': scoring.cutoff_ranges(), 'weights': Scorer.WEIGHTS,
-                    'oversold': scoring.oversold_share(Scorer.WEIGHTS), 'check': get_json('weights_check')})
+    return jsonify({'name': g.user})
 
 
 @app.post('/api/password')
@@ -515,52 +505,6 @@ def save_scan():
 @login_required
 def last_scan():
     return jsonify(get_json(f"scan:{g.user.lower()}", {'when': None, 'results': []}))
-
-
-# ============================================================
-# WEEKLY SCORING CHECK - do the scores still predict returns? (Vercel runs it every Monday)
-# ============================================================
-
-CHECK_STOCKS = 40          # the most-watched stocks across everyone's watchlists
-CHECK_FALLBACK = ['RELIANCE', 'HDFCBANK', 'ICICIBANK', 'INFY', 'TCS', 'SBIN', 'BHARTIARTL', 'ITC', 'LT', 'AXISBANK',
-                  'KOTAKBANK', 'HINDUNILVR', 'BAJFINANCE', 'MARUTI', 'SUNPHARMA', 'TITAN', 'NTPC', 'ONGC', 'TATASTEEL', 'WIPRO']
-
-
-@app.get('/api/cron/weights-check')
-def weights_check():
-    """The same check as the desktop app's monthly one: on the last ~6 months of the most-watched
-    stocks, were higher scores followed by better 10-day returns? Kept for the page to show.
-    The score leans on "oversold" indicators, which can stop working when markets trend."""
-    # With a CRON_SECRET set in Vercel, only its scheduler may start the check. Without one, anyone may -
-    # harmless: it runs at most once a day and only stores its result (a re-run on demand needs the secret).
-    secret = os.environ.get('CRON_SECRET')
-    authorized = hmac.compare_digest(request.headers.get('Authorization', ''), f"Bearer {secret}") if secret else not ON_VERCEL
-    if secret and not authorized:
-        return error("Not allowed", 401)
-    last = get_json('weights_check')
-    if last and not (request.args.get('force') and authorized) and time.time() - last.get('at', 0) < 20 * 3600:
-        return jsonify(last)                 # checked today already
-    counts = {}
-    for key in store.keys('wl:*'):
-        for s in get_json(key, []):
-            counts[s] = counts.get(s, 0) + 1
-    symbols = sorted(counts, key=lambda s: -counts[s])[:CHECK_STOCKS] or CHECK_FALLBACK
-    try:
-        with _download_lock:
-            data = market_data.load_history(symbols, years=2)
-        samples, _ = backtest.build_samples(data, Scorer)
-        r = backtest.compare_weights(samples, Scorer.WEIGHTS, Scorer.WEIGHTS, 10)
-    except Exception as e:
-        logger.error(f"Weights check failed: {e}")
-        return error(f"Check failed: {e}", 502)
-    if 'error' in r:
-        return error(f"Check failed: {r['error']}", 502)
-    result = {'at': time.time(), 'date': _today(), 'since': r['since'], 'until': r['until'], 'stocks': len(data),
-              'samples': r['n_samples'], 'power': round(r['a']['ic'], 4), 'spread': round(r['a']['spread'], 3),
-              'verdict': 'ok' if r['a']['ic'] > 0 else 'stopped'}
-    set_json('weights_check', result)
-    logger.info(f"Weights check: {result}")
-    return jsonify(result)
 
 
 @app.get('/api/history')

@@ -13,7 +13,7 @@ from pathlib import Path
 WEB = Path(__file__).resolve().parent
 DESKTOP = WEB.parent
 CORE = WEB / 'api' / '_core'
-SHARED = ['scoring.py', 'market_data.py', 'pattern_recognition.py', 'app_paths.py', 'backtest.py']
+SHARED = ['scoring.py', 'market_data.py', 'pattern_recognition.py', 'app_paths.py']
 DATA = {'symbols_master.json': WEB / 'public' / 'symbols.json'}      # the NSE + BSE company list
 
 

@@ -54,7 +54,7 @@ check('short password refused', c.post('/api/signup', json={'name': 'alice', 'pa
 r = c.post('/api/signup', json={'name': 'alice', 'password': 'secret-pass-1', 'invite': 'dev'})
 cookie = r.headers.get('Set-Cookie', '')
 check('sign up', r.status_code == 200 and 'drs_session=' in cookie and 'HttpOnly' in cookie and 'SameSite=Lax' in cookie, cookie[:80])
-check('signed in after sign up', c.get('/api/me').get_json()['name'] == 'alice')
+check('signed in after sign up', c.get('/api/me').get_json() == {'name': 'alice'})
 check('user name taken', client().post('/api/signup', json={'name': 'ALICE', 'password': 'secret-pass-2', 'invite': 'dev'}).status_code == 409)
 t = client()
 t.set_cookie('drs_session', index._make_session('alice')[:-3] + 'abc')
@@ -74,27 +74,6 @@ check('watchlist saved', c.get('/api/watchlist').get_json()['symbols'] == ['RELI
 bob = client()
 bob.post('/api/signup', json={'name': 'bob', 'password': 'bobs-password', 'invite': 'dev'})
 check("each person has their own watchlist", bob.get('/api/watchlist').get_json()['symbols'] == [])
-
-# ---- 3b. how the score is set up, and the weekly check ----
-d = c.get('/api/me').get_json()
-check('the page gets the same cut-offs and weights as the desktop app', d['cutoffs'] == [list(x) for x in scoring.cutoff_ranges()]
-      and d['weights'] == scoring.Scorer.WEIGHTS and d['oversold'] == 70 and d['check'] is None, str(d)[:120])
-r = client().get('/api/cron/weights-check')
-res = r.get_json()
-check('weekly scoring check runs (on the most-watched stocks)', r.status_code == 200 and res.get('verdict') in ('ok', 'stopped')
-      and res['stocks'] >= 3 and res['samples'] > 100, str(res)[:160])
-check('the page shows the latest check', c.get('/api/me').get_json()['check'] == res)
-check('checked today already: not run twice', client().get('/api/cron/weights-check').get_json()['at'] == res['at'])
-os.environ['CRON_SECRET'] = 'test-secret'
-check('only Vercel (with the secret) may run the check', client().get('/api/cron/weights-check').status_code == 401
-      and client().get('/api/cron/weights-check', headers={'Authorization': 'Bearer test-secret'}).status_code == 200)
-del os.environ['CRON_SECRET']
-index.ON_VERCEL = True
-os.environ['SECRET_KEY'] = 'x' * 32
-r = client().get('/api/cron/weights-check?force=1')
-check('on Vercel without a secret: anyone may start it, but only once a day', r.status_code == 200 and r.get_json()['at'] == res['at'])
-del os.environ['SECRET_KEY']
-index.ON_VERCEL = False
 
 # ---- 4. scan: the same scores as the desktop app ----
 yesterday = (datetime.now(index.IST) - timedelta(days=1)).strftime('%Y-%m-%d')

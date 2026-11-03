@@ -62,18 +62,11 @@ the Backtest tab shows which weights are in use; Settings > Reset Defaults resto
 
 | Score | Signal |
 |-------|--------|
-| 62-100 | STRONG BUY |
-| 56-61 | BUY |
-| 44-55 | HOLD |
-| 37-43 | SELL |
-| 0-36 | STRONG SELL |
-
-These cut-offs (in `scoring.CUTOFFS`) were chosen with the backtest on 5 years of the watchlist: set on the
-older 60% of dates and checked on the newer 40%, where strong buy > buy > hold > sell > strong sell on both
-10- and 20-day holds. ADX counts a strong trend in its own direction (a strong rise scores high, a steep fall
-low). 70% of the default score comes from four "oversold" indicators (RSI, Bollinger, Stochastic, Momentum),
-so the desktop app checks every month - and the web version every Monday - that higher scores are still
-followed by better returns, and warns when they aren't.
+| 75-100 | STRONG BUY |
+| 60-74 | BUY |
+| 45-59 | HOLD |
+| 30-44 | SELL |
+| 0-29 | STRONG SELL |
 
 Stocks trading less than Rs 1 crore a day (adjustable) are marked **LOW** liquidity: their stop-loss and targets are less reliable.
 

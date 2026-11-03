@@ -795,8 +795,7 @@ class DailyReportGenerator:
             'sell': total_sell,
             'strong_sell': total_ss,
             'avg_score': round(avg_score, 1),
-            # the scan's own cut-offs: an average in BUY territory is bullish, in SELL territory bearish
-            'market_sentiment': {'BUY': 'BULLISH', 'SELL': 'BEARISH'}.get(scoring.rec_for(avg_score).split()[-1], 'NEUTRAL'),
+            'market_sentiment': 'BULLISH' if avg_score >= 60 else 'BEARISH' if avg_score < 40 else 'NEUTRAL',
         }
         report['top_picks'] = top_picks
         report['avoid_list'] = avoid_list
