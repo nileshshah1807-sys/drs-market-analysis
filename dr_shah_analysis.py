@@ -2401,9 +2401,10 @@ class App:
         weights_frame.pack(fill=tk.X, padx=20, pady=10)
         
         self.weight_vars = {}
-        weights = [(k, name, Scorer.DEFAULT_WEIGHTS[k]) for k, name in (
-            ('rsi', 'RSI'), ('macd', 'MACD'), ('ma', 'Moving Avg'), ('boll', 'Bollinger'), ('stoch', 'Stochastic'),
-            ('adx', 'ADX'), ('vol', 'Volume'), ('mom', 'Momentum'), ('st', 'SuperTrend'), ('vwap', 'VWAP'))]
+        weights = [('rsi', 'RSI', 12), ('macd', 'MACD', 12), ('ma', 'Moving Avg', 15),
+                   ('boll', 'Bollinger', 8), ('stoch', 'Stochastic', 8), ('adx', 'ADX', 8),
+                   ('vol', 'Volume', 8), ('mom', 'Momentum', 8), ('st', 'SuperTrend', 11),
+                   ('vwap', 'VWAP', 10)]
         
         weights_grid = tk.Frame(weights_frame, bg=T['bg'])
         weights_grid.pack(fill=tk.X, padx=10, pady=10)
