@@ -1,5 +1,6 @@
 # The second copy of the web app, on Render's free plan: https://drs-market-analysis.onrender.com
-# Render reads this file once (New > Blueprint); after that every push to GitHub updates it, like Vercel.
+# The service was made with these settings through Render's API (13 Nov 2026); every push to GitHub updates it,
+# like Vercel. If it is ever lost, Render > New > Blueprint with this repo recreates it.
 # It uses the same Upstash database as Vercel, so accounts and watchlists are shared.
 services:
   - type: web
