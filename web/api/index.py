@@ -51,7 +51,7 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
 
 IST = timezone(timedelta(hours=5, minutes=30))
-ON_VERCEL = bool(os.environ.get('VERCEL'))
+ON_VERCEL = bool(os.environ.get('VERCEL') or os.environ.get('RENDER'))   # live on the internet (Vercel, or the copy on Render): strict rules
 COOKIE = 'drs_session'
 SESSION_DAYS = 30
 NAME_RE = re.compile(r'^[A-Za-z0-9_.-]{3,20}$')
@@ -261,7 +261,9 @@ def login_required(fn):
 
 
 def _client_ip():
-    return (request.headers.get('X-Forwarded-For') or request.remote_addr or '?').split(',')[0].strip()
+    # Render sits behind Cloudflare, which sets True-Client-Ip; Render's X-Forwarded-For keeps whatever the visitor sent
+    fwd = (os.environ.get('RENDER') and request.headers.get('True-Client-Ip')) or request.headers.get('X-Forwarded-For')
+    return (fwd or request.remote_addr or '?').split(',')[0].strip()
 
 
 @app.get('/api/health')
@@ -588,10 +590,10 @@ def search_companies():
 
 
 # ============================================================
-# THIS PC ONLY: serve the page too (Vercel serves public/ itself)
+# RENDER AND THIS PC: serve the page too (Vercel serves public/ itself, with the headers in vercel.json)
 # ============================================================
 
-if not ON_VERCEL and os.environ.get('DRS_DEV'):
+if os.environ.get('RENDER') or (not ON_VERCEL and os.environ.get('DRS_DEV')):
     from flask import send_from_directory
     PUBLIC = HERE.parent / 'public'
 
@@ -602,3 +604,11 @@ if not ON_VERCEL and os.environ.get('DRS_DEV'):
     @app.get('/<path:path>')
     def static_files(path):
         return send_from_directory(PUBLIC, path)
+
+    @app.after_request
+    def site_headers(resp):              # the same headers web/vercel.json adds on Vercel
+        resp.headers.update({'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'DENY',
+                             'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'})
+        if request.path.startswith('/api/'):
+            resp.headers['Cache-Control'] = 'no-store'
+        return resp

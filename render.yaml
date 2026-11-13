@@ -1,0 +1,24 @@
+# The second copy of the web app, on Render's free plan: https://drs-market-analysis.onrender.com
+# Render reads this file once (New > Blueprint); after that every push to GitHub updates it, like Vercel.
+# It uses the same Upstash database as Vercel, so accounts and watchlists are shared.
+services:
+  - type: web
+    name: drs-market-analysis
+    runtime: python
+    plan: free
+    region: singapore
+    rootDir: web
+    buildCommand: pip install -r requirements.txt gunicorn
+    startCommand: gunicorn --chdir api index:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 300
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.11"
+      - key: SECRET_KEY            # only signs the sign-in cookie, so Render can make its own
+        generateValue: true
+      - key: INVITE_CODE           # asked for during setup
+        sync: false
+      - key: KV_REST_API_URL       # the Upstash database, same values as in Vercel
+        sync: false
+      - key: KV_REST_API_TOKEN
+        sync: false

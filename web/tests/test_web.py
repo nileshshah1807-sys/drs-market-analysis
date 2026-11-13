@@ -198,6 +198,23 @@ try:
 finally:
     index.requests.post = real_post
 
+# ---- 10. the copy on Render: shows the page itself, with the same headers and rules as on Vercel ----
+with index.app.test_request_context(headers={'X-Forwarded-For': '6.6.6.6', 'True-Client-Ip': '1.2.3.4'}):
+    check('Vercel: ignores True-Client-Ip (a visitor could fake it there)', index._client_ip() == '6.6.6.6')
+import importlib  # noqa: E402
+os.environ['RENDER'] = 'true'
+try:
+    importlib.reload(index)
+    r = client().get('/')
+    check('Render: shows the page', r.status_code == 200 and b'<title>' in r.data and r.headers.get('X-Frame-Options') == 'DENY')
+    r = client().get('/api/health')
+    check('Render: same strict rules as Vercel', index.ON_VERCEL and r.status_code == 200 and r.headers.get('Cache-Control') == 'no-store'
+          and r.get_json()['secret'] is False)
+    with index.app.test_request_context(headers={'X-Forwarded-For': '6.6.6.6', 'True-Client-Ip': '1.2.3.4'}):
+        check("Render: uses the visitor's real address", index._client_ip() == '1.2.3.4')
+finally:
+    os.environ.pop('RENDER')
+
 print("\n".join(passed))
 print(f"\n==== PROBLEMS: {len(problems)} ====")
 print("\n".join(problems) if problems else "none")
