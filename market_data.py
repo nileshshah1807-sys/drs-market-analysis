@@ -357,6 +357,7 @@ def load_scan_history(symbols, years: int = 5, exchange: str = 'NSE', progress=N
     if exchange not in HOURLY_EXCHANGES:
         return result
     cutoff = pd.Timestamp(datetime.now()) - pd.DateOffset(months=NEW_LISTING_MONTHS)
+    young = pd.Timestamp(datetime.now()) - pd.Timedelta(days=50)   # well inside Yahoo's 60 days of 15-minute candles
     daily = {s: df for s, df in {**short, **result}.items() if df.index[0] > cutoff}
     todo = list(daily)
     for suffix in EXCHANGE_SUFFIXES[exchange]:
@@ -376,7 +377,13 @@ def load_scan_history(symbols, years: int = 5, exchange: str = 'NSE', progress=N
                 result[s] = df
                 if days is not None:
                     days[s] = daily_bars(df, daily[s])
-            # else Yahoo has candles older than a month: not a new listing, leave it as it was
+            elif s not in result and df.index[0] > young:
+                # listed 1-2 months ago, but Yahoo's daily history is missing days (seen for VNL):
+                # its 15-minute candles start inside their 60-day window, so they hold its whole life
+                built = daily_bars(df, daily[s])
+                if len(built) >= MIN_ROWS:
+                    result[s] = built
+            # else not a new listing: leave it as it was
         todo = still
     return result
 

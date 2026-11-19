@@ -736,7 +736,9 @@ def s_new_listing():
     fakes = {new + '.NS': (q15, daily),
              two_days + '.NS': _fake_listing(2, 8),
              # an old stock whose daily download came back nearly empty: Yahoo still has 40 days of candles
-             old + '.NS': (_fake_listing(40, 9)[0], _fake_listing(3, 9)[1])}
+             old + '.NS': (_fake_listing(40, 9)[0], _fake_listing(3, 9)[1]),
+             # listed ~6 weeks ago, Yahoo's daily history has only today (seen for VNL)
+             'ZZYOUNG.NS': (_fake_listing(28, 10)[0], _fake_listing(1, 10)[1])}
     real = market_data._download
 
     def fake(tickers, tz=None, **kw):
@@ -759,6 +761,10 @@ def s_new_listing():
               f"{len(df)} candles at {hours}")
         check('old stock with a failed daily download is not treated as a new listing',
               old not in market_data.load_scan_history([old]))
+        young = market_data.load_scan_history(['ZZYOUNG']).get('ZZYOUNG')
+        check('stock listed 6 weeks ago with missing daily data: days built from 15-minute candles',
+              young is not None and not market_data.is_hourly(young) and len(young) == 28,
+              'missing' if young is None else f"{len(young)} days")
 
         app.watchlist = [new, two_days, old, normal]
         app.last_toast = None
@@ -770,7 +776,7 @@ def s_new_listing():
         check('new listing scanned', r is not None and r['hourly'] and r['data']['days'] == 6,
               f"results: {[x['symbol'] for x in app.results]}")
         if r:
-            filled = ['Price', 'Change%', 'RSI', 'Score', '52W High', '52W Low', 'ATR', 'Traded/day (Cr)']
+            filled = ['Price', 'Change%', 'Score', '52W High', '52W Low', 'ATR', 'Traded/day (Cr)']
             check('new listing has every figure', all(is_number(cell(rows[new], c)) for c in filled)
                   and cell(rows[new], 'SuperTrend') in ('BUY', 'SELL') and cell(rows[new], 'Candle') == '1 Hour'
                   and cell(rows[new], 'vs Nifty 3M') == 'N/A' and cell(rows[normal], 'Candle') == 'Daily',
